@@ -35,7 +35,7 @@ jobs:
       - name: Validate CloudFormation Template
         run: |
           aws cloudformation validate-template \
-            --template-body file://dynamodb-productcatalog.yaml
+            --template-body file://cloudformation/dynamodb-productcatalog.yaml
 
       - name: Deploy CloudFormation
         run: |
