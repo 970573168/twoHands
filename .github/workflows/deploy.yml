@@ -14,22 +14,19 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+
+      - name: Debug Context
+        run: |
+          echo "Repository=$GITHUB_REPOSITORY"
+          echo "Ref=$GITHUB_REF"
+          echo "Actor=$GITHUB_ACTOR"
 
       - name: Configure AWS
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::767076981380:role/twoHands-GitHubActions-Role
           aws-region: ap-northeast-1
-          
+
       - name: Verify AWS Identity
         run: aws sts get-caller-identity
-        
-      - name: Deploy CloudFormation
-        run: |
-          aws cloudformation deploy \
-            --template-file dynamodb-productcatalog.yaml \
-            --stack-name productcatalog-dev \
-            --parameter-overrides \
-              Environment=dev
