@@ -1,4 +1,4 @@
-name: Deploy DynamoDB
+name: Deploy Product Catalog
 
 on:
   push:
@@ -35,13 +35,13 @@ jobs:
       - name: Validate CloudFormation Template
         run: |
           aws cloudformation validate-template \
-            --template-body file://cloudformation/dynamodb-productcatalog.yaml
+            --template-body file://cloudformation/productcatalog.yaml
 
       - name: Deploy CloudFormation
         run: |
           aws cloudformation deploy \
-            --template-file cloudformation/dynamodb-productcatalog.yaml \
-            --stack-name productcatalog-dev \
+            --template-file cloudformation/productcatalog.yaml \
+            --stack-name productcatalog-app-dev \
             --parameter-overrides Environment=dev \
+            --capabilities CAPABILITY_NAMED_IAM \
             --no-fail-on-empty-changeset
-
