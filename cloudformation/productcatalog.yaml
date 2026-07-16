@@ -1,47 +1,161 @@
-name: Deploy Product Catalog
+AWSTemplateFormatVersion: "2010-09-09"
 
-on:
-  push:
-    branches:
-      - main
+Description: >
+  Product Catalog Demo Stack
 
-permissions:
-  id-token: write
-  contents: read
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - prod
 
-jobs:
-  deploy:
-    runs-on: ubuntu-latest
+Resources:
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+  ProductCatalogTable:
+    Type: AWS::DynamoDB::Table
 
-      - name: Debug Context
-        run: |
-          echo "Repository=$GITHUB_REPOSITORY"
-          echo "Ref=$GITHUB_REF"
-          echo "Actor=$GITHUB_ACTOR"
+    Properties:
+      TableName: !Sub "ProductCatalog-${Environment}"
 
-      - name: Configure AWS
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::767076981380:role/twoHands-GitHubActions-Role
-          aws-region: ap-northeast-1
+      BillingMode: PAY_PER_REQUEST
 
-      - name: Verify AWS Identity
-        run: aws sts get-caller-identity
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
 
-      - name: Validate CloudFormation Template
-        run: |
-          aws cloudformation validate-template \
-            --template-body file://cloudformation/productcatalog.yaml
+        - AttributeName: SK
+          AttributeType: S
 
-      - name: Deploy CloudFormation
-        run: |
-          aws cloudformation deploy \
-            --template-file cloudformation/productcatalog.yaml \
-            --stack-name productcatalog-app-dev \
-            --parameter-overrides Environment=dev \
-            --capabilities CAPABILITY_NAMED_IAM \
-            --no-fail-on-empty-changeset
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+
+        - AttributeName: SK
+          KeyType: RANGE
+
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+
+      SSESpecification:
+        SSEEnabled: true
+
+      Tags:
+        - Key: Application
+          Value: ProductCatalog
+
+        - Key: Environment
+          Value: !Ref Environment
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+
+    Properties:
+      RoleName: !Sub "ProductCatalog-LambdaRole-${Environment}"
+
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+
+        Statement:
+          - Effect: Allow
+
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+
+            Action:
+              - sts:AssumeRole
+
+      Policies:
+        - PolicyName: DynamoDBAccess
+
+          PolicyDocument:
+            Version: "2012-10-17"
+
+            Statement:
+
+              - Effect: Allow
+
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+
+                Resource: !GetAtt ProductCatalogTable.Arn
+
+              - Effect: Allow
+
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+
+                Resource: "*"
+
+  TestLambda:
+    Type: AWS::Lambda::Function
+
+    Properties:
+      FunctionName: !Sub "ProductCatalog-Test-${Environment}"
+
+      Runtime: python3.12
+
+      Handler: index.lambda_handler
+
+      Timeout: 10
+
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ProductCatalogTable
+
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+
+          dynamodb = boto3.resource("dynamodb")
+
+          def lambda_handler(event, context):
+
+              table = dynamodb.Table(
+                  os.environ["TABLE_NAME"]
+              )
+
+              table.put_item(
+                  Item={
+                      "PK": "TEST#001",
+                      "SK": "METADATA",
+                      "name": "Lambda Test"
+                  }
+              )
+
+              return {
+                  "statusCode": 200,
+                  "message": "Success"
+              }
+
+Outputs:
+
+  ProductCatalogTableName:
+    Description: DynamoDB Table Name
+    Value: !Ref ProductCatalogTable
+
+  ProductCatalogTableArn:
+    Description: DynamoDB Table ARN
+    Value: !GetAtt ProductCatalogTable.Arn
+
+  LambdaName:
+    Description: Lambda Function Name
+    Value: !Ref TestLambda
+
+  LambdaRoleArn:
+    Description: Lambda Role ARN
+    Value: !GetAtt LambdaExecutionRole.Arn
