@@ -1,6 +1,8 @@
 AWSTemplateFormatVersion: "2010-09-09"
 
-Description: Single-table DynamoDB for product catalog
+Description: >
+  Single-table DynamoDB for product catalog,
+  price history, jobs, usage limits and locks.
 
 Parameters:
   Environment:
