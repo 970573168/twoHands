@@ -1,0 +1,32 @@
+name: Deploy DynamoDB
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::767076981380:role/Github
+          aws-region: ap-northeast-1
+
+      - name: Deploy CloudFormation
+        run: |
+          aws cloudformation deploy \
+            --template-file dynamodb-productcatalog.yaml \
+            --stack-name productcatalog-dev \
+            --parameter-overrides \
+              Environment=dev
