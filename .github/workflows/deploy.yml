@@ -44,4 +44,4 @@ jobs:
             --stack-name productcatalog-dev \
             --parameter-overrides Environment=dev \
             --no-fail-on-empty-changeset
-`
+
