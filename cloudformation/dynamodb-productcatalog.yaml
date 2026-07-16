@@ -13,24 +13,9 @@ Parameters:
       - test
       - prod
 
-  EnablePointInTimeRecovery:
-    Type: String
-    Default: "false"
-    AllowedValues:
-      - "true"
-      - "false"
-
-Conditions:
-  IsPointInTimeRecoveryEnabled: !Equals
-    - !Ref EnablePointInTimeRecovery
-    - "true"
-
 Resources:
   ProductCatalogTable:
     Type: AWS::DynamoDB::Table
-
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
 
     Properties:
       TableName: !Sub "ProductCatalog-${Environment}"
@@ -53,30 +38,19 @@ Resources:
         AttributeName: expires_at
         Enabled: true
 
-      PointInTimeRecoverySpecification:
-        PointInTimeRecoveryEnabled: !If
-          - IsPointInTimeRecoveryEnabled
-          - true
-          - false
-
       SSESpecification:
         SSEEnabled: true
-
-      DeletionProtectionEnabled: false
 
       Tags:
         - Key: Application
           Value: ProductCatalog
+
         - Key: Environment
           Value: !Ref Environment
-        - Key: ManagedBy
-          Value: CloudFormation
 
 Outputs:
   ProductCatalogTableName:
-    Description: DynamoDB table name
     Value: !Ref ProductCatalogTable
 
   ProductCatalogTableArn:
-    Description: DynamoDB table ARN
     Value: !GetAtt ProductCatalogTable.Arn
