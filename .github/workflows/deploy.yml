@@ -40,7 +40,7 @@ jobs:
       - name: Deploy CloudFormation
         run: |
           aws cloudformation deploy \
-            --template-file dynamodb-productcatalog.yaml \
+            --template-file file://cloudformation/dynamodb-productcatalog.yaml \
             --stack-name productcatalog-dev \
             --parameter-overrides Environment=dev \
             --no-fail-on-empty-changeset
