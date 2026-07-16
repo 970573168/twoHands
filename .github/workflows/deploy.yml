@@ -14,7 +14,8 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Debug Context
         run: |
@@ -30,3 +31,17 @@ jobs:
 
       - name: Verify AWS Identity
         run: aws sts get-caller-identity
+
+      - name: Validate CloudFormation Template
+        run: |
+          aws cloudformation validate-template \
+            --template-body file://dynamodb-productcatalog.yaml
+
+      - name: Deploy CloudFormation
+        run: |
+          aws cloudformation deploy \
+            --template-file dynamodb-productcatalog.yaml \
+            --stack-name productcatalog-dev \
+            --parameter-overrides Environment=dev \
+            --no-fail-on-empty-changeset
+`
