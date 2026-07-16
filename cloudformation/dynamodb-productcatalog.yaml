@@ -1,8 +1,6 @@
- AWSTemplateFormatVersion: "2010-09-09"
+AWSTemplateFormatVersion: "2010-09-09"
 
-Description: >
-  Single-table DynamoDB for product catalog,
-  price history, jobs, usage limits and locks.
+Description: Single-table DynamoDB for product catalog
 
 Parameters:
   Environment:
@@ -21,10 +19,9 @@ Parameters:
       - "false"
 
 Conditions:
-  IsPointInTimeRecoveryEnabled:
-    Fn::Equals:
-      - Ref: EnablePointInTimeRecovery
-      - "true"
+  IsPointInTimeRecoveryEnabled: !Equals
+    - !Ref EnablePointInTimeRecovery
+    - "true"
 
 Resources:
   ProductCatalogTable:
@@ -34,22 +31,19 @@ Resources:
     UpdateReplacePolicy: Retain
 
     Properties:
-      TableName:
-        Fn::Sub: "ProductCatalog-${Environment}"
+      TableName: !Sub "ProductCatalog-${Environment}"
 
       BillingMode: PAY_PER_REQUEST
 
       AttributeDefinitions:
         - AttributeName: PK
           AttributeType: S
-
         - AttributeName: SK
           AttributeType: S
 
       KeySchema:
         - AttributeName: PK
           KeyType: HASH
-
         - AttributeName: SK
           KeyType: RANGE
 
@@ -58,11 +52,10 @@ Resources:
         Enabled: true
 
       PointInTimeRecoverySpecification:
-        PointInTimeRecoveryEnabled:
-          Fn::If:
-            - IsPointInTimeRecoveryEnabled
-            - true
-            - false
+        PointInTimeRecoveryEnabled: !If
+          - IsPointInTimeRecoveryEnabled
+          - true
+          - false
 
       SSESpecification:
         SSEEnabled: true
@@ -72,23 +65,16 @@ Resources:
       Tags:
         - Key: Application
           Value: ProductCatalog
-
         - Key: Environment
-          Value:
-            Ref: Environment
-
+          Value: !Ref Environment
         - Key: ManagedBy
           Value: CloudFormation
 
 Outputs:
   ProductCatalogTableName:
     Description: DynamoDB table name
-    Value:
-      Ref: ProductCatalogTable
+    Value: !Ref ProductCatalogTable
 
   ProductCatalogTableArn:
     Description: DynamoDB table ARN
-    Value:
-      Fn::GetAtt:
-        - ProductCatalogTable
-        - Arn
+    Value: !GetAtt ProductCatalogTable.Arn
