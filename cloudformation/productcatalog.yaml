@@ -206,7 +206,6 @@ Resources:
       Handler: index.lambda_handler
       Timeout: 300
       MemorySize: 256
-      ReservedConcurrentExecutions: !Ref LambdaReservedConcurrency
       Role: !GetAtt LambdaExecutionRole.Arn
       Environment:
         Variables:
