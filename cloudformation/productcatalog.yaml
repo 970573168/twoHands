@@ -1,7 +1,9 @@
 AWSTemplateFormatVersion: "2010-09-09"
 
 Description: >
-  Product Catalog Demo Stack
+  Serverless electronic product catalog collector:
+  EventBridge Scheduler -> SQS -> Lambda -> Volcengine Ark Bot API -> DynamoDB.
+  The Lambda discovers category -> brand -> model and upserts the product catalog.
 
 Parameters:
   Environment:
@@ -12,150 +14,755 @@ Parameters:
       - test
       - prod
 
-Resources:
+  ArkBotId:
+    Type: String
+    Default: bot-20260716130853-glss9
+    Description: Volcengine Ark Bot ID used as the model field.
 
+  ArkApiUrl:
+    Type: String
+    Default: https://ark.cn-beijing.volces.com/api/v3/bots/chat/completions
+
+  ScheduleExpression:
+    Type: String
+    Default: rate(1 day)
+    Description: EventBridge Scheduler expression, for example rate(1 day) or cron(0 1 * * ? *).
+
+  ScheduleState:
+    Type: String
+    Default: DISABLED
+    AllowedValues:
+      - ENABLED
+      - DISABLED
+    Description: Keep DISABLED until the Ark API key has been stored in Secrets Manager.
+
+  LambdaReservedConcurrency:
+    Type: Number
+    Default: 2
+    MinValue: 2
+    MaxValue: 10
+
+  WorkerMaximumConcurrency:
+    Type: Number
+    Default: 2
+    MinValue: 2
+    MaxValue: 10
+
+  MaxCategoriesPerRun:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    MaxValue: 100
+
+  MaxBrandsPerCategory:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    MaxValue: 100
+
+  MaxModelsPerBrand:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    MaxValue: 100
+
+Resources:
   ProductCatalogTable:
     Type: AWS::DynamoDB::Table
-
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       TableName: !Sub "ProductCatalog-${Environment}"
-
       BillingMode: PAY_PER_REQUEST
-
       AttributeDefinitions:
         - AttributeName: PK
           AttributeType: S
-
         - AttributeName: SK
           AttributeType: S
-
       KeySchema:
         - AttributeName: PK
           KeyType: HASH
-
         - AttributeName: SK
           KeyType: RANGE
-
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
       TimeToLiveSpecification:
         AttributeName: expires_at
         Enabled: true
-
       SSESpecification:
         SSEEnabled: true
-
       Tags:
         - Key: Application
           Value: ProductCatalog
-
         - Key: Environment
           Value: !Ref Environment
 
+  ArkApiSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: !Sub "ProductCatalog/ArkApiKey/${Environment}"
+      Description: Volcengine Ark API key. Store JSON in the form {"apiKey":"..."} after stack creation.
+      Tags:
+        - Key: Application
+          Value: ProductCatalog
+        - Key: Environment
+          Value: !Ref Environment
+
+  ProductCatalogDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "ProductCatalog-DLQ-${Environment}"
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      Tags:
+        - Key: Application
+          Value: ProductCatalog
+        - Key: Environment
+          Value: !Ref Environment
+
+  ProductCatalogQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "ProductCatalog-Queue-${Environment}"
+      VisibilityTimeout: 360
+      MessageRetentionPeriod: 345600
+      ReceiveMessageWaitTimeSeconds: 20
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ProductCatalogDLQ.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Application
+          Value: ProductCatalog
+        - Key: Environment
+          Value: !Ref Environment
+
+  ProductCatalogLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/ProductCatalog-Worker-${Environment}"
+      RetentionInDays: 14
+
   LambdaExecutionRole:
     Type: AWS::IAM::Role
-
     Properties:
       RoleName: !Sub "ProductCatalog-LambdaRole-${Environment}"
-
       AssumeRolePolicyDocument:
         Version: "2012-10-17"
-
         Statement:
           - Effect: Allow
-
             Principal:
               Service:
                 - lambda.amazonaws.com
-
             Action:
               - sts:AssumeRole
-
       Policies:
-        - PolicyName: DynamoDBAccess
-
+        - PolicyName: ProductCatalogWorkerPolicy
           PolicyDocument:
             Version: "2012-10-17"
-
             Statement:
-
-              - Effect: Allow
-
+              - Sid: DynamoDBCatalogAccess
+                Effect: Allow
                 Action:
                   - dynamodb:GetItem
                   - dynamodb:PutItem
                   - dynamodb:UpdateItem
-                  - dynamodb:DeleteItem
                   - dynamodb:Query
-                  - dynamodb:Scan
-
+                  - dynamodb:BatchWriteItem
                 Resource: !GetAtt ProductCatalogTable.Arn
-
-              - Effect: Allow
-
+              - Sid: ConsumeAndProduceQueueMessages
+                Effect: Allow
                 Action:
-                  - logs:CreateLogGroup
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:ChangeMessageVisibility
+                  - sqs:SendMessage
+                Resource: !GetAtt ProductCatalogQueue.Arn
+              - Sid: ReadArkApiSecret
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref ArkApiSecret
+              - Sid: WriteLambdaLogs
+                Effect: Allow
+                Action:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
+                Resource: !Sub "${ProductCatalogLogGroup.Arn}:*"
 
-                Resource: "*"
-
-  TestLambda:
+  ProductCatalogWorker:
     Type: AWS::Lambda::Function
-
+    DependsOn:
+      - ProductCatalogLogGroup
     Properties:
-      FunctionName: !Sub "ProductCatalog-Test-${Environment}"
-
+      FunctionName: !Sub "ProductCatalog-Worker-${Environment}"
+      Description: Discovers electronic product categories, brands and models through Ark AI.
       Runtime: python3.12
-
+      Architectures:
+        - arm64
       Handler: index.lambda_handler
-
-      Timeout: 10
-
+      Timeout: 300
+      MemorySize: 256
+      ReservedConcurrentExecutions: !Ref LambdaReservedConcurrency
       Role: !GetAtt LambdaExecutionRole.Arn
-
       Environment:
         Variables:
           TABLE_NAME: !Ref ProductCatalogTable
-
+          QUEUE_URL: !Ref ProductCatalogQueue
+          ARK_SECRET_ARN: !Ref ArkApiSecret
+          ARK_BOT_ID: !Ref ArkBotId
+          ARK_API_URL: !Ref ArkApiUrl
+          MAX_CATEGORIES: !Ref MaxCategoriesPerRun
+          MAX_BRANDS: !Ref MaxBrandsPerCategory
+          MAX_MODELS: !Ref MaxModelsPerBrand
       Code:
         ZipFile: |
+          import hashlib
+          import json
           import os
+          import random
+          import re
+          import time
+          import urllib.error
+          import urllib.request
+
           import boto3
 
           dynamodb = boto3.resource("dynamodb")
+          table = dynamodb.Table(os.environ["TABLE_NAME"])
+          sqs = boto3.client("sqs")
+          secretsmanager = boto3.client("secretsmanager")
 
-          def lambda_handler(event, context):
+          QUEUE_URL = os.environ["QUEUE_URL"]
+          API_URL = os.environ["ARK_API_URL"]
+          BOT_ID = os.environ["ARK_BOT_ID"]
+          SECRET_ARN = os.environ["ARK_SECRET_ARN"]
+          MAX_CATEGORIES = int(os.environ.get("MAX_CATEGORIES", "20"))
+          MAX_BRANDS = int(os.environ.get("MAX_BRANDS", "20"))
+          MAX_MODELS = int(os.environ.get("MAX_MODELS", "50"))
 
-              table = dynamodb.Table(
-                  os.environ["TABLE_NAME"]
-              )
+          _api_key_cache = None
 
-              table.put_item(
-                  Item={
-                      "PK": "TEST#001",
-                      "SK": "METADATA",
-                      "name": "Lambda Test"
-                  }
-              )
+
+          def log(level, message, **fields):
+              entry = {
+                  "level": level,
+                  "message": message,
+                  **fields,
+              }
+              print(json.dumps(entry, ensure_ascii=False, default=str))
+
+
+          def get_api_key():
+              global _api_key_cache
+              if _api_key_cache:
+                  return _api_key_cache
+
+              response = secretsmanager.get_secret_value(SecretId=SECRET_ARN)
+              secret_string = response.get("SecretString")
+              if not secret_string:
+                  raise RuntimeError("Ark API secret has no SecretString value")
+
+              try:
+                  value = json.loads(secret_string)
+                  api_key = value.get("apiKey")
+              except json.JSONDecodeError:
+                  api_key = secret_string
+
+              if not api_key:
+                  raise RuntimeError("Ark API secret does not contain apiKey")
+
+              _api_key_cache = api_key
+              return _api_key_cache
+
+
+          def normalize(value):
+              value = str(value or "").strip()
+              return re.sub(r"\s+", " ", value)
+
+
+          def key_part(value):
+              value = normalize(value).upper()
+              value = re.sub(r"[^A-Z0-9\u4e00-\u9fff]+", "-", value)
+              return value.strip("-")[:180]
+
+
+          def stable_id(*values):
+              raw = "|".join(normalize(value).casefold() for value in values)
+              return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+          def clean_json_content(content):
+              if isinstance(content, dict):
+                  return content
+
+              if isinstance(content, list):
+                  text_parts = []
+                  for part in content:
+                      if isinstance(part, dict) and part.get("type") == "text":
+                          text_parts.append(str(part.get("text", "")))
+                  content = "".join(text_parts)
+
+              text = str(content or "").strip()
+              text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+              text = re.sub(r"\s*```$", "", text)
+              return json.loads(text)
+
+
+          def ark_prompt(task):
+              task_type = task["task_type"]
+              max_items = int(task.get("max_items", 20))
+
+              if task_type == "DISCOVER_CATEGORIES":
+                  objective = (
+                      "列出常见电子产品商品品类。每项只填写category；"
+                      "不要返回品牌、配件小类、服务或重复同义词。"
+                  )
+              elif task_type == "DISCOVER_BRANDS":
+                  objective = (
+                      f"列出电子产品品类“{normalize(task.get('category'))}”的真实品牌。"
+                      "每项填写category和brand；不要编造品牌。"
+                  )
+              elif task_type == "DISCOVER_MODELS":
+                  objective = (
+                      f"列出品类“{normalize(task.get('category'))}”中品牌"
+                      f"“{normalize(task.get('brand'))}”的具体商品型号。"
+                      "每项填写category、brand、model、confidence；"
+                      "model必须是具体型号，不要只返回产品系列。"
+                  )
+              else:
+                  raise ValueError(f"Unknown task_type: {task_type}")
 
               return {
-                  "statusCode": 200,
-                  "message": "Success"
+                  "objective": objective,
+                  "output": {
+                      "format": "strict_json",
+                      "schema": {
+                          "items": [
+                              {
+                                  "category": "string",
+                                  "brand": "string or empty",
+                                  "model": "string or empty",
+                                  "confidence": "number from 0 to 1 or null",
+                              }
+                          ]
+                      },
+                      "max_items": max_items,
+                  },
+                  "rules": [
+                      "只返回JSON对象，不要Markdown，不要解释",
+                      "只包含有可靠依据的真实电子产品数据",
+                      "不确定时降低confidence，不要猜测或编造",
+                      "合并大小写、空格、全半角造成的重复项",
+                      "使用品牌官方常用名称和型号名称",
+                  ],
               }
 
-Outputs:
 
+          def call_ark(task):
+              body = {
+                  "model": BOT_ID,
+                  "stream": False,
+                  "messages": [
+                      {
+                          "role": "system",
+                          "content": (
+                              "你是电子产品目录数据整理助手。"
+                              "严格依据任务返回JSON；禁止返回Markdown或解释文字。"
+                          ),
+                      },
+                      {
+                          "role": "user",
+                          "content": json.dumps(ark_prompt(task), ensure_ascii=False),
+                      },
+                  ],
+              }
+
+              encoded_body = json.dumps(body, ensure_ascii=False).encode("utf-8")
+              retryable_codes = {408, 409, 429, 500, 502, 503, 504}
+              last_error = None
+
+              for attempt in range(3):
+                  request = urllib.request.Request(
+                      API_URL,
+                      data=encoded_body,
+                      headers={
+                          "Authorization": "Bearer " + get_api_key(),
+                          "Content-Type": "application/json",
+                      },
+                      method="POST",
+                  )
+
+                  try:
+                      with urllib.request.urlopen(request, timeout=90) as response:
+                          result = json.loads(response.read().decode("utf-8"))
+                          content = result["choices"][0]["message"]["content"]
+                          parsed = clean_json_content(content)
+                          items = parsed.get("items", [])
+                          if not isinstance(items, list):
+                              raise ValueError("Ark response items is not a list")
+                          usage = result.get("usage", {})
+                          log("INFO", "Ark request completed", usage=usage, item_count=len(items))
+                          return items
+
+                  except urllib.error.HTTPError as error:
+                      error_body = error.read().decode("utf-8", errors="replace")
+                      last_error = RuntimeError(
+                          f"Ark HTTP {error.code}: {error_body[:1000]}"
+                      )
+                      if error.code not in retryable_codes:
+                          raise last_error
+
+                  except (urllib.error.URLError, TimeoutError) as error:
+                      last_error = RuntimeError(f"Ark network error: {error}")
+
+                  if attempt < 2:
+                      delay = (2 ** attempt) + random.random()
+                      time.sleep(delay)
+
+              raise last_error or RuntimeError("Ark request failed")
+
+
+          def upsert_category(category):
+              category = normalize(category)
+              if not category:
+                  return
+
+              now = int(time.time())
+              table.update_item(
+                  Key={
+                      "PK": f"CATEGORY#{key_part(category)}",
+                      "SK": "META",
+                  },
+                  UpdateExpression=(
+                      "SET entity_type = :type, #name = :name, #status = :status, "
+                      "first_seen_at = if_not_exists(first_seen_at, :now), "
+                      "last_seen_at = :now, #source = :source"
+                  ),
+                  ExpressionAttributeNames={
+                      "#name": "name",
+                      "#status": "status",
+                      "#source": "source",
+                  },
+                  ExpressionAttributeValues={
+                      ":type": "CATEGORY",
+                      ":name": category,
+                      ":status": "ACTIVE",
+                      ":now": now,
+                      ":source": "ARK_AI",
+                  },
+              )
+
+
+          def upsert_brand(category, brand):
+              category = normalize(category)
+              brand = normalize(brand)
+              if not category or not brand:
+                  return
+
+              now = int(time.time())
+              table.update_item(
+                  Key={
+                      "PK": f"CATEGORY#{key_part(category)}",
+                      "SK": f"BRAND#{key_part(brand)}",
+                  },
+                  UpdateExpression=(
+                      "SET entity_type = :type, category = :category, brand = :brand, "
+                      "#status = :status, first_seen_at = if_not_exists(first_seen_at, :now), "
+                      "last_seen_at = :now, #source = :source"
+                  ),
+                  ExpressionAttributeNames={
+                      "#status": "status",
+                      "#source": "source",
+                  },
+                  ExpressionAttributeValues={
+                      ":type": "BRAND",
+                      ":category": category,
+                      ":brand": brand,
+                      ":status": "ACTIVE",
+                      ":now": now,
+                      ":source": "ARK_AI",
+                  },
+              )
+
+
+          def upsert_product(category, brand, model, confidence=None):
+              category = normalize(category)
+              brand = normalize(brand)
+              model = normalize(model)
+              if not category or not brand or not model:
+                  return
+
+              now = int(time.time())
+              product_id = stable_id(category, brand, model)
+              product_pk = f"PRODUCT#{product_id}"
+
+              expression = (
+                  "SET entity_type = :type, category = :category, brand = :brand, "
+                  "model = :model, normalized_model = :normalized_model, "
+                  "#status = :status, verification_status = if_not_exists(verification_status, :unverified), "
+                  "first_seen_at = if_not_exists(first_seen_at, :now), last_seen_at = :now, "
+                  "#source = :source"
+              )
+              values = {
+                  ":type": "PRODUCT",
+                  ":category": category,
+                  ":brand": brand,
+                  ":model": model,
+                  ":normalized_model": normalize(model).casefold(),
+                  ":status": "ACTIVE",
+                  ":unverified": "UNVERIFIED",
+                  ":now": now,
+                  ":source": "ARK_AI",
+              }
+
+              if confidence is not None:
+                  try:
+                      confidence_text = str(max(0.0, min(1.0, float(confidence))))
+                      expression += ", confidence = :confidence"
+                      values[":confidence"] = confidence_text
+                  except (TypeError, ValueError):
+                      pass
+
+              table.update_item(
+                  Key={"PK": product_pk, "SK": "META"},
+                  UpdateExpression=expression,
+                  ExpressionAttributeNames={
+                      "#status": "status",
+                      "#source": "source",
+                  },
+                  ExpressionAttributeValues=values,
+              )
+
+              table.update_item(
+                  Key={
+                      "PK": f"BRAND#{key_part(brand)}",
+                      "SK": f"MODEL#{key_part(model)}",
+                  },
+                  UpdateExpression=(
+                      "SET entity_type = :type, category = :category, brand = :brand, "
+                      "model = :model, product_pk = :product_pk, last_seen_at = :now"
+                  ),
+                  ExpressionAttributeValues={
+                      ":type": "BRAND_MODEL",
+                      ":category": category,
+                      ":brand": brand,
+                      ":model": model,
+                      ":product_pk": product_pk,
+                      ":now": now,
+                  },
+              )
+
+
+          def enqueue(task):
+              sqs.send_message(
+                  QueueUrl=QUEUE_URL,
+                  MessageBody=json.dumps(task, ensure_ascii=False),
+              )
+
+
+          def unique_items(items, fields):
+              seen = set()
+              for item in items:
+                  if not isinstance(item, dict):
+                      continue
+                  signature = tuple(normalize(item.get(field)).casefold() for field in fields)
+                  if not all(signature) or signature in seen:
+                      continue
+                  seen.add(signature)
+                  yield item
+
+
+          def process_task(task):
+              task_type = task.get("task_type")
+              items = call_ark(task)
+
+              if task_type == "DISCOVER_CATEGORIES":
+                  for item in unique_items(items, ["category"]):
+                      category = normalize(item.get("category"))
+                      upsert_category(category)
+                      enqueue({
+                          "task_type": "DISCOVER_BRANDS",
+                          "category": category,
+                          "max_items": MAX_BRANDS,
+                      })
+
+              elif task_type == "DISCOVER_BRANDS":
+                  category = normalize(task.get("category"))
+                  for item in unique_items(items, ["brand"]):
+                      brand = normalize(item.get("brand"))
+                      upsert_brand(category, brand)
+                      enqueue({
+                          "task_type": "DISCOVER_MODELS",
+                          "category": category,
+                          "brand": brand,
+                          "max_items": MAX_MODELS,
+                      })
+
+              elif task_type == "DISCOVER_MODELS":
+                  category = normalize(task.get("category"))
+                  brand = normalize(task.get("brand"))
+                  for item in unique_items(items, ["model"]):
+                      upsert_product(
+                          category=category,
+                          brand=brand,
+                          model=item.get("model"),
+                          confidence=item.get("confidence"),
+                      )
+
+              else:
+                  raise ValueError(f"Unknown task_type: {task_type}")
+
+              log("INFO", "Task completed", task_type=task_type, received_items=len(items))
+
+
+          def lambda_handler(event, context):
+              failures = []
+
+              for record in event.get("Records", []):
+                  message_id = record.get("messageId", "unknown")
+                  try:
+                      task = json.loads(record["body"])
+                      log("INFO", "Processing task", message_id=message_id, task=task)
+                      process_task(task)
+                  except Exception as error:
+                      log(
+                          "ERROR",
+                          "Task failed",
+                          message_id=message_id,
+                          error_type=type(error).__name__,
+                          error=str(error),
+                      )
+                      failures.append({"itemIdentifier": message_id})
+
+              return {"batchItemFailures": failures}
+
+  ProductCatalogEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt ProductCatalogQueue.Arn
+      FunctionName: !Ref ProductCatalogWorker
+      Enabled: true
+      BatchSize: 5
+      MaximumBatchingWindowInSeconds: 10
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+      ScalingConfig:
+        MaximumConcurrency: !Ref WorkerMaximumConcurrency
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "ProductCatalog-SchedulerRole-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - scheduler.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: SendCatalogDiscoveryTask
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource:
+                  - !GetAtt ProductCatalogQueue.Arn
+                  - !GetAtt ProductCatalogDLQ.Arn
+
+  ProductCatalogSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "ProductCatalog-Discovery-${Environment}"
+      Description: Starts category, brand and model discovery.
+      State: !Ref ScheduleState
+      ScheduleExpression: !Ref ScheduleExpression
+      FlexibleTimeWindow:
+        Mode: FLEXIBLE
+        MaximumWindowInMinutes: 30
+      Target:
+        Arn: !GetAtt ProductCatalogQueue.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: !Sub |
+          {
+            "task_type": "DISCOVER_CATEGORIES",
+            "max_items": ${MaxCategoriesPerRun}
+          }
+        RetryPolicy:
+          MaximumEventAgeInSeconds: 3600
+          MaximumRetryAttempts: 2
+        DeadLetterConfig:
+          Arn: !GetAtt ProductCatalogDLQ.Arn
+
+  QueueDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Product catalog queue has accumulated messages.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ProductCatalogQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  DeadLetterQueueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Product catalog dead-letter queue contains failed tasks.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ProductCatalogDLQ.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
   ProductCatalogTableName:
-    Description: DynamoDB Table Name
+    Description: DynamoDB product catalog table name.
     Value: !Ref ProductCatalogTable
 
   ProductCatalogTableArn:
-    Description: DynamoDB Table ARN
+    Description: DynamoDB product catalog table ARN.
     Value: !GetAtt ProductCatalogTable.Arn
 
-  LambdaName:
-    Description: Lambda Function Name
-    Value: !Ref TestLambda
+  WorkerLambdaName:
+    Description: Product catalog Lambda worker name.
+    Value: !Ref ProductCatalogWorker
 
-  LambdaRoleArn:
-    Description: Lambda Role ARN
-    Value: !GetAtt LambdaExecutionRole.Arn
+  WorkerQueueUrl:
+    Description: SQS worker queue URL.
+    Value: !Ref ProductCatalogQueue
+
+  DeadLetterQueueUrl:
+    Description: SQS dead-letter queue URL.
+    Value: !Ref ProductCatalogDLQ
+
+  ArkApiSecretArn:
+    Description: Store the Ark API key in this Secrets Manager secret.
+    Value: !Ref ArkApiSecret
+
+  ArkApiSecretName:
+    Description: Secrets Manager secret name.
+    Value: !Sub "ProductCatalog/ArkApiKey/${Environment}"
+
+  SchedulerName:
+    Description: EventBridge Scheduler schedule name.
+    Value: !Ref ProductCatalogSchedule
