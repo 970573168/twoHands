@@ -35,6 +35,27 @@ jobs:
           aws cloudformation validate-template \
             --template-body file://cloudformation/productcatalog.yaml
 
+      - name: Clean Rollback Stack
+        run: |
+          STATUS=$(aws cloudformation describe-stacks \
+            --stack-name productcatalog-app-dev \
+            --query 'Stacks[0].StackStatus' \
+            --output text 2>/dev/null || echo "NOT_FOUND")
+
+          echo "Stack Status: $STATUS"
+
+          if [ "$STATUS" = "ROLLBACK_COMPLETE" ]; then
+            echo "Deleting rollback stack..."
+
+            aws cloudformation delete-stack \
+              --stack-name productcatalog-app-dev
+
+            aws cloudformation wait stack-delete-complete \
+              --stack-name productcatalog-app-dev
+
+            echo "Rollback stack deleted."
+          fi
+
       - name: Deploy CloudFormation - Small Test
         run: |
           aws cloudformation deploy \
@@ -43,7 +64,7 @@ jobs:
             --parameter-overrides \
               Environment=dev \
               ScheduleState=DISABLED \
-              LambdaReservedConcurrency=2 \
+              LambdaReservedConcurrency=0 \
               WorkerMaximumConcurrency=2 \
               MaxCategoriesPerRun=1 \
               MaxBrandsPerCategory=1 \
@@ -52,8 +73,19 @@ jobs:
             --no-fail-on-empty-changeset
 
       - name: Show Stack Outputs
+        if: success()
         run: |
           aws cloudformation describe-stacks \
             --stack-name productcatalog-app-dev \
             --query 'Stacks[0].Outputs' \
+            --output table
+
+      - name: Show Failed Resources
+        if: failure()
+        run: |
+          echo "===== FAILED EVENTS ====="
+
+          aws cloudformation describe-stack-events \
+            --stack-name productcatalog-app-dev \
+            --query "StackEvents[?contains(ResourceStatus,'FAILED')].[LogicalResourceId,ResourceStatus,ResourceStatusReason]" \
             --output table
