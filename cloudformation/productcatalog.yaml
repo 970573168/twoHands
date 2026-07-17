@@ -68,8 +68,6 @@ Parameters:
 Resources:
   ProductCatalogTable:
     Type: AWS::DynamoDB::Table
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
     Properties:
       TableName: !Sub "ProductCatalog-${Environment}"
       BillingMode: PAY_PER_REQUEST
