@@ -2,7 +2,7 @@ AWSTemplateFormatVersion: "2010-09-09"
 
 Description: >
   Serverless electronic product catalog collector:
-  EventBridge Scheduler -> SQS -> Lambda -> Volcengine Ark Bot API -> DynamoDB.
+  EventBridge Scheduler -> SQS -> Lambda -> DeepSeek API -> DynamoDB.
   The Lambda discovers category -> brand -> model and upserts the product catalog.
 
 Parameters:
@@ -14,14 +14,14 @@ Parameters:
       - test
       - prod
 
-  ArkBotId:
+  DeepSeekModel:
     Type: String
-    Default: bot-20260716130853-glss9
-    Description: Volcengine Ark Bot ID used as the model field.
+    Default: deepseek-v4-flash-260425
+    Description: DeepSeek model to use for product discovery.
 
-  ArkApiUrl:
+  DeepSeekApiUrl:
     Type: String
-    Default: https://ark.cn-beijing.volces.com/api/v3/bots/chat/completions
+    Default: https://ark.cn-beijing.volces.com/api/v3/responses
 
   ScheduleExpression:
     Type: String
@@ -34,7 +34,7 @@ Parameters:
     AllowedValues:
       - ENABLED
       - DISABLED
-    Description: Keep DISABLED until the Ark API key has been stored in Secrets Manager.
+    Description: Keep DISABLED until the DeepSeek API key has been stored in Secrets Manager.
 
   LambdaReservedConcurrency:
     Type: Number
@@ -94,11 +94,11 @@ Resources:
         - Key: Environment
           Value: !Ref Environment
 
-  ArkApiSecret:
+  DeepSeekApiSecret:
     Type: AWS::SecretsManager::Secret
     Properties:
-      Name: !Sub "ProductCatalog/ArkApiKey/${Environment}"
-      Description: Volcengine Ark API key. Store JSON in the form {"apiKey":"..."} after stack creation.
+      Name: !Sub "ProductCatalog/DeepSeekApiKey/${Environment}"
+      Description: DeepSeek API key. Store JSON in the form {"apiKey":"..."} after stack creation.
       Tags:
         - Key: Application
           Value: ProductCatalog
@@ -176,11 +176,11 @@ Resources:
                   - sqs:ChangeMessageVisibility
                   - sqs:SendMessage
                 Resource: !GetAtt ProductCatalogQueue.Arn
-              - Sid: ReadArkApiSecret
+              - Sid: ReadDeepSeekApiSecret
                 Effect: Allow
                 Action:
                   - secretsmanager:GetSecretValue
-                Resource: !Ref ArkApiSecret
+                Resource: !Ref DeepSeekApiSecret
               - Sid: WriteLambdaLogs
                 Effect: Allow
                 Action:
@@ -194,7 +194,7 @@ Resources:
       - ProductCatalogLogGroup
     Properties:
       FunctionName: !Sub "ProductCatalog-Worker-${Environment}"
-      Description: Discovers electronic product categories, brands and models through Ark AI.
+      Description: Discovers electronic product categories, brands and models through DeepSeek AI.
       Runtime: python3.12
       Architectures:
         - arm64
@@ -206,9 +206,9 @@ Resources:
         Variables:
           TABLE_NAME: !Ref ProductCatalogTable
           QUEUE_URL: !Ref ProductCatalogQueue
-          ARK_SECRET_ARN: !Ref ArkApiSecret
-          ARK_BOT_ID: !Ref ArkBotId
-          ARK_API_URL: !Ref ArkApiUrl
+          DEEPSEEK_SECRET_ARN: !Ref DeepSeekApiSecret
+          DEEPSEEK_MODEL: !Ref DeepSeekModel
+          DEEPSEEK_API_URL: !Ref DeepSeekApiUrl
           MAX_CATEGORIES: !Ref MaxCategoriesPerRun
           MAX_BRANDS: !Ref MaxBrandsPerCategory
           MAX_MODELS: !Ref MaxModelsPerBrand
@@ -231,9 +231,9 @@ Resources:
           secretsmanager = boto3.client("secretsmanager")
 
           QUEUE_URL = os.environ["QUEUE_URL"]
-          API_URL = os.environ["ARK_API_URL"]
-          BOT_ID = os.environ["ARK_BOT_ID"]
-          SECRET_ARN = os.environ["ARK_SECRET_ARN"]
+          API_URL = os.environ["DEEPSEEK_API_URL"]
+          MODEL = os.environ["DEEPSEEK_MODEL"]
+          SECRET_ARN = os.environ["DEEPSEEK_SECRET_ARN"]
           MAX_CATEGORIES = int(os.environ.get("MAX_CATEGORIES", "20"))
           MAX_BRANDS = int(os.environ.get("MAX_BRANDS", "20"))
           MAX_MODELS = int(os.environ.get("MAX_MODELS", "50"))
@@ -258,7 +258,7 @@ Resources:
               response = secretsmanager.get_secret_value(SecretId=SECRET_ARN)
               secret_string = response.get("SecretString")
               if not secret_string:
-                  raise RuntimeError("Ark API secret has no SecretString value")
+                  raise RuntimeError("DeepSeek API secret has no SecretString value")
 
               try:
                   value = json.loads(secret_string)
@@ -267,7 +267,7 @@ Resources:
                   api_key = secret_string
 
               if not api_key:
-                  raise RuntimeError("Ark API secret does not contain apiKey")
+                  raise RuntimeError("DeepSeek API secret does not contain apiKey")
 
               _api_key_cache = api_key
               return _api_key_cache
@@ -296,83 +296,99 @@ Resources:
               if isinstance(content, list):
                   text_parts = []
                   for part in content:
-                      if isinstance(part, dict) and part.get("type") == "text":
-                          text_parts.append(str(part.get("text", "")))
+                      if isinstance(part, dict):
+                          if part.get("type") == "input_text":
+                              text_parts.append(str(part.get("text", "")))
+                          elif part.get("type") == "text":
+                              text_parts.append(str(part.get("text", "")))
                   content = "".join(text_parts)
 
               text = str(content or "").strip()
               text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
               text = re.sub(r"\s*```$", "", text)
+              
+              # Try to extract JSON from the text
+              json_match = re.search(r'\{[\s\S]*\}', text)
+              if json_match:
+                  text = json_match.group(0)
+              
               return json.loads(text)
 
 
-          def ark_prompt(task):
+          def build_deepseek_prompt(task):
               task_type = task["task_type"]
               max_items = int(task.get("max_items", 20))
 
               if task_type == "DISCOVER_CATEGORIES":
-                  objective = (
-                      "列出常见电子产品商品品类。每项只填写category；"
-                      "不要返回品牌、配件小类、服务或重复同义词。"
+                  instruction = (
+                      "List common electronic product categories. "
+                      "Each item should only have a category field. "
+                      "Do not include brands, accessories, services, or duplicate synonyms."
                   )
               elif task_type == "DISCOVER_BRANDS":
-                  objective = (
-                      f"列出电子产品品类“{normalize(task.get('category'))}”的真实品牌。"
-                      "每项填写category和brand；不要编造品牌。"
+                  category = normalize(task.get("category"))
+                  instruction = (
+                      f"List real brands for the electronic product category '{category}'. "
+                      "Each item should have category and brand fields. "
+                      "Do not invent brands."
                   )
               elif task_type == "DISCOVER_MODELS":
-                  objective = (
-                      f"列出品类“{normalize(task.get('category'))}”中品牌"
-                      f"“{normalize(task.get('brand'))}”的具体商品型号。"
-                      "每项填写category、brand、model、confidence；"
-                      "model必须是具体型号，不要只返回产品系列。"
+                  category = normalize(task.get("category"))
+                  brand = normalize(task.get("brand"))
+                  instruction = (
+                      f"List specific product models for brand '{brand}' in category '{category}'. "
+                      "Each item should have category, brand, model, and confidence fields. "
+                      "Model must be a specific product model, not just a product series."
                   )
               else:
                   raise ValueError(f"Unknown task_type: {task_type}")
 
-              return {
-                  "objective": objective,
-                  "output": {
-                      "format": "strict_json",
-                      "schema": {
-                          "items": [
-                              {
-                                  "category": "string",
-                                  "brand": "string or empty",
-                                  "model": "string or empty",
-                                  "confidence": "number from 0 to 1 or null",
-                              }
-                          ]
-                      },
-                      "max_items": max_items,
-                  },
-                  "rules": [
-                      "只返回JSON对象，不要Markdown，不要解释",
-                      "只包含有可靠依据的真实电子产品数据",
-                      "不确定时降低confidence，不要猜测或编造",
-                      "合并大小写、空格、全半角造成的重复项",
-                      "使用品牌官方常用名称和型号名称",
-                  ],
-              }
+              prompt = f"""
+              {instruction}
+
+              Return ONLY a JSON object with an "items" array containing up to {max_items} items.
+              Each item should have the following fields (use empty string for optional fields):
+              - category: string
+              - brand: string or empty
+              - model: string or empty
+              - confidence: number from 0 to 1 or null
+
+              Rules:
+              - Return only JSON, no markdown, no explanation
+              - Include only real electronic product data from reliable sources
+              - Lower confidence when uncertain, do not guess
+              - Merge duplicates by normalizing case, spacing, and full/half-width characters
+              - Use official brand names and model names
+              - If you need web search to find accurate information, use the web_search tool
+              """
+
+              return prompt
 
 
-          def call_ark(task):
+          def call_deepseek(task):
+              prompt = build_deepseek_prompt(task)
+              
+              # Use the responses API format with web search support
               body = {
-                  "model": BOT_ID,
+                  "model": MODEL,
                   "stream": False,
-                  "messages": [
+                  "tools": [
                       {
-                          "role": "system",
-                          "content": (
-                              "你是电子产品目录数据整理助手。"
-                              "严格依据任务返回JSON；禁止返回Markdown或解释文字。"
-                          ),
-                      },
+                          "type": "web_search",
+                          "max_keyword": 3
+                      }
+                  ],
+                  "input": [
                       {
                           "role": "user",
-                          "content": json.dumps(ark_prompt(task), ensure_ascii=False),
-                      },
-                  ],
+                          "content": [
+                              {
+                                  "type": "input_text",
+                                  "text": prompt
+                              }
+                          ]
+                      }
+                  ]
               }
 
               encoded_body = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -393,31 +409,63 @@ Resources:
                   try:
                       with urllib.request.urlopen(request, timeout=90) as response:
                           result = json.loads(response.read().decode("utf-8"))
-                          content = result["choices"][0]["message"]["content"]
+                          
+                          # Extract the response content
+                          if "output" in result:
+                              # Handle responses API format
+                              output_text = ""
+                              for item in result.get("output", []):
+                                  if item.get("type") == "message":
+                                      content_items = item.get("content", [])
+                                      for content in content_items:
+                                          if content.get("type") in ["output_text", "text"]:
+                                              output_text += content.get("text", "")
+                              content = output_text
+                          elif "choices" in result and len(result["choices"]) > 0:
+                              # Handle chat completions API format
+                              message = result["choices"][0].get("message", {})
+                              content = message.get("content", "")
+                          else:
+                              # Fallback: try to get content from response
+                              content = result.get("content") or result.get("text") or json.dumps(result)
+
                           parsed = clean_json_content(content)
                           items = parsed.get("items", [])
                           if not isinstance(items, list):
-                              raise ValueError("Ark response items is not a list")
+                              # Try to extract items from a different structure
+                              if "items" in parsed:
+                                  items = parsed["items"]
+                              else:
+                                  # Try to find any list in the response
+                                  for key, value in parsed.items():
+                                      if isinstance(value, list):
+                                          items = value
+                                          break
+                          
+                          if not isinstance(items, list):
+                              raise ValueError("DeepSeek response items is not a list")
+                          
+                          # Log usage info if available
                           usage = result.get("usage", {})
-                          log("INFO", "Ark request completed", usage=usage, item_count=len(items))
+                          log("INFO", "DeepSeek request completed", usage=usage, item_count=len(items))
                           return items
 
                   except urllib.error.HTTPError as error:
                       error_body = error.read().decode("utf-8", errors="replace")
                       last_error = RuntimeError(
-                          f"Ark HTTP {error.code}: {error_body[:1000]}"
+                          f"DeepSeek HTTP {error.code}: {error_body[:1000]}"
                       )
                       if error.code not in retryable_codes:
                           raise last_error
 
                   except (urllib.error.URLError, TimeoutError) as error:
-                      last_error = RuntimeError(f"Ark network error: {error}")
+                      last_error = RuntimeError(f"DeepSeek network error: {error}")
 
                   if attempt < 2:
                       delay = (2 ** attempt) + random.random()
                       time.sleep(delay)
 
-              raise last_error or RuntimeError("Ark request failed")
+              raise last_error or RuntimeError("DeepSeek request failed")
 
 
           def upsert_category(category):
@@ -446,7 +494,7 @@ Resources:
                       ":name": category,
                       ":status": "ACTIVE",
                       ":now": now,
-                      ":source": "ARK_AI",
+                      ":source": "DEEPSEEK_AI",
                   },
               )
 
@@ -478,7 +526,7 @@ Resources:
                       ":brand": brand,
                       ":status": "ACTIVE",
                       ":now": now,
-                      ":source": "ARK_AI",
+                      ":source": "DEEPSEEK_AI",
                   },
               )
 
@@ -510,7 +558,7 @@ Resources:
                   ":status": "ACTIVE",
                   ":unverified": "UNVERIFIED",
                   ":now": now,
-                  ":source": "ARK_AI",
+                  ":source": "DEEPSEEK_AI",
               }
 
               if confidence is not None:
@@ -572,7 +620,7 @@ Resources:
 
           def process_task(task):
               task_type = task.get("task_type")
-              items = call_ark(task)
+              items = call_deepseek(task)
 
               if task_type == "DISCOVER_CATEGORIES":
                   for item in unique_items(items, ["category"]):
@@ -749,13 +797,13 @@ Outputs:
     Description: SQS dead-letter queue URL.
     Value: !Ref ProductCatalogDLQ
 
-  ArkApiSecretArn:
-    Description: Store the Ark API key in this Secrets Manager secret.
-    Value: !Ref ArkApiSecret
+  DeepSeekApiSecretArn:
+    Description: Store the DeepSeek API key in this Secrets Manager secret.
+    Value: !Ref DeepSeekApiSecret
 
-  ArkApiSecretName:
+  DeepSeekApiSecretName:
     Description: Secrets Manager secret name.
-    Value: !Sub "ProductCatalog/ArkApiKey/${Environment}"
+    Value: !Sub "ProductCatalog/DeepSeekApiKey/${Environment}"
 
   SchedulerName:
     Description: EventBridge Scheduler schedule name.
