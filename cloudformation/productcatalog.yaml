@@ -38,9 +38,8 @@ Parameters:
 
   LambdaReservedConcurrency:
     Type: Number
-    Default: 2
-    MinValue: 2
-    MaxValue: 10
+    Default: 0
+    MinValue: 0
 
   WorkerMaximumConcurrency:
     Type: Number
