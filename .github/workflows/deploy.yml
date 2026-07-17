@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       environment:
-        description: 'Environment (dev/test/prod)'
+        description: 'Environment'
         required: true
         default: 'dev'
         type: choice
@@ -12,24 +12,54 @@ on:
           - dev
           - test
           - prod
+      
+      # ========== 部署选择 ==========
+      deploy_secret:
+        description: 'Deploy DeepSeek Secret?'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      
+      deploy_main_app:
+        description: 'Deploy Main Application?'
+        required: true
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      
+      # ========== Secret 参数 ==========
+      api_key:
+        description: 'DeepSeek API Key (sk-xxx) - required if deploy_secret=true'
+        required: false
+        type: string
+      
+      # ========== 主应用参数 ==========
       schedule_state:
-        description: 'Schedule state (ENABLED/DISABLED)'
+        description: 'Schedule state'
         required: true
         default: 'DISABLED'
         type: choice
         options:
           - ENABLED
           - DISABLED
+      
       max_categories:
-        description: 'Max categories per run'
+        description: 'Max categories'
         required: false
         default: '20'
         type: string
+      
       max_brands:
         description: 'Max brands per category'
         required: false
         default: '20'
         type: string
+      
       max_models:
         description: 'Max models per brand'
         required: false
@@ -49,13 +79,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Debug Context
-        run: |
-          echo "Repository=$GITHUB_REPOSITORY"
-          echo "Ref=$GITHUB_REF"
-          echo "Actor=$GITHUB_ACTOR"
-          echo "Environment=${{ github.event.inputs.environment }}"
-
       - name: Configure AWS
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -65,76 +88,75 @@ jobs:
       - name: Verify AWS Identity
         run: aws sts get-caller-identity
 
-      - name: Get Secret ARN
-        id: get-secret
-        run: |
-          SECRET_STACK="productcatalog-secret-${{ github.event.inputs.environment }}"
-          
-          # Check if secret stack exists
-          if aws cloudformation describe-stacks --stack-name "$SECRET_STACK" &>/dev/null; then
-            SECRET_ARN=$(aws cloudformation describe-stacks \
-              --stack-name "$SECRET_STACK" \
-              --query "Stacks[0].Outputs[?OutputKey=='DeepSeekApiSecretArn'].OutputValue" \
-              --output text)
-            
-            echo "secret_arn=$SECRET_ARN" >> $GITHUB_OUTPUT
-            echo "✅ Found secret: $SECRET_ARN"
-          else
-            echo "⚠️ Secret stack not found. Please deploy secret.yaml first."
-            echo "secret_arn=" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Validate Main Template
+      - name: Validate Template
         run: |
           aws cloudformation validate-template \
-            --template-body file://cloudformation/main.yaml
+            --template-body file://cloudformation/productcatalog.yaml
 
-      - name: Clean Rollback Stack
-        run: |
-          STATUS=$(aws cloudformation describe-stacks \
-            --stack-name productcatalog-app-${{ github.event.inputs.environment }} \
-            --query 'Stacks[0].StackStatus' \
-            --output text 2>/dev/null || echo "NOT_FOUND")
-
-          echo "Stack Status: $STATUS"
-
-          if [ "$STATUS" = "ROLLBACK_COMPLETE" ]; then
-            echo "Deleting rollback stack..."
-
-            aws cloudformation delete-stack \
-              --stack-name productcatalog-app-${{ github.event.inputs.environment }}
-
-            aws cloudformation wait stack-delete-complete \
-              --stack-name productcatalog-app-${{ github.event.inputs.environment }}
-
-            echo "Rollback stack deleted."
-          fi
-
-      - name: Deploy CloudFormation
+      - name: Deploy Stack
         run: |
           STACK_NAME="productcatalog-app-${{ github.event.inputs.environment }}"
-          SECRET_ARN="${{ steps.get-secret.outputs.secret_arn }}"
-
+          
+          echo "=========================================="
           echo "Deploying stack: $STACK_NAME"
+          echo "Deploy Secret: ${{ github.event.inputs.deploy_secret }}"
+          echo "Deploy Main App: ${{ github.event.inputs.deploy_main_app }}"
+          echo "=========================================="
 
-          # Build parameter overrides
+          # 构建参数
           PARAMS="Environment=${{ github.event.inputs.environment }} \
+            DeploySecret=${{ github.event.inputs.deploy_secret }} \
+            DeployMainApp=${{ github.event.inputs.deploy_main_app }} \
             ScheduleState=${{ github.event.inputs.schedule_state }} \
             MaxCategoriesPerRun=${{ github.event.inputs.max_categories }} \
             MaxBrandsPerCategory=${{ github.event.inputs.max_brands }} \
             MaxModelsPerBrand=${{ github.event.inputs.max_models }}"
 
-          # Add secret ARN if available, otherwise use secret name
-          if [ -n "$SECRET_ARN" ]; then
-            PARAMS="$PARAMS DeepSeekSecretArn=$SECRET_ARN"
-            echo "🔑 Using Secret ARN: $SECRET_ARN"
-          else
-            PARAMS="$PARAMS DeepSeekSecretName=ProductCatalog/DeepSeekApiKey"
-            echo "⚠️ Using secret name (secret stack may not exist)"
+          # 如果部署 Secret，添加 API Key
+          if [ "${{ github.event.inputs.deploy_secret }}" = "true" ]; then
+            if [ -n "${{ github.event.inputs.api_key }}" ]; then
+              PARAMS="$PARAMS DeepSeekApiKey=${{ github.event.inputs.api_key }}"
+              echo "✅ API Key provided"
+            else
+              echo "⚠️ WARNING: deploy_secret=true but no API key provided"
+              echo "   Secret will be created with placeholder value"
+            fi
           fi
 
+          # 如果只部署主应用（不部署新 Secret），尝试获取已有 Secret ARN
+          if [ "${{ github.event.inputs.deploy_secret }}" = "false" ] && [ "${{ github.event.inputs.deploy_main_app }}" = "true" ]; then
+            # 尝试从已有栈获取 Secret ARN
+            SECRET_STACK="productcatalog-secret-${{ github.event.inputs.environment }}"
+            if aws cloudformation describe-stacks --stack-name "$SECRET_STACK" &>/dev/null; then
+              SECRET_ARN=$(aws cloudformation describe-stacks \
+                --stack-name "$SECRET_STACK" \
+                --query "Stacks[0].Outputs[?OutputKey=='DeepSeekApiSecretArn'].OutputValue" \
+                --output text 2>/dev/null || echo "")
+              
+              if [ -n "$SECRET_ARN" ]; then
+                PARAMS="$PARAMS DeepSeekSecretArn=$SECRET_ARN"
+                echo "✅ Found existing Secret ARN: $SECRET_ARN"
+              fi
+            else
+              # 尝试通过名称查找
+              SECRET_NAME="ProductCatalog/DeepSeekApiKey/${{ github.event.inputs.environment }}"
+              if aws secretsmanager describe-secret --secret-id "$SECRET_NAME" &>/dev/null; then
+                echo "✅ Found existing secret by name: $SECRET_NAME"
+                # 不传 ARN，让模板通过名称查找
+              else
+                echo "⚠️ WARNING: No existing secret found!"
+                echo "   Please deploy secret first or set deploy_secret=true"
+              fi
+            fi
+          fi
+
+          echo ""
+          echo "📋 Parameters:"
+          echo "$PARAMS" | tr ' ' '\n'
+          echo ""
+
           aws cloudformation deploy \
-            --template-file cloudformation/main.yaml \
+            --template-file cloudformation/productcatalog.yaml \
             --stack-name "$STACK_NAME" \
             --parameter-overrides $PARAMS \
             --capabilities CAPABILITY_NAMED_IAM \
@@ -144,26 +166,19 @@ jobs:
         if: success()
         run: |
           STACK_NAME="productcatalog-app-${{ github.event.inputs.environment }}"
-
-          echo "===== PRODUCT CATALOG STACK OUTPUTS ====="
-
+          
+          echo "===== STACK OUTPUTS ====="
           aws cloudformation describe-stacks \
             --stack-name "$STACK_NAME" \
             --query 'Stacks[0].Outputs' \
             --output table
 
-          echo ""
-          echo "📋 Useful URLs:"
-          echo "  - Lambda: https://console.aws.amazon.com/lambda/home?region=ap-northeast-1#/functions/productcatalog-app-${{ github.event.inputs.environment }}"
-          echo "  - DynamoDB: https://console.aws.amazon.com/dynamodbv2/home?region=ap-northeast-1#/table/productcatalog-app-${{ github.event.inputs.environment }}"
-
       - name: Show Failed Resources
         if: failure()
         run: |
           STACK_NAME="productcatalog-app-${{ github.event.inputs.environment }}"
-
+          
           echo "===== FAILED EVENTS ====="
-
           aws cloudformation describe-stack-events \
             --stack-name "$STACK_NAME" \
             --query "StackEvents[?contains(ResourceStatus,'FAILED')].[LogicalResourceId,ResourceStatus,ResourceStatusReason]" \
