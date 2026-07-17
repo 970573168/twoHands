@@ -1,9 +1,7 @@
-name: Deploy Product Catalog
+name: Deploy Product Catalog - Small Test
 
 on:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
 
 permissions:
   id-token: write
@@ -37,11 +35,25 @@ jobs:
           aws cloudformation validate-template \
             --template-body file://cloudformation/productcatalog.yaml
 
-      - name: Deploy CloudFormation
+      - name: Deploy CloudFormation - Small Test
         run: |
           aws cloudformation deploy \
             --template-file cloudformation/productcatalog.yaml \
             --stack-name productcatalog-app-dev \
-            --parameter-overrides Environment=dev \
+            --parameter-overrides \
+              Environment=dev \
+              ScheduleState=DISABLED \
+              LambdaReservedConcurrency=2 \
+              WorkerMaximumConcurrency=2 \
+              MaxCategoriesPerRun=1 \
+              MaxBrandsPerCategory=1 \
+              MaxModelsPerBrand=3 \
             --capabilities CAPABILITY_NAMED_IAM \
             --no-fail-on-empty-changeset
+
+      - name: Show Stack Outputs
+        run: |
+          aws cloudformation describe-stacks \
+            --stack-name productcatalog-app-dev \
+            --query 'Stacks[0].Outputs' \
+            --output table
