@@ -22,7 +22,7 @@ Parameters:
     AllowedValues:
       - "true"
       - "false"
-    Description: 是否部署 DeepSeek API Secret（首次部署设为 true，后续可设为 false）
+    Description: 是否部署 DeepSeek API Secret
 
   DeepSeekApiKey:
     Type: String
@@ -42,12 +42,12 @@ Parameters:
     AllowedValues:
       - "true"
       - "false"
-    Description: 是否部署主应用（DynamoDB, SQS, Lambda, Scheduler）
+    Description: 是否部署主应用
 
   DeepSeekSecretArn:
     Type: String
     Default: ""
-    Description: 已有 Secret 的 ARN（如果 DeployMainApp=true 且不部署新 Secret）
+    Description: 已有 Secret 的 ARN
 
   DeepSeekModel:
     Type: String
@@ -71,63 +71,54 @@ Parameters:
       - ENABLED
       - DISABLED
     Description: 调度器状态
-
-  LambdaReservedConcurrency:
-    Type: Number
-    Default: 0
-    MinValue: 0
-
+    
   WorkerMaximumConcurrency:
     Type: Number
     Default: 2
     MinValue: 2
     MaxValue: 10
+    Description: Lambda 最大并发数
 
   MaxCategoriesPerRun:
     Type: Number
     Default: 20
     MinValue: 1
     MaxValue: 100
+    Description: 每次运行发现的最大品类数
 
   MaxBrandsPerCategory:
     Type: Number
     Default: 20
     MinValue: 1
     MaxValue: 100
+    Description: 每个品类发现的最大品牌数
 
   MaxModelsPerBrand:
     Type: Number
     Default: 50
     MinValue: 1
     MaxValue: 100
+    Description: 每个品牌发现的最大型号数
 
   LogRetentionDays:
     Type: Number
     Default: 14
     MinValue: 1
     MaxValue: 3653
+    Description: CloudWatch 日志保留天数
 
   QueueAlarmThreshold:
     Type: Number
     Default: 100
     MinValue: 1
+    Description: 队列深度告警阈值
 
 Conditions:
-  # ============ 部署条件 ============
   DeploySecretCondition: !Equals [!Ref DeploySecret, "true"]
   DeployMainAppCondition: !Equals [!Ref DeployMainApp, "true"]
-  
-  # Secret 引用条件
   UseExistingSecretArn: !And
     - !Condition DeployMainAppCondition
     - !Not [!Equals [!Ref DeepSeekSecretArn, ""]]
-  
-  UseNewSecret: !And
-    - !Condition DeployMainAppCondition
-    - !Not [!Condition DeploySecretCondition]
-    - !Equals [!Ref DeepSeekSecretArn, ""]
-
-  # 验证 DeepSeekApiKey 是否提供
   HasApiKey: !Not [!Equals [!Ref DeepSeekApiKey, ""]]
 
 Resources:
@@ -143,7 +134,7 @@ Resources:
       SecretString: !If
         - HasApiKey
         - !Sub '{"apiKey":"${DeepSeekApiKey}"}'
-        - !Sub '{"apiKey":"PLACEHOLDER-REPLACE-ME"}'
+        - '{"apiKey":"PLACEHOLDER-REPLACE-ME"}'
       Tags:
         - Key: Application
           Value: ProductCatalog
@@ -315,8 +306,464 @@ Resources:
           MAX_MODELS: !Ref MaxModelsPerBrand
       Code:
         ZipFile: |
-          # (Lambda 代码保持不变，与之前相同)
-          # 为了简洁，这里省略，实际使用时复制完整代码
+          import hashlib
+          import json
+          import os
+          import random
+          import re
+          import time
+          import urllib.error
+          import urllib.request
+
+          import boto3
+
+          dynamodb = boto3.resource("dynamodb")
+          table = dynamodb.Table(os.environ["TABLE_NAME"])
+          sqs = boto3.client("sqs")
+          secretsmanager = boto3.client("secretsmanager")
+
+          QUEUE_URL = os.environ["QUEUE_URL"]
+          API_URL = os.environ["DEEPSEEK_API_URL"]
+          MODEL = os.environ["DEEPSEEK_MODEL"]
+          SECRET_ARN = os.environ["DEEPSEEK_SECRET_ARN"]
+          MAX_CATEGORIES = int(os.environ.get("MAX_CATEGORIES", "20"))
+          MAX_BRANDS = int(os.environ.get("MAX_BRANDS", "20"))
+          MAX_MODELS = int(os.environ.get("MAX_MODELS", "50"))
+
+          _api_key_cache = None
+
+
+          def log(level, message, **fields):
+              entry = {
+                  "level": level,
+                  "message": message,
+                  **fields,
+              }
+              print(json.dumps(entry, ensure_ascii=False, default=str))
+
+
+          def get_api_key():
+              global _api_key_cache
+              if _api_key_cache:
+                  return _api_key_cache
+
+              response = secretsmanager.get_secret_value(SecretId=SECRET_ARN)
+              secret_string = response.get("SecretString")
+              if not secret_string:
+                  raise RuntimeError("DeepSeek API secret has no SecretString value")
+
+              try:
+                  value = json.loads(secret_string)
+                  api_key = value.get("apiKey")
+              except json.JSONDecodeError:
+                  api_key = secret_string
+
+              if not api_key:
+                  raise RuntimeError("DeepSeek API secret does not contain apiKey")
+
+              _api_key_cache = api_key
+              return _api_key_cache
+
+
+          def normalize(value):
+              value = str(value or "").strip()
+              return re.sub(r"\s+", " ", value)
+
+
+          def key_part(value):
+              value = normalize(value).upper()
+              value = re.sub(r"[^A-Z0-9\u4e00-\u9fff]+", "-", value)
+              return value.strip("-")[:180]
+
+
+          def stable_id(*values):
+              raw = "|".join(normalize(value).casefold() for value in values)
+              return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+          def clean_json_content(content):
+              if isinstance(content, dict):
+                  return content
+
+              if isinstance(content, list):
+                  text_parts = []
+                  for part in content:
+                      if isinstance(part, dict):
+                          if part.get("type") == "input_text":
+                              text_parts.append(str(part.get("text", "")))
+                          elif part.get("type") == "text":
+                              text_parts.append(str(part.get("text", "")))
+                  content = "".join(text_parts)
+
+              text = str(content or "").strip()
+              text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+              text = re.sub(r"\s*```$", "", text)
+              
+              json_match = re.search(r'\{[\s\S]*\}', text)
+              if json_match:
+                  text = json_match.group(0)
+              
+              return json.loads(text)
+
+
+          def build_deepseek_prompt(task):
+              task_type = task["task_type"]
+              max_items = int(task.get("max_items", 20))
+
+              if task_type == "DISCOVER_CATEGORIES":
+                  instruction = (
+                      "列出常见的电子产品品类。"
+                      "每个条目只需要包含 category 字段。"
+                      "不要包含品牌、配件、服务或重复的同义词。"
+                  )
+              elif task_type == "DISCOVER_BRANDS":
+                  category = normalize(task.get("category"))
+                  instruction = (
+                      f"列出电子产品品类 '{category}' 的真实品牌。"
+                      "每个条目需要包含 category 和 brand 字段。"
+                      "不要编造品牌。"
+                  )
+              elif task_type == "DISCOVER_MODELS":
+                  category = normalize(task.get("category"))
+                  brand = normalize(task.get("brand"))
+                  instruction = (
+                      f"列出品牌 '{brand}' 在品类 '{category}' 中的具体产品型号。"
+                      "每个条目需要包含 category、brand、model 和 confidence 字段。"
+                      "型号必须是具体的产品型号，而不是产品系列。"
+                  )
+              else:
+                  raise ValueError(f"Unknown task_type: {task_type}")
+
+              prompt = f"""
+              {instruction}
+
+              只返回一个包含 "items" 数组的 JSON 对象，最多 {max_items} 个条目。
+              每个条目应包含以下字段（可选字段使用空字符串）：
+              - category: 字符串
+              - brand: 字符串或空
+              - model: 字符串或空
+              - confidence: 0-1 的数字或 null
+
+              规则：
+              - 只返回 JSON，不要 markdown，不要解释
+              - 只包含来自可靠来源的真实电子产品数据
+              - 不确定时降低 confidence，不要猜测
+              - 通过规范化大小写、空格和全角/半角字符来合并重复项
+              - 使用官方品牌名称和型号名称
+              - 如果需要网络搜索获取准确信息，请使用 web_search 工具
+              """
+
+              return prompt
+
+
+          def call_deepseek(task):
+              prompt = build_deepseek_prompt(task)
+              
+              body = {
+                  "model": MODEL,
+                  "stream": False,
+                  "tools": [
+                      {
+                          "type": "web_search",
+                          "max_keyword": 3
+                      }
+                  ],
+                  "input": [
+                      {
+                          "role": "user",
+                          "content": [
+                              {
+                                  "type": "input_text",
+                                  "text": prompt
+                              }
+                          ]
+                      }
+                  ]
+              }
+
+              encoded_body = json.dumps(body, ensure_ascii=False).encode("utf-8")
+              retryable_codes = {408, 409, 429, 500, 502, 503, 504}
+              last_error = None
+
+              for attempt in range(3):
+                  request = urllib.request.Request(
+                      API_URL,
+                      data=encoded_body,
+                      headers={
+                          "Authorization": "Bearer " + get_api_key(),
+                          "Content-Type": "application/json",
+                      },
+                      method="POST",
+                  )
+
+                  try:
+                      with urllib.request.urlopen(request, timeout=90) as response:
+                          result = json.loads(response.read().decode("utf-8"))
+                          
+                          if "output" in result:
+                              output_text = ""
+                              for item in result.get("output", []):
+                                  if item.get("type") == "message":
+                                      content_items = item.get("content", [])
+                                      for content in content_items:
+                                          if content.get("type") in ["output_text", "text"]:
+                                              output_text += content.get("text", "")
+                              content = output_text
+                          elif "choices" in result and len(result["choices"]) > 0:
+                              message = result["choices"][0].get("message", {})
+                              content = message.get("content", "")
+                          else:
+                              content = result.get("content") or result.get("text") or json.dumps(result)
+
+                          parsed = clean_json_content(content)
+                          items = parsed.get("items", [])
+                          if not isinstance(items, list):
+                              if "items" in parsed:
+                                  items = parsed["items"]
+                              else:
+                                  for key, value in parsed.items():
+                                      if isinstance(value, list):
+                                          items = value
+                                          break
+                          
+                          if not isinstance(items, list):
+                              raise ValueError("DeepSeek response items is not a list")
+                          
+                          usage = result.get("usage", {})
+                          log("INFO", "DeepSeek request completed", usage=usage, item_count=len(items))
+                          return items
+
+                  except urllib.error.HTTPError as error:
+                      error_body = error.read().decode("utf-8", errors="replace")
+                      last_error = RuntimeError(
+                          f"DeepSeek HTTP {error.code}: {error_body[:1000]}"
+                      )
+                      if error.code not in retryable_codes:
+                          raise last_error
+
+                  except (urllib.error.URLError, TimeoutError) as error:
+                      last_error = RuntimeError(f"DeepSeek network error: {error}")
+
+                  if attempt < 2:
+                      delay = (2 ** attempt) + random.random()
+                      time.sleep(delay)
+
+              raise last_error or RuntimeError("DeepSeek request failed")
+
+
+          def upsert_category(category):
+              category = normalize(category)
+              if not category:
+                  return
+
+              now = int(time.time())
+              table.update_item(
+                  Key={
+                      "PK": f"CATEGORY#{key_part(category)}",
+                      "SK": "META",
+                  },
+                  UpdateExpression=(
+                      "SET entity_type = :type, #name = :name, #status = :status, "
+                      "first_seen_at = if_not_exists(first_seen_at, :now), "
+                      "last_seen_at = :now, #source = :source"
+                  ),
+                  ExpressionAttributeNames={
+                      "#name": "name",
+                      "#status": "status",
+                      "#source": "source",
+                  },
+                  ExpressionAttributeValues={
+                      ":type": "CATEGORY",
+                      ":name": category,
+                      ":status": "ACTIVE",
+                      ":now": now,
+                      ":source": "DEEPSEEK_AI",
+                  },
+              )
+
+
+          def upsert_brand(category, brand):
+              category = normalize(category)
+              brand = normalize(brand)
+              if not category or not brand:
+                  return
+
+              now = int(time.time())
+              table.update_item(
+                  Key={
+                      "PK": f"CATEGORY#{key_part(category)}",
+                      "SK": f"BRAND#{key_part(brand)}",
+                  },
+                  UpdateExpression=(
+                      "SET entity_type = :type, category = :category, brand = :brand, "
+                      "#status = :status, first_seen_at = if_not_exists(first_seen_at, :now), "
+                      "last_seen_at = :now, #source = :source"
+                  ),
+                  ExpressionAttributeNames={
+                      "#status": "status",
+                      "#source": "source",
+                  },
+                  ExpressionAttributeValues={
+                      ":type": "BRAND",
+                      ":category": category,
+                      ":brand": brand,
+                      ":status": "ACTIVE",
+                      ":now": now,
+                      ":source": "DEEPSEEK_AI",
+                  },
+              )
+
+
+          def upsert_product(category, brand, model, confidence=None):
+              category = normalize(category)
+              brand = normalize(brand)
+              model = normalize(model)
+              if not category or not brand or not model:
+                  return
+
+              now = int(time.time())
+              product_id = stable_id(category, brand, model)
+              product_pk = f"PRODUCT#{product_id}"
+
+              expression = (
+                  "SET entity_type = :type, category = :category, brand = :brand, "
+                  "model = :model, normalized_model = :normalized_model, "
+                  "#status = :status, verification_status = if_not_exists(verification_status, :unverified), "
+                  "first_seen_at = if_not_exists(first_seen_at, :now), last_seen_at = :now, "
+                  "#source = :source"
+              )
+              values = {
+                  ":type": "PRODUCT",
+                  ":category": category,
+                  ":brand": brand,
+                  ":model": model,
+                  ":normalized_model": normalize(model).casefold(),
+                  ":status": "ACTIVE",
+                  ":unverified": "UNVERIFIED",
+                  ":now": now,
+                  ":source": "DEEPSEEK_AI",
+              }
+
+              if confidence is not None:
+                  try:
+                      confidence_text = str(max(0.0, min(1.0, float(confidence))))
+                      expression += ", confidence = :confidence"
+                      values[":confidence"] = confidence_text
+                  except (TypeError, ValueError):
+                      pass
+
+              table.update_item(
+                  Key={"PK": product_pk, "SK": "META"},
+                  UpdateExpression=expression,
+                  ExpressionAttributeNames={
+                      "#status": "status",
+                      "#source": "source",
+                  },
+                  ExpressionAttributeValues=values,
+              )
+
+              table.update_item(
+                  Key={
+                      "PK": f"BRAND#{key_part(brand)}",
+                      "SK": f"MODEL#{key_part(model)}",
+                  },
+                  UpdateExpression=(
+                      "SET entity_type = :type, category = :category, brand = :brand, "
+                      "model = :model, product_pk = :product_pk, last_seen_at = :now"
+                  ),
+                  ExpressionAttributeValues={
+                      ":type": "BRAND_MODEL",
+                      ":category": category,
+                      ":brand": brand,
+                      ":model": model,
+                      ":product_pk": product_pk,
+                      ":now": now,
+                  },
+              )
+
+
+          def enqueue(task):
+              sqs.send_message(
+                  QueueUrl=QUEUE_URL,
+                  MessageBody=json.dumps(task, ensure_ascii=False),
+              )
+
+
+          def unique_items(items, fields):
+              seen = set()
+              for item in items:
+                  if not isinstance(item, dict):
+                      continue
+                  signature = tuple(normalize(item.get(field)).casefold() for field in fields)
+                  if not all(signature) or signature in seen:
+                      continue
+                  seen.add(signature)
+                  yield item
+
+
+          def process_task(task):
+              task_type = task.get("task_type")
+              items = call_deepseek(task)
+
+              if task_type == "DISCOVER_CATEGORIES":
+                  for item in unique_items(items, ["category"]):
+                      category = normalize(item.get("category"))
+                      upsert_category(category)
+                      enqueue({
+                          "task_type": "DISCOVER_BRANDS",
+                          "category": category,
+                          "max_items": MAX_BRANDS,
+                      })
+
+              elif task_type == "DISCOVER_BRANDS":
+                  category = normalize(task.get("category"))
+                  for item in unique_items(items, ["brand"]):
+                      brand = normalize(item.get("brand"))
+                      upsert_brand(category, brand)
+                      enqueue({
+                          "task_type": "DISCOVER_MODELS",
+                          "category": category,
+                          "brand": brand,
+                          "max_items": MAX_MODELS,
+                      })
+
+              elif task_type == "DISCOVER_MODELS":
+                  category = normalize(task.get("category"))
+                  brand = normalize(task.get("brand"))
+                  for item in unique_items(items, ["model"]):
+                      upsert_product(
+                          category=category,
+                          brand=brand,
+                          model=item.get("model"),
+                          confidence=item.get("confidence"),
+                      )
+
+              else:
+                  raise ValueError(f"Unknown task_type: {task_type}")
+
+              log("INFO", "Task completed", task_type=task_type, received_items=len(items))
+
+
+          def lambda_handler(event, context):
+              failures = []
+
+              for record in event.get("Records", []):
+                  message_id = record.get("messageId", "unknown")
+                  try:
+                      task = json.loads(record["body"])
+                      log("INFO", "Processing task", message_id=message_id, task=task)
+                      process_task(task)
+                  except Exception as error:
+                      log(
+                          "ERROR",
+                          "Task failed",
+                          message_id=message_id,
+                          error_type=type(error).__name__,
+                          error=str(error),
+                      )
+                      failures.append({"itemIdentifier": message_id})
+
+              return {"batchItemFailures": failures}
 
   # ---------- Lambda 事件源映射 ----------
   ProductCatalogEventSourceMapping:
@@ -459,12 +906,33 @@ Outputs:
     Export:
       Name: !Sub "${AWS::StackName}-LambdaName"
 
+  WorkerLambdaArn:
+    Description: Lambda Worker 函数 ARN
+    Condition: DeployMainAppCondition
+    Value: !GetAtt ProductCatalogWorker.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaArn"
+
   WorkerQueueUrl:
     Description: SQS Worker 队列 URL
     Condition: DeployMainAppCondition
     Value: !Ref ProductCatalogQueue
     Export:
       Name: !Sub "${AWS::StackName}-QueueUrl"
+
+  WorkerQueueArn:
+    Description: SQS Worker 队列 ARN
+    Condition: DeployMainAppCondition
+    Value: !GetAtt ProductCatalogQueue.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-QueueArn"
+
+  DeadLetterQueueUrl:
+    Description: SQS 死信队列 URL
+    Condition: DeployMainAppCondition
+    Value: !Ref ProductCatalogDLQ
+    Export:
+      Name: !Sub "${AWS::StackName}-DLQUrl"
 
   SchedulerName:
     Description: EventBridge Scheduler 名称
