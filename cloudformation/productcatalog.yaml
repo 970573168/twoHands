@@ -96,8 +96,6 @@ Resources:
 
   ArkApiSecret:
     Type: AWS::SecretsManager::Secret
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
     Properties:
       Name: !Sub "ProductCatalog/ArkApiKey/${Environment}"
       Description: Volcengine Ark API key. Store JSON in the form {"apiKey":"..."} after stack creation.
