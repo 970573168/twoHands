@@ -17,7 +17,7 @@ on:
       deploy_secret:
         description: 'Deploy DeepSeek Secret?'
         required: true
-        default: 'true'
+        default: 'false'
         type: choice
         options:
           - 'true'
