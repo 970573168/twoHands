@@ -71,13 +71,13 @@ Parameters:
       - ENABLED
       - DISABLED
     Description: 调度器状态
-    
+
   WorkerMaximumConcurrency:
     Type: Number
     Default: 2
-    MinValue: 2
+    MinValue: 1
     MaxValue: 10
-    Description: Lambda 最大并发数
+    Description: Lambda 最大并发数（SQS 事件源映射控制）
 
   MaxCategoriesPerRun:
     Type: Number
@@ -287,7 +287,6 @@ Resources:
       Timeout: 300
       MemorySize: 256
       Role: !GetAtt LambdaExecutionRole.Arn
-      ReservedConcurrentExecutions: !Ref LambdaReservedConcurrency
       Environment:
         Variables:
           TABLE_NAME: !Ref ProductCatalogTable
