@@ -4,60 +4,60 @@ on:
   workflow_dispatch:
     inputs:
       environment:
-        description: 'Environment'
+        description: "Environment"
         required: true
-        default: 'dev'
+        default: "dev"
         type: choice
         options:
           - dev
           - test
           - prod
-      
+
       deploy_secret:
-        description: 'Deploy DeepSeek Secret?'
+        description: "Deploy DeepSeek Secret?"
         required: true
-        default: 'false'
+        default: "false"
         type: choice
         options:
-          - 'true'
-          - 'false'
-      
+          - "true"
+          - "false"
+
       deploy_main_app:
-        description: 'Deploy Main Application?'
+        description: "Deploy Main Application?"
         required: true
-        default: 'true'
+        default: "true"
         type: choice
         options:
-          - 'true'
-          - 'false'
-      
+          - "true"
+          - "false"
+
       api_key:
-        description: 'DeepSeek API Key (required if deploy_secret=true)'
+        description: "DeepSeek API Key (required if deploy_secret=true)"
         required: false
         type: string
-      
+
       s3_bucket:
-        description: 'S3 bucket name prefix for Lambda code'
+        description: "S3 bucket name prefix for Lambda code"
         required: true
-        default: 'productcatalog-lambda-code'
+        default: "productcatalog-lambda-code"
         type: string
-      
+
       max_categories:
-        description: 'Max categories per run'
+        description: "Max categories per run"
         required: false
-        default: '20'
+        default: "20"
         type: string
-      
+
       max_brands:
-        description: 'Max brands per category'
+        description: "Max brands per category"
         required: false
-        default: '20'
+        default: "20"
         type: string
-      
+
       max_models:
-        description: 'Max models per brand'
+        description: "Max models per brand"
         required: false
-        default: '50'
+        default: "50"
         type: string
 
 permissions:
@@ -80,84 +80,140 @@ jobs:
           aws-region: ap-northeast-1
 
       - name: Verify AWS Identity
-        run: aws sts get-caller-identity
+        run: |
+          aws sts get-caller-identity
+
+      - name: Prepare Deployment Variables
+        run: |
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          S3_BUCKET_BASE="${{ github.event.inputs.s3_bucket }}"
+          S3_BUCKET="${S3_BUCKET_BASE}-${AWS_ACCOUNT_ID}"
+
+          echo "AWS_ACCOUNT_ID=$AWS_ACCOUNT_ID" >> "$GITHUB_ENV"
+          echo "AWS_REGION=ap-northeast-1" >> "$GITHUB_ENV"
+          echo "S3_BUCKET=$S3_BUCKET" >> "$GITHUB_ENV"
+
+          echo "Prepared variables:"
+          echo "  AWS_ACCOUNT_ID: $AWS_ACCOUNT_ID"
+          echo "  AWS_REGION: ap-northeast-1"
+          echo "  S3_BUCKET: $S3_BUCKET"
 
       # ============================================
-      # 创建 S3 存储桶（带账号 ID 后缀确保唯一性）
+      # 创建/配置 S3 Bucket
+      # 注意：CloudFormation 模板不再创建这个 Bucket
       # ============================================
       - name: Create S3 Bucket if not exists
         if: ${{ github.event.inputs.deploy_main_app == 'true' }}
         run: |
-          S3_BUCKET_BASE="${{ github.event.inputs.s3_bucket }}"
-          AWS_REGION="ap-northeast-1"
-          
-          # 获取 AWS 账号 ID，用于创建唯一存储桶名称
-          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          
-          # 生成唯一存储桶名称：基础名称-账号ID
-          S3_BUCKET="${S3_BUCKET_BASE}-${AWS_ACCOUNT_ID}"
-          
-          echo "🔍 Checking if S3 bucket exists: $S3_BUCKET"
-          
-          # 检查存储桶是否存在
+          S3_BUCKET="$S3_BUCKET"
+          AWS_REGION="$AWS_REGION"
+
+          echo "Checking if S3 bucket exists: $S3_BUCKET"
+
           if aws s3api head-bucket --bucket "$S3_BUCKET" 2>/dev/null; then
-            echo "✅ S3 bucket already exists: $S3_BUCKET"
+            echo "S3 bucket already exists: $S3_BUCKET"
           else
-            echo "🪣 Creating S3 bucket: $S3_BUCKET"
-            
-            # 创建存储桶
+            echo "Creating S3 bucket: $S3_BUCKET"
+
             aws s3api create-bucket \
               --bucket "$S3_BUCKET" \
               --region "$AWS_REGION" \
               --create-bucket-configuration LocationConstraint="$AWS_REGION"
-            
-            echo "🔧 Configuring S3 bucket settings..."
-            
-            # 启用版本控制
-            aws s3api put-bucket-versioning \
-              --bucket "$S3_BUCKET" \
-              --versioning-configuration Status=Enabled
-            
-            # 启用默认加密 (SSE-S3)
-            aws s3api put-bucket-encryption \
-              --bucket "$S3_BUCKET" \
-              --server-side-encryption-configuration '{
-                "Rules": [
-                  {
-                    "ApplyServerSideEncryptionByDefault": {
-                      "SSEAlgorithm": "AES256"
-                    }
-                  }
-                ]
-              }'
-            
-            # 阻止公共访问
-            aws s3api put-public-access-block \
-              --bucket "$S3_BUCKET" \
-              --public-access-block-configuration \
-                BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
-            
-            # 添加标签
-            aws s3api put-bucket-tagging \
-              --bucket "$S3_BUCKET" \
-              --tagging '{
-                "TagSet": [
-                  {"Key": "Application", "Value": "ProductCatalog"},
-                  {"Key": "Environment", "Value": "${{ github.event.inputs.environment }}"}
-                ]
-              }'
-            
-            echo "✅ S3 bucket created and configured successfully"
+
+            echo "S3 bucket created: $S3_BUCKET"
           fi
-          
-          # 将存储桶名称保存到环境变量，供后续步骤使用
-          echo "S3_BUCKET=$S3_BUCKET" >> $GITHUB_ENV
-          
-          echo ""
-          echo "📊 S3 Bucket Details:"
-          echo "   Name: $S3_BUCKET"
-          aws s3api get-bucket-versioning --bucket "$S3_BUCKET" --query 'Status' --output text 2>/dev/null || echo "N/A"
-          aws s3api get-bucket-encryption --bucket "$S3_BUCKET" --query 'ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm' --output text 2>/dev/null || echo "N/A"
+
+          echo "Configuring S3 bucket settings..."
+
+          aws s3api put-bucket-versioning \
+            --bucket "$S3_BUCKET" \
+            --versioning-configuration Status=Enabled
+
+          aws s3api put-bucket-encryption \
+            --bucket "$S3_BUCKET" \
+            --server-side-encryption-configuration '{
+              "Rules": [
+                {
+                  "ApplyServerSideEncryptionByDefault": {
+                    "SSEAlgorithm": "AES256"
+                  }
+                }
+              ]
+            }'
+
+          aws s3api put-public-access-block \
+            --bucket "$S3_BUCKET" \
+            --public-access-block-configuration \
+              BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+
+          aws s3api put-bucket-tagging \
+            --bucket "$S3_BUCKET" \
+            --tagging '{
+              "TagSet": [
+                {"Key": "Application", "Value": "ProductCatalog"},
+                {"Key": "Environment", "Value": "${{ github.event.inputs.environment }}"}
+              ]
+            }'
+
+          echo "S3 bucket configured successfully."
+
+          echo "Bucket versioning:"
+          aws s3api get-bucket-versioning \
+            --bucket "$S3_BUCKET" \
+            --query 'Status' \
+            --output text || true
+
+          echo "Bucket encryption:"
+          aws s3api get-bucket-encryption \
+            --bucket "$S3_BUCKET" \
+            --query 'ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm' \
+            --output text || true
+
+      # ============================================
+      # 先构建并上传 Lambda 代码，再部署 CloudFormation
+      # ============================================
+      - name: Build and Upload Lambda Code
+        if: ${{ github.event.inputs.deploy_main_app == 'true' }}
+        run: |
+          echo "Setting up Python..."
+          python3 -m pip install --upgrade pip --quiet
+
+          echo "Building Lambda package..."
+          BUILD_DIR="build"
+          rm -rf "$BUILD_DIR"
+          mkdir -p "$BUILD_DIR"
+
+          echo "Installing dependencies..."
+          pip3 install -r requirements.txt -t "$BUILD_DIR" \
+            --platform manylinux2014_aarch64 \
+            --only-binary=:all: \
+            --python-version 3.12 \
+            --quiet
+
+          echo "Copying Lambda function..."
+          cp src/lambda_function.py "$BUILD_DIR/"
+
+          echo "Creating deployment package..."
+          cd "$BUILD_DIR"
+          zip -r9 ../lambda.zip . -q
+          cd ..
+
+          echo "Package size:"
+          du -h lambda.zip
+
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          S3_KEY="productcatalog/lambda-$TIMESTAMP.zip"
+
+          echo "Uploading Lambda code to S3..."
+          echo "  Bucket: $S3_BUCKET"
+          echo "  Key: $S3_KEY"
+
+          aws s3 cp lambda.zip "s3://$S3_BUCKET/$S3_KEY"
+
+          echo "S3_KEY=$S3_KEY" >> "$GITHUB_ENV"
+
+          echo "Lambda package uploaded successfully:"
+          echo "s3://$S3_BUCKET/$S3_KEY"
 
       - name: Validate Template
         run: |
@@ -167,163 +223,118 @@ jobs:
       - name: Deploy Stack
         run: |
           STACK_NAME="productcatalog-app-${{ github.event.inputs.environment }}"
-          TIMESTAMP=$(date +%Y%m%d%H%M%S)
-          
-          # 使用上一步创建的环境变量
-          S3_BUCKET="${{ env.S3_BUCKET }}"
-          
-          # 设置默认值
+
           MAX_CATEGORIES="${{ github.event.inputs.max_categories }}"
           MAX_CATEGORIES=${MAX_CATEGORIES:-20}
-          
+
           MAX_BRANDS="${{ github.event.inputs.max_brands }}"
           MAX_BRANDS=${MAX_BRANDS:-20}
-          
+
           MAX_MODELS="${{ github.event.inputs.max_models }}"
           MAX_MODELS=${MAX_MODELS:-50}
-          
+
+          # 如果没有部署主应用，S3_KEY 不会被前面的步骤设置。
+          # 由于 CloudFormation 参数仍然需要传值，这里给一个占位值。
+          if [ -z "${S3_KEY:-}" ]; then
+            S3_KEY="productcatalog/lambda-placeholder.zip"
+          fi
+
           echo "=========================================="
           echo "Deploying infrastructure stack: $STACK_NAME"
           echo "Environment: ${{ github.event.inputs.environment }}"
           echo "Deploy Secret: ${{ github.event.inputs.deploy_secret }}"
           echo "Deploy Main App: ${{ github.event.inputs.deploy_main_app }}"
           echo "S3 Bucket: $S3_BUCKET"
+          echo "S3 Key: $S3_KEY"
           echo "Max Categories: $MAX_CATEGORIES"
           echo "Max Brands: $MAX_BRANDS"
           echo "Max Models: $MAX_MODELS"
           echo "=========================================="
 
-          # 构建基础参数
-          PARAMS="Environment=${{ github.event.inputs.environment }} \
-            DeploySecret=${{ github.event.inputs.deploy_secret }} \
-            DeployMainApp=${{ github.event.inputs.deploy_main_app }} \
-            MaxCategoriesPerRun=$MAX_CATEGORIES \
-            MaxBrandsPerCategory=$MAX_BRANDS \
-            MaxModelsPerBrand=$MAX_MODELS \
-            LambdaCodeS3Bucket=$S3_BUCKET \
-            LambdaCodeS3Key=productcatalog/lambda-$TIMESTAMP.zip"
+          PARAMS=(
+            "Environment=${{ github.event.inputs.environment }}"
+            "DeploySecret=${{ github.event.inputs.deploy_secret }}"
+            "DeployMainApp=${{ github.event.inputs.deploy_main_app }}"
+            "MaxCategoriesPerRun=$MAX_CATEGORIES"
+            "MaxBrandsPerCategory=$MAX_BRANDS"
+            "MaxModelsPerBrand=$MAX_MODELS"
+            "LambdaCodeS3Bucket=$S3_BUCKET"
+            "LambdaCodeS3Key=$S3_KEY"
+          )
 
-          # 如果部署 Secret，添加 API Key
           if [ "${{ github.event.inputs.deploy_secret }}" = "true" ]; then
             if [ -n "${{ github.event.inputs.api_key }}" ]; then
-              PARAMS="$PARAMS DeepSeekApiKey=${{ github.event.inputs.api_key }}"
-              echo "✅ API Key provided"
+              PARAMS+=("DeepSeekApiKey=${{ github.event.inputs.api_key }}")
+              echo "API Key provided."
             else
-              echo "⚠️ WARNING: deploy_secret=true but no API key provided"
-              echo "   Secret will be created with placeholder value"
+              echo "WARNING: deploy_secret=true but no API key provided."
+              echo "Secret will be created with placeholder value."
             fi
           fi
 
           echo ""
-          echo "📋 Parameters:"
-          echo "$PARAMS" | tr ' ' '\n' | grep -v '^$'
+          echo "Parameter summary:"
+          printf '%s\n' "${PARAMS[@]}" | grep -v "DeepSeekApiKey" || true
           echo ""
 
-          # 部署 CloudFormation 栈
           aws cloudformation deploy \
             --template-file cloudformation/productcatalog.yaml \
             --stack-name "$STACK_NAME" \
-            --parameter-overrides $PARAMS \
+            --parameter-overrides "${PARAMS[@]}" \
             --capabilities CAPABILITY_NAMED_IAM \
             --no-fail-on-empty-changeset
-
-      - name: Build and Upload Lambda Code
-        if: ${{ github.event.inputs.deploy_main_app == 'true' && success() }}
-        run: |
-          # 设置 Python 环境
-          echo "🔧 Setting up Python..."
-          python3 -m pip install --upgrade pip --quiet
-          
-          # 构建 Lambda 包
-          echo "🔨 Building Lambda package..."
-          BUILD_DIR="build"
-          rm -rf "$BUILD_DIR"
-          mkdir -p "$BUILD_DIR"
-          
-          # 安装依赖
-          echo "📦 Installing dependencies..."
-          pip3 install -r requirements.txt -t "$BUILD_DIR" --platform manylinux2014_aarch64 --only-binary=:all: --python-version 3.12 --quiet
-          
-          # 复制 Lambda 代码
-          echo "📋 Copying Lambda function..."
-          cp src/lambda_function.py "$BUILD_DIR/"
-          
-          # 创建 ZIP 包
-          echo "🗜️ Creating deployment package..."
-          cd "$BUILD_DIR"
-          zip -r9 ../lambda.zip . -q
-          cd ..
-          
-          echo "✅ Build complete"
-          echo "📊 Package size: $(du -h lambda.zip | cut -f1)"
-          
-          # 上传到 S3
-          TIMESTAMP=$(date +%Y%m%d%H%M%S)
-          S3_BUCKET="${{ env.S3_BUCKET }}"
-          S3_KEY="productcatalog/lambda-$TIMESTAMP.zip"
-          
-          echo "📤 Uploading Lambda code to S3..."
-          echo "Bucket: $S3_BUCKET"
-          echo "Key: $S3_KEY"
-          
-          aws s3 cp lambda.zip "s3://$S3_BUCKET/$S3_KEY"
-          
-          # 更新 Lambda 函数代码
-          FUNCTION_NAME="ProductCatalog-Discovery-${{ github.event.inputs.environment }}"
-          
-          echo "🔄 Updating Lambda function: $FUNCTION_NAME"
-          aws lambda update-function-code \
-            --function-name "$FUNCTION_NAME" \
-            --s3-bucket "$S3_BUCKET" \
-            --s3-key "$S3_KEY"
-          
-          echo "⏳ Waiting for Lambda update to complete..."
-          aws lambda wait function-updated \
-            --function-name "$FUNCTION_NAME"
-          
-          echo "✅ Lambda function updated with initial code"
 
       - name: Show Stack Outputs
         if: success()
         run: |
           STACK_NAME="productcatalog-app-${{ github.event.inputs.environment }}"
-          
+
           echo "===== STACK OUTPUTS ====="
           aws cloudformation describe-stacks \
             --stack-name "$STACK_NAME" \
             --query 'Stacks[0].Outputs' \
-            --output table
-          
+            --output table || true
+
           echo ""
           echo "===== DEPLOYMENT SUMMARY ====="
-          echo "🏗️ Stack: $STACK_NAME"
-          echo "📦 S3 Bucket: ${{ env.S3_BUCKET }}"
-          echo "⚡ Lambda: ProductCatalog-Discovery-${{ github.event.inputs.environment }}"
-          echo "🗄️ DynamoDB: ProductCatalog-${{ github.event.inputs.environment }}"
-          
-          # 获取并显示 Lambda 函数信息
-          echo ""
-          echo "===== LAMBDA FUNCTION INFO ====="
-          aws lambda get-function \
-            --function-name "ProductCatalog-Discovery-${{ github.event.inputs.environment }}" \
-            --query '{Name:Configuration.FunctionName,Runtime:Configuration.Runtime,Memory:Configuration.MemorySize,Timeout:Configuration.Timeout,LastModified:Configuration.LastModified}' \
-            --output table
+          echo "Stack: $STACK_NAME"
+          echo "S3 Bucket: $S3_BUCKET"
+
+          if [ "${{ github.event.inputs.deploy_main_app }}" = "true" ]; then
+            echo "Lambda: ProductCatalog-Discovery-${{ github.event.inputs.environment }}"
+            echo "DynamoDB: ProductCatalog-${{ github.event.inputs.environment }}"
+
+            echo ""
+            echo "===== LAMBDA FUNCTION INFO ====="
+            aws lambda get-function \
+              --function-name "ProductCatalog-Discovery-${{ github.event.inputs.environment }}" \
+              --query '{Name:Configuration.FunctionName,Runtime:Configuration.Runtime,Memory:Configuration.MemorySize,Timeout:Configuration.Timeout,LastModified:Configuration.LastModified}' \
+              --output table || true
+          fi
 
       - name: Show Failed Resources
         if: failure()
         run: |
           STACK_NAME="productcatalog-app-${{ github.event.inputs.environment }}"
-          
-          echo "===== FAILED EVENTS ====="
+
+          echo "===== CLOUDFORMATION DESCRIBE-EVENTS FAILED EVENTS ====="
+          aws cloudformation describe-events \
+            --stack-name "$STACK_NAME" \
+            --filters FailedEvents=true \
+            --query "OperationEvents[*].[LogicalResourceId,ResourceType,Status,StatusReason,Timestamp]" \
+            --output table || true
+
+          echo ""
+          echo "===== STACK FAILED EVENTS ====="
           aws cloudformation describe-stack-events \
             --stack-name "$STACK_NAME" \
             --query "StackEvents[?contains(ResourceStatus,'FAILED')].[LogicalResourceId,ResourceStatus,ResourceStatusReason,Timestamp]" \
-            --output table
-          
+            --output table || true
+
           echo ""
-          echo "===== LAST 10 EVENTS ====="
+          echo "===== LAST 20 STACK EVENTS ====="
           aws cloudformation describe-stack-events \
             --stack-name "$STACK_NAME" \
-            --max-items 10 \
+            --max-items 20 \
             --query "StackEvents[].[LogicalResourceId,ResourceStatus,ResourceStatusReason,Timestamp]" \
-            --output table
+            --output table || true
