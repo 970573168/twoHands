@@ -37,10 +37,28 @@ on:
         type: string
       
       s3_bucket:
-        description: 'S3 bucket for Lambda code (required if deploy_main_app=true)'
-        required: false
+        description: 'S3 bucket for Lambda code'
+        required: true
+        default: 'productcatalog-lambda-code'
         type: string
-        default: 'productcatalog-lambda-code-767076981380'
+      
+      max_categories:
+        description: 'Max categories per run'
+        required: false
+        default: '20'
+        type: string
+      
+      max_brands:
+        description: 'Max brands per category'
+        required: false
+        default: '20'
+        type: string
+      
+      max_models:
+        description: 'Max models per brand'
+        required: false
+        default: '50'
+        type: string
 
 permissions:
   id-token: write
@@ -69,16 +87,22 @@ jobs:
         run: |
           S3_BUCKET="${{ github.event.inputs.s3_bucket }}"
           
-          if [ -z "$S3_BUCKET" ]; then
-            echo "❌ ERROR: s3_bucket parameter is required when deploy_main_app=true"
-            exit 1
-          fi
-          
           echo "🔍 Checking if S3 bucket exists: $S3_BUCKET"
           if aws s3api head-bucket --bucket "$S3_BUCKET" 2>/dev/null; then
             echo "✅ S3 bucket already exists: $S3_BUCKET"
           else
             echo "📦 Creating S3 bucket: $S3_BUCKET"
+            
+            # 获取 AWS 账号 ID
+            AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+            
+            # 如果 bucket 名称不包含账号 ID，添加后缀使其唯一
+            if [[ ! "$S3_BUCKET" =~ $AWS_ACCOUNT_ID ]]; then
+              S3_BUCKET="${S3_BUCKET}-${AWS_ACCOUNT_ID}"
+              echo "📝 Appending account ID to bucket name: $S3_BUCKET"
+              echo "S3_BUCKET=$S3_BUCKET" >> $GITHUB_ENV
+            fi
+            
             aws s3api create-bucket \
               --bucket "$S3_BUCKET" \
               --region ap-northeast-1 \
@@ -108,8 +132,52 @@ jobs:
               --public-access-block-configuration \
                 BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
             
-            echo "✅ S3 bucket created successfully"
+            echo "✅ S3 bucket created successfully: $S3_BUCKET"
           fi
+          
+          # 确保环境变量设置正确
+          if [ -z "${{ env.S3_BUCKET }}" ]; then
+            echo "S3_BUCKET=$S3_BUCKET" >> $GITHUB_ENV
+          fi
+
+      - name: Upload Placeholder Lambda Code
+        if: ${{ github.event.inputs.deploy_main_app == 'true' }}
+        run: |
+          S3_BUCKET="${{ env.S3_BUCKET }}"
+          if [ -z "$S3_BUCKET" ]; then
+            S3_BUCKET="${{ github.event.inputs.s3_bucket }}"
+          fi
+          
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          S3_KEY="productcatalog/lambda-$TIMESTAMP.zip"
+          
+          echo "📤 Uploading placeholder Lambda code to S3..."
+          echo "Bucket: $S3_BUCKET"
+          echo "Key: $S3_KEY"
+          
+          # 创建一个最小的占位 ZIP 文件
+          mkdir -p /tmp/lambda_placeholder
+          cat > /tmp/lambda_placeholder/lambda_function.py << 'PLACEHOLDER_EOF'
+import json
+
+def lambda_handler(event, context):
+    return {
+        'statusCode': 200,
+        'body': json.dumps({'message': 'Placeholder - update with real code'})
+    }
+PLACEHOLDER_EOF
+          
+          cd /tmp/lambda_placeholder
+          zip -r9 /tmp/lambda.zip . -q
+          cd -
+          
+          aws s3 cp /tmp/lambda.zip "s3://$S3_BUCKET/$S3_KEY"
+          
+          echo "✅ Placeholder code uploaded"
+          
+          # 保存 S3 信息到环境变量
+          echo "S3_KEY=$S3_KEY" >> $GITHUB_ENV
+          echo "S3_BUCKET=$S3_BUCKET" >> $GITHUB_ENV
 
       - name: Validate Template
         run: |
@@ -120,7 +188,27 @@ jobs:
         run: |
           STACK_NAME="productcatalog-app-${{ github.event.inputs.environment }}"
           TIMESTAMP=$(date +%Y%m%d%H%M%S)
-          S3_BUCKET="${{ github.event.inputs.s3_bucket }}"
+          
+          # 使用已创建的 S3 bucket
+          S3_BUCKET="${{ env.S3_BUCKET }}"
+          S3_KEY="${{ env.S3_KEY }}"
+          
+          if [ -z "$S3_BUCKET" ]; then
+            S3_BUCKET="${{ github.event.inputs.s3_bucket }}"
+          fi
+          if [ -z "$S3_KEY" ]; then
+            S3_KEY="productcatalog/lambda-$TIMESTAMP.zip"
+          fi
+          
+          # 设置默认值
+          MAX_CATEGORIES="${{ github.event.inputs.max_categories }}"
+          MAX_CATEGORIES=${MAX_CATEGORIES:-20}
+          
+          MAX_BRANDS="${{ github.event.inputs.max_brands }}"
+          MAX_BRANDS=${MAX_BRANDS:-20}
+          
+          MAX_MODELS="${{ github.event.inputs.max_models }}"
+          MAX_MODELS=${MAX_MODELS:-50}
           
           echo "=========================================="
           echo "Deploying infrastructure stack: $STACK_NAME"
@@ -128,29 +216,21 @@ jobs:
           echo "Deploy Secret: ${{ github.event.inputs.deploy_secret }}"
           echo "Deploy Main App: ${{ github.event.inputs.deploy_main_app }}"
           echo "S3 Bucket: $S3_BUCKET"
+          echo "S3 Key: $S3_KEY"
+          echo "Max Categories: $MAX_CATEGORIES"
+          echo "Max Brands: $MAX_BRANDS"
+          echo "Max Models: $MAX_MODELS"
           echo "=========================================="
 
           # 构建基础参数
           PARAMS="Environment=${{ github.event.inputs.environment }} \
             DeploySecret=${{ github.event.inputs.deploy_secret }} \
             DeployMainApp=${{ github.event.inputs.deploy_main_app }} \
-            MaxCategoriesPerRun=${{ github.event.inputs.max_categories }} \
-            MaxBrandsPerCategory=${{ github.event.inputs.max_brands }} \
-            MaxModelsPerBrand=${{ github.event.inputs.max_models }}"
-
-          # 添加 S3 相关参数
-          if [ "${{ github.event.inputs.deploy_main_app }}" = "true" ]; then
-            if [ -z "$S3_BUCKET" ]; then
-              echo "❌ ERROR: s3_bucket is required when deploy_main_app=true"
-              exit 1
-            fi
-            
-            PARAMS="$PARAMS \
-              LambdaCodeS3Bucket=$S3_BUCKET \
-              LambdaCodeS3Key=productcatalog/lambda-$TIMESTAMP.zip"
-            
-            echo "📦 Lambda code will be deployed from: s3://$S3_BUCKET/productcatalog/lambda-$TIMESTAMP.zip"
-          fi
+            MaxCategoriesPerRun=$MAX_CATEGORIES \
+            MaxBrandsPerCategory=$MAX_BRANDS \
+            MaxModelsPerBrand=$MAX_MODELS \
+            LambdaCodeS3Bucket=$S3_BUCKET \
+            LambdaCodeS3Key=$S3_KEY"
 
           # 如果部署 Secret，添加 API Key
           if [ "${{ github.event.inputs.deploy_secret }}" = "true" ]; then
@@ -176,21 +256,46 @@ jobs:
             --capabilities CAPABILITY_NAMED_IAM \
             --no-fail-on-empty-changeset
 
-      - name: Build and Upload Lambda Code
+      - name: Build and Upload Real Lambda Code
         if: ${{ github.event.inputs.deploy_main_app == 'true' && success() }}
         run: |
-          echo "🔨 Building Lambda package..."
+          # 设置 Python 环境
+          echo "🔧 Setting up Python..."
+          python3 -m pip install --upgrade pip --quiet
           
           # 构建 Lambda 包
-          chmod +x build.sh
-          ./build.sh
+          echo "🔨 Building Lambda package..."
+          BUILD_DIR="build"
+          rm -rf "$BUILD_DIR"
+          mkdir -p "$BUILD_DIR"
           
-          # 上传到 S3
+          # 安装依赖
+          echo "📦 Installing dependencies..."
+          pip3 install -r requirements.txt -t "$BUILD_DIR" --platform manylinux2014_aarch64 --only-binary=:all: --python-version 3.12 --quiet
+          
+          # 复制 Lambda 代码
+          echo "📋 Copying Lambda function..."
+          cp src/lambda_function.py "$BUILD_DIR/"
+          
+          # 创建 ZIP 包
+          echo "🗜️ Creating deployment package..."
+          cd "$BUILD_DIR"
+          zip -r9 ../lambda.zip . -q
+          cd ..
+          
+          echo "✅ Build complete"
+          echo "📊 Package size: $(du -h lambda.zip | cut -f1)"
+          
+          # 获取 S3 信息
+          S3_BUCKET="${{ env.S3_BUCKET }}"
+          if [ -z "$S3_BUCKET" ]; then
+            S3_BUCKET="${{ github.event.inputs.s3_bucket }}"
+          fi
+          
           TIMESTAMP=$(date +%Y%m%d%H%M%S)
-          S3_BUCKET="${{ github.event.inputs.s3_bucket }}"
           S3_KEY="productcatalog/lambda-$TIMESTAMP.zip"
           
-          echo "📤 Uploading Lambda code to S3..."
+          echo "📤 Uploading real Lambda code to S3..."
           echo "Bucket: $S3_BUCKET"
           echo "Key: $S3_KEY"
           
@@ -209,34 +314,7 @@ jobs:
           aws lambda wait function-updated \
             --function-name "$FUNCTION_NAME"
           
-          echo "✅ Lambda function updated with initial code"
-          
-          # 更新 CloudFormation 栈以使用正确的 S3 键
-          STACK_NAME="productcatalog-app-${{ github.event.inputs.environment }}"
-          
-          echo "🔄 Updating CloudFormation stack with correct S3 key..."
-          aws cloudformation update-stack \
-            --stack-name "$STACK_NAME" \
-            --use-previous-template \
-            --parameters \
-              ParameterKey=Environment,UsePreviousValue=true \
-              ParameterKey=DeploySecret,UsePreviousValue=true \
-              ParameterKey=DeployMainApp,UsePreviousValue=true \
-              ParameterKey=DeepSeekModel,UsePreviousValue=true \
-              ParameterKey=DeepSeekApiUrl,UsePreviousValue=true \
-              ParameterKey=MaxCategoriesPerRun,UsePreviousValue=true \
-              ParameterKey=MaxBrandsPerCategory,UsePreviousValue=true \
-              ParameterKey=MaxModelsPerBrand,UsePreviousValue=true \
-              ParameterKey=LogRetentionDays,UsePreviousValue=true \
-              ParameterKey=LambdaCodeS3Bucket,ParameterValue=$S3_BUCKET \
-              ParameterKey=LambdaCodeS3Key,ParameterValue=$S3_KEY \
-            --capabilities CAPABILITY_NAMED_IAM
-          
-          echo "⏳ Waiting for stack update to complete..."
-          aws cloudformation wait stack-update-complete \
-            --stack-name "$STACK_NAME"
-          
-          echo "✅ Stack updated with correct S3 key"
+          echo "✅ Lambda function updated with real code"
 
       - name: Show Stack Outputs
         if: success()
@@ -252,9 +330,17 @@ jobs:
           echo ""
           echo "===== DEPLOYMENT SUMMARY ====="
           echo "🏗️ Stack: $STACK_NAME"
-          echo "📦 S3 Bucket: ${{ github.event.inputs.s3_bucket }}"
+          echo "📦 S3 Bucket: ${{ env.S3_BUCKET }}"
           echo "⚡ Lambda: ProductCatalog-Discovery-${{ github.event.inputs.environment }}"
           echo "🗄️ DynamoDB: ProductCatalog-${{ github.event.inputs.environment }}"
+          
+          # 获取并显示 Lambda 函数信息
+          echo ""
+          echo "===== LAMBDA FUNCTION INFO ====="
+          aws lambda get-function \
+            --function-name "ProductCatalog-Discovery-${{ github.event.inputs.environment }}" \
+            --query '{Name:Configuration.FunctionName,Runtime:Configuration.Runtime,Memory:Configuration.MemorySize,Timeout:Configuration.Timeout,LastModified:Configuration.LastModified}' \
+            --output table
 
       - name: Show Failed Resources
         if: failure()
