@@ -15,20 +15,58 @@ dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table(os.environ["TABLE_NAME"])
 secretsmanager = boto3.client("secretsmanager")
 
-# 修改为豆包模型配置
+# ============================================
+# 所有配置项都从环境变量读取
+# ============================================
+
+# 豆包模型配置
 API_URL = os.environ.get("DOUBAO_API_URL", "https://ark.cn-beijing.volces.com/api/v3/chat/completions")
 MODEL = os.environ.get("DOUBAO_MODEL", "doubao-seed-2-1-pro-260628")
-SECRET_NAME = os.environ.get("DOUBAO_SECRET_NAME", os.environ.get("DEEPSEEK_SECRET_NAME", ""))
+SECRET_NAME = os.environ.get("DOUBAO_SECRET_NAME", "")
+API_KEY = os.environ.get("DOUBAO_API_KEY", "")
+
+# API 调用参数配置
+TEMPERATURE = float(os.environ.get("DOUBAO_TEMPERATURE", "0.7"))
+MAX_TOKENS = int(os.environ.get("DOUBAO_MAX_TOKENS", "4000"))
+TOP_P = float(os.environ.get("DOUBAO_TOP_P", "1.0"))
+REQUEST_TIMEOUT = int(os.environ.get("DOUBAO_REQUEST_TIMEOUT", "90"))
+MAX_RETRIES = int(os.environ.get("DOUBAO_MAX_RETRIES", "3"))
+
+# 系统提示词配置
+SYSTEM_PROMPT = os.environ.get("DOUBAO_SYSTEM_PROMPT", 
+    "You are a helpful assistant that returns data in JSON format.")
+
+# 发现任务配置
 MAX_CATEGORIES = int(os.environ.get("MAX_CATEGORIES", "20"))
 MAX_BRANDS = int(os.environ.get("MAX_BRANDS", "20"))
 MAX_MODELS = int(os.environ.get("MAX_MODELS", "50"))
-MAX_TOTAL_TOKENS = int(os.environ.get("MAX_TOTAL_TOKENS", "100000"))  # Token上限，默认10万
+
+# Token 和超时控制配置
+MAX_TOTAL_TOKENS = int(os.environ.get("MAX_TOTAL_TOKENS", "100000"))  # Token总量上限
+LAMBDA_TIMEOUT_SECONDS = int(os.environ.get("LAMBDA_TIMEOUT_SECONDS", "840"))  # Lambda超时时间（默认14分钟）
+LAMBDA_TIMEOUT_BUFFER = int(os.environ.get("LAMBDA_TIMEOUT_BUFFER", "30"))  # 提前30秒结束，留出清理时间
+
+# 处理流程配置
+CATEGORY_LIMIT = int(os.environ.get("CATEGORY_LIMIT", "5"))
+BRAND_LIMIT = int(os.environ.get("BRAND_LIMIT", "3"))
+API_CALL_DELAY = float(os.environ.get("API_CALL_DELAY", "1.0"))
+
+# 重试配置
+RETRYABLE_CODES = {408, 409, 429, 500, 502, 503, 504}
+
+# 数据来源标识
+DATA_SOURCE = os.environ.get("DATA_SOURCE", "DOUBAO_AI")
+
+# ============================================
 
 _api_key_cache = None
-_brand_date_cache = {}  # 品牌日期缓存
+_brand_date_cache = {}
 
 # 全局Token计数器
 _total_tokens_used = 0
+
+# 记录Lambda开始时间
+_lambda_start_time = None
 
 
 def log(level, message, **fields):
@@ -36,15 +74,53 @@ def log(level, message, **fields):
         "level": level,
         "message": message,
         "total_tokens": _total_tokens_used,
+        "elapsed_seconds": get_elapsed_seconds(),
         **fields,
     }
     print(json.dumps(entry, ensure_ascii=False, default=str))
+
+
+def get_elapsed_seconds():
+    """获取从Lambda开始到现在的运行时间（秒）"""
+    if _lambda_start_time is None:
+        return 0
+    return time.time() - _lambda_start_time
+
+
+def get_remaining_seconds():
+    """获取Lambda剩余可用时间（秒）"""
+    elapsed = get_elapsed_seconds()
+    remaining = LAMBDA_TIMEOUT_SECONDS - elapsed - LAMBDA_TIMEOUT_BUFFER
+    return max(0, remaining)
+
+
+def check_timeout():
+    """检查是否接近Lambda超时"""
+    remaining = get_remaining_seconds()
+    if remaining <= 0:
+        raise RuntimeError(
+            f"Lambda超时倒计时: 已运行{get_elapsed_seconds():.1f}秒, "
+            f"超时限制{LAMBDA_TIMEOUT_SECONDS}秒, 缓冲{LAMBDA_TIMEOUT_BUFFER}秒"
+        )
+
+
+def check_limits():
+    """检查所有限制条件（Token + 超时）"""
+    check_token_limit()
+    check_timeout()
 
 
 def get_api_key():
     global _api_key_cache
     if _api_key_cache:
         return _api_key_cache
+
+    if API_KEY:
+        _api_key_cache = API_KEY
+        return _api_key_cache
+
+    if not SECRET_NAME:
+        raise RuntimeError("未配置 DOUBAO_SECRET_NAME 或 DOUBAO_API_KEY 环境变量")
 
     response = secretsmanager.get_secret_value(SecretId=SECRET_NAME)
     secret_string = response.get("SecretString")
@@ -66,7 +142,6 @@ def get_api_key():
 
 def normalize(value):
     value = str(value or "").strip()
-    # 全角英数字转换为半角
     value = value.translate(str.maketrans(
         'ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ'
         'ａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ'
@@ -118,7 +193,6 @@ def get_latest_model_date(brand):
     """从数据库获取该品牌最晚发布的型号发布日期（带缓存）"""
     brand_key = key_part(brand)
     
-    # 检查缓存
     if brand_key in _brand_date_cache:
         return _brand_date_cache[brand_key]
     
@@ -126,17 +200,17 @@ def get_latest_model_date(brand):
         response = table.query(
             IndexName="GSI1",
             KeyConditionExpression=Key("GSI1PK").eq(f"BRAND#{brand_key}"),
-            ScanIndexForward=False,  # 降序排列，最新的在前
+            ScanIndexForward=False,
             Limit=1
         )
         items = response.get("Items", [])
         if items:
             latest_date = items[0].get("release_date", "")
             if latest_date:
-                _brand_date_cache[brand_key] = latest_date  # 缓存结果
+                _brand_date_cache[brand_key] = latest_date
                 return latest_date
         
-        _brand_date_cache[brand_key] = None  # 缓存空结果
+        _brand_date_cache[brand_key] = None
         return None
     except Exception as e:
         log("WARN", "获取最新型号日期失败", brand=brand, error=str(e))
@@ -155,16 +229,16 @@ def update_token_usage(usage):
     """更新全局Token用量"""
     global _total_tokens_used
     if usage:
-        # 豆包API的usage字段通常包含 total_tokens
         total = usage.get("total_tokens", 0)
         _total_tokens_used += total
         log("INFO", "Token用量更新", 
             added_tokens=total, 
             total_tokens=_total_tokens_used,
-            limit=MAX_TOTAL_TOKENS)
+            limit=MAX_TOTAL_TOKENS,
+            remaining_tokens=MAX_TOTAL_TOKENS - _total_tokens_used)
 
 
-def build_deepseek_prompt(task):
+def build_prompt(task):
     task_type = task.get("task_type")
     max_items = int(task.get("max_items", 20))
     search_date = task.get("search_date", "")
@@ -220,33 +294,42 @@ def build_deepseek_prompt(task):
 
     return prompt
 
+
 def call_api(task):
     """调用豆包API"""
-    # 调用前检查Token限制
-    check_token_limit()
+    check_limits()  # 检查Token和超时限制
     
-    prompt = build_deepseek_prompt(task)
+    # 再次检查剩余时间是否足够完成一次API调用
+    remaining = get_remaining_seconds()
+    if remaining < REQUEST_TIMEOUT + 10:  # 需要至少比超时时间多10秒
+        raise RuntimeError(
+            f"剩余时间不足，无法完成API调用: 剩余{remaining:.1f}秒, "
+            f"请求超时{REQUEST_TIMEOUT}秒"
+        )
     
-    # 豆包API使用 messages 格式
+    prompt = build_prompt(task)
+    
     body = {
         "model": MODEL,
         "messages": [
             {
                 "role": "system",
-                "content": "You are a helpful assistant that returns data in JSON format."
+                "content": SYSTEM_PROMPT
             },
             {
                 "role": "user",
                 "content": prompt
             }
-        ]
+        ],
+        "temperature": TEMPERATURE,
+        "max_tokens": MAX_TOKENS,
+        "top_p": TOP_P
     }
 
     encoded_body = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    retryable_codes = {408, 409, 429, 500, 502, 503, 504}
     last_error = None
 
-    for attempt in range(3):
+    for attempt in range(MAX_RETRIES):
         request = urllib.request.Request(
             API_URL,
             data=encoded_body,
@@ -258,10 +341,9 @@ def call_api(task):
         )
 
         try:
-            with urllib.request.urlopen(request, timeout=90) as response:
+            with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
                 result = json.loads(response.read().decode("utf-8"))
                 
-                # 豆包API响应格式：choices[0].message.content
                 if "choices" in result and len(result["choices"]) > 0:
                     message = result["choices"][0].get("message", {})
                     content = message.get("content", "")
@@ -282,7 +364,6 @@ def call_api(task):
                 if not isinstance(items, list):
                     raise ValueError("API response items is not a list")
                 
-                # 更新Token用量
                 usage = result.get("usage", {})
                 update_token_usage(usage)
                 
@@ -290,7 +371,8 @@ def call_api(task):
                     model=MODEL, 
                     usage=usage, 
                     item_count=len(items),
-                    total_tokens=_total_tokens_used)
+                    total_tokens=_total_tokens_used,
+                    remaining_seconds=get_remaining_seconds())
                 
                 return items
 
@@ -299,22 +381,17 @@ def call_api(task):
             last_error = RuntimeError(
                 f"API HTTP {error.code}: {error_body[:1000]}"
             )
-            if error.code not in retryable_codes:
+            if error.code not in RETRYABLE_CODES:
                 raise last_error
 
         except (urllib.error.URLError, TimeoutError) as error:
             last_error = RuntimeError(f"API network error: {error}")
 
-        if attempt < 2:
+        if attempt < MAX_RETRIES - 1:
             delay = (2 ** attempt) + random.random()
             time.sleep(delay)
 
     raise last_error or RuntimeError("API request failed")
-
-
-# 向后兼容，保留原函数名
-def call_deepseek(task):
-    return call_api(task)
 
 
 def upsert_category(category):
@@ -343,7 +420,7 @@ def upsert_category(category):
             ":name": category,
             ":status": "ACTIVE",
             ":now": now,
-            ":source": "DOUBAO_AI",
+            ":source": DATA_SOURCE,
         },
     )
 
@@ -375,7 +452,7 @@ def upsert_brand(category, brand):
             ":brand": brand,
             ":status": "ACTIVE",
             ":now": now,
-            ":source": "DOUBAO_AI",
+            ":source": DATA_SOURCE,
         },
     )
 
@@ -407,7 +484,7 @@ def upsert_product(category, brand, model, confidence=None, release_date=None):
         ":status": "ACTIVE",
         ":unverified": "UNVERIFIED",
         ":now": now,
-        ":source": "DOUBAO_AI",
+        ":source": DATA_SOURCE,
     }
 
     if confidence is not None:
@@ -434,7 +511,6 @@ def upsert_product(category, brand, model, confidence=None, release_date=None):
         ExpressionAttributeValues=values,
     )
 
-    # 创建GSI1索引项，用于按品牌查询并按发布日期排序
     gsi1_item = {
         "PK": f"BRAND#{key_part(brand)}",
         "SK": f"MODEL#{key_part(model)}",
@@ -456,16 +532,30 @@ def upsert_product(category, brand, model, confidence=None, release_date=None):
 
 def process_discovery(event):
     """主发现处理逻辑（手动触发入口）"""
-    global _total_tokens_used
-    _total_tokens_used = 0  # 每次执行重置Token计数
+    global _total_tokens_used, _lambda_start_time
+    _total_tokens_used = 0
+    _lambda_start_time = time.time()  # 记录开始时间
     
     task_type = event.get("task_type", "DISCOVER_CATEGORIES")
     
-    log("INFO", "开始发现处理", task_type=task_type, model=MODEL, token_limit=MAX_TOTAL_TOKENS)
+    log("INFO", "开始发现处理", 
+        task_type=task_type, 
+        model=MODEL, 
+        token_limit=MAX_TOTAL_TOKENS,
+        lambda_timeout=LAMBDA_TIMEOUT_SECONDS,
+        lambda_timeout_buffer=LAMBDA_TIMEOUT_BUFFER,
+        config={
+            "api_url": API_URL,
+            "model": MODEL,
+            "temperature": TEMPERATURE,
+            "max_tokens": MAX_TOKENS,
+            "category_limit": CATEGORY_LIMIT,
+            "brand_limit": BRAND_LIMIT,
+            "api_call_delay": API_CALL_DELAY
+        })
     
     try:
         if task_type == "DISCOVER_CATEGORIES":
-            # 发现品类
             task = {
                 "task_type": "DISCOVER_CATEGORIES",
                 "max_items": MAX_CATEGORIES
@@ -482,16 +572,21 @@ def process_discovery(event):
             
             log("INFO", "品类发现完成", count=len(categories))
             
-            # 从发现的品类中发现品牌
-            for category in categories[:5]:  # 限制处理前5个品类
-                # 每次API调用前检查Token限制
+            for category in categories[:CATEGORY_LIMIT]:
+                # 检查所有限制条件
                 if _total_tokens_used >= MAX_TOTAL_TOKENS:
                     log("WARN", "Token用量接近上限，停止品牌发现", 
                         category=category, 
                         total_tokens=_total_tokens_used)
                     break
                 
-                time.sleep(1)
+                if get_remaining_seconds() < REQUEST_TIMEOUT + 10:
+                    log("WARN", "剩余时间不足，停止品牌发现",
+                        category=category,
+                        remaining_seconds=get_remaining_seconds())
+                    break
+                
+                time.sleep(API_CALL_DELAY)
                 brand_task = {
                     "task_type": "DISCOVER_BRANDS",
                     "category": category,
@@ -509,9 +604,8 @@ def process_discovery(event):
                 
                 log("INFO", "品牌发现完成", category=category, count=len(brands))
                 
-                # 从发现的品牌中发现型号
-                for cat, brand in brands[:3]:
-                    # 每次API调用前检查Token限制
+                for cat, brand in brands[:BRAND_LIMIT]:
+                    # 检查所有限制条件
                     if _total_tokens_used >= MAX_TOTAL_TOKENS:
                         log("WARN", "Token用量接近上限，停止型号发现", 
                             category=cat, 
@@ -519,7 +613,14 @@ def process_discovery(event):
                             total_tokens=_total_tokens_used)
                         break
                     
-                    time.sleep(1)
+                    if get_remaining_seconds() < REQUEST_TIMEOUT + 10:
+                        log("WARN", "剩余时间不足，停止型号发现",
+                            category=cat,
+                            brand=brand,
+                            remaining_seconds=get_remaining_seconds())
+                        break
+                    
+                    time.sleep(API_CALL_DELAY)
                     
                     latest_date = get_latest_model_date(brand)
                     
@@ -546,8 +647,9 @@ def process_discovery(event):
                     
                     log("INFO", "型号发现完成", category=cat, brand=brand, count=model_count)
                 
-                # 内层循环也可能因Token限制而中断
                 if _total_tokens_used >= MAX_TOTAL_TOKENS:
+                    break
+                if get_remaining_seconds() < REQUEST_TIMEOUT + 10:
                     break
             
             return {
@@ -556,7 +658,9 @@ def process_discovery(event):
                     "message": "发现处理完成",
                     "categories_discovered": len(categories),
                     "total_tokens_used": _total_tokens_used,
-                    "token_limit": MAX_TOTAL_TOKENS
+                    "token_limit": MAX_TOTAL_TOKENS,
+                    "elapsed_seconds": get_elapsed_seconds(),
+                    "remaining_seconds": get_remaining_seconds()
                 }, ensure_ascii=False)
             }
         
@@ -600,7 +704,9 @@ def process_discovery(event):
                     "models_discovered": model_count,
                     "search_date": latest_date,
                     "total_tokens_used": _total_tokens_used,
-                    "token_limit": MAX_TOTAL_TOKENS
+                    "token_limit": MAX_TOTAL_TOKENS,
+                    "elapsed_seconds": get_elapsed_seconds(),
+                    "remaining_seconds": get_remaining_seconds()
                 }, ensure_ascii=False)
             }
         
@@ -611,16 +717,23 @@ def process_discovery(event):
             }
     
     except RuntimeError as e:
-        if "Token用量已达上限" in str(e):
-            log("WARN", "Token用量达到上限，任务中断", 
+        error_msg = str(e)
+        if "Token用量已达上限" in error_msg or "Lambda超时倒计时" in error_msg or "剩余时间不足" in error_msg:
+            log("WARN", "任务中断", 
+                reason=error_msg,
                 total_tokens=_total_tokens_used, 
-                limit=MAX_TOTAL_TOKENS)
+                limit=MAX_TOTAL_TOKENS,
+                elapsed_seconds=get_elapsed_seconds(),
+                remaining_seconds=get_remaining_seconds())
             return {
                 "statusCode": 200,
                 "body": json.dumps({
-                    "message": "Token用量达到上限，任务已安全中断",
+                    "message": "任务已安全中断",
+                    "reason": error_msg,
                     "total_tokens_used": _total_tokens_used,
-                    "token_limit": MAX_TOTAL_TOKENS
+                    "token_limit": MAX_TOTAL_TOKENS,
+                    "elapsed_seconds": get_elapsed_seconds(),
+                    "remaining_seconds": get_remaining_seconds()
                 }, ensure_ascii=False)
             }
         raise
@@ -628,8 +741,15 @@ def process_discovery(event):
 
 def lambda_handler(event, context):
     """Lambda入口函数，支持手动触发"""
+    global _lambda_start_time
+    _lambda_start_time = time.time()
+    
     try:
-        log("INFO", "Lambda执行开始", event=event)
+        log("INFO", "Lambda执行开始", 
+            event=event,
+            lambda_timeout=LAMBDA_TIMEOUT_SECONDS,
+            lambda_timeout_buffer=LAMBDA_TIMEOUT_BUFFER,
+            max_total_tokens=MAX_TOTAL_TOKENS)
         
         return process_discovery(event)
         
@@ -639,13 +759,15 @@ def lambda_handler(event, context):
             "处理失败",
             error_type=type(error).__name__,
             error=str(error),
-            total_tokens=_total_tokens_used
+            total_tokens=_total_tokens_used,
+            elapsed_seconds=get_elapsed_seconds()
         )
         return {
             "statusCode": 500,
             "body": json.dumps({
                 "error": "内部错误",
                 "details": str(error),
-                "total_tokens_used": _total_tokens_used
+                "total_tokens_used": _total_tokens_used,
+                "elapsed_seconds": get_elapsed_seconds()
             }, ensure_ascii=False)
         }
