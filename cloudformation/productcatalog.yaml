@@ -85,6 +85,44 @@ Parameters:
     MaxValue: 100
     Description: 每个品牌发现的最大型号数
 
+  # ============ Token 和超时控制 ============
+  MaxTotalTokens:
+    Type: Number
+    Default: 100000
+    MinValue: 1000
+    MaxValue: 1000000
+    Description: 每次运行的最大 Token 用量
+
+  LambdaTimeoutBuffer:
+    Type: Number
+    Default: 30
+    MinValue: 10
+    MaxValue: 300
+    Description: Lambda 超时缓冲时间（秒）
+
+  # ============ 处理流程控制 ============
+  ApiCallDelay:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 10
+    Description: API 调用间隔（秒）
+
+  CategoryLimit:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 20
+    Description: 每次处理的最大品类数
+
+  BrandLimit:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 10
+    Description: 每个品类处理的最大品牌数
+
+  # ============ 其他配置 ============
   LogRetentionDays:
     Type: Number
     Default: 14
@@ -230,7 +268,7 @@ Resources:
       - LambdaExecutionRole
     Properties:
       FunctionName: !Sub "ProductCatalog-Discovery-${Environment}"
-      Description: 通过 DeepSeek AI 发现电子产品品类、品牌和型号（手动触发）
+      Description: 通过 AI 发现电子产品品类、品牌和型号（手动触发）
       Runtime: python3.12
       Architectures:
         - arm64
@@ -243,13 +281,41 @@ Resources:
         S3Key: !Ref LambdaCodeS3Key
       Environment:
         Variables:
+          # DynamoDB 表名
           TABLE_NAME: !Ref ProductCatalogTable
+          
+          # API 配置
           DEEPSEEK_SECRET_NAME: !Sub "${SecretName}/${Environment}"
           DEEPSEEK_MODEL: !Ref DeepSeekModel
           DEEPSEEK_API_URL: !Ref DeepSeekApiUrl
+          
+          # 发现任务配置
           MAX_CATEGORIES: !Ref MaxCategoriesPerRun
           MAX_BRANDS: !Ref MaxBrandsPerCategory
           MAX_MODELS: !Ref MaxModelsPerBrand
+          
+          # Token 和超时控制
+          MAX_TOTAL_TOKENS: !Ref MaxTotalTokens
+          LAMBDA_TIMEOUT_SECONDS: "900"
+          LAMBDA_TIMEOUT_BUFFER: !Ref LambdaTimeoutBuffer
+          
+          # API 调用参数
+          DOUBAO_TEMPERATURE: "0.7"
+          DOUBAO_MAX_TOKENS: "4000"
+          DOUBAO_TOP_P: "1.0"
+          DOUBAO_REQUEST_TIMEOUT: "90"
+          DOUBAO_MAX_RETRIES: "3"
+          
+          # 系统提示词
+          DOUBAO_SYSTEM_PROMPT: "You are a helpful assistant that returns data in JSON format."
+          
+          # 处理流程控制
+          CATEGORY_LIMIT: !Ref CategoryLimit
+          BRAND_LIMIT: !Ref BrandLimit
+          API_CALL_DELAY: !Ref ApiCallDelay
+          
+          # 数据来源标识
+          DATA_SOURCE: "AI_DISCOVERY"
       Tags:
         - Key: Application
           Value: ProductCatalog
