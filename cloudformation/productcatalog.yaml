@@ -1,276 +1,332 @@
-name: Deploy Infrastructure
+AWSTemplateFormatVersion: "2010-09-09"
 
-on:
-  workflow_dispatch:
-    inputs:
-      environment:
-        description: 'Environment'
-        required: true
-        default: 'dev'
-        type: choice
-        options:
-          - dev
-          - test
-          - prod
-      
-      deploy_secret:
-        description: 'Deploy DeepSeek Secret?'
-        required: true
-        default: 'false'
-        type: choice
-        options:
-          - 'true'
-          - 'false'
-      
-      deploy_main_app:
-        description: 'Deploy Main Application?'
-        required: true
-        default: 'true'
-        type: choice
-        options:
-          - 'true'
-          - 'false'
-      
-      api_key:
-        description: 'DeepSeek API Key (required if deploy_secret=true)'
-        required: false
-        type: string
-      
-      s3_bucket:
-        description: 'S3 bucket for Lambda code (required if deploy_main_app=true)'
-        required: false
-        type: string
-        default: 'productcatalog-lambda-code-767076981380'
+Description: >
+  电子产品目录采集器 + DeepSeek API Secret（可选）
+  Lambda 代码通过 S3 部署
 
-permissions:
-  id-token: write
-  contents: read
+Parameters:
+  # ============ 通用参数 ============
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - prod
+    Description: 环境名称
 
-jobs:
-  deploy-infrastructure:
-    runs-on: ubuntu-latest
-    environment: ${{ github.event.inputs.environment }}
+  # ============ S3 代码部署参数 ============
+  LambdaCodeS3Bucket:
+    Type: String
+    Description: S3 存储 Lambda 代码的存储桶名称
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+  LambdaCodeS3Key:
+    Type: String
+    Default: "productcatalog/lambda.zip"
+    Description: S3 中 Lambda 代码的对象键
 
-      - name: Configure AWS
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::767076981380:role/twoHands-GitHubActions-Role
-          aws-region: ap-northeast-1
+  # ============ Secret 控制参数 ============
+  DeploySecret:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: 是否部署 DeepSeek API Secret
 
-      - name: Verify AWS Identity
-        run: aws sts get-caller-identity
+  DeepSeekApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: DeepSeek API Key（仅在 DeploySecret=true 时需要）
 
-      - name: Create S3 Bucket if not exists
-        if: ${{ github.event.inputs.deploy_main_app == 'true' }}
-        run: |
-          S3_BUCKET="${{ github.event.inputs.s3_bucket }}"
-          
-          if [ -z "$S3_BUCKET" ]; then
-            echo "❌ ERROR: s3_bucket parameter is required when deploy_main_app=true"
-            exit 1
-          fi
-          
-          echo "🔍 Checking if S3 bucket exists: $S3_BUCKET"
-          if aws s3api head-bucket --bucket "$S3_BUCKET" 2>/dev/null; then
-            echo "✅ S3 bucket already exists: $S3_BUCKET"
-          else
-            echo "📦 Creating S3 bucket: $S3_BUCKET"
-            aws s3api create-bucket \
-              --bucket "$S3_BUCKET" \
-              --region ap-northeast-1 \
-              --create-bucket-configuration LocationConstraint=ap-northeast-1
-            
-            echo "🔒 Enabling versioning..."
-            aws s3api put-bucket-versioning \
-              --bucket "$S3_BUCKET" \
-              --versioning-configuration Status=Enabled
-            
-            echo "🔐 Enabling encryption..."
-            aws s3api put-bucket-encryption \
-              --bucket "$S3_BUCKET" \
-              --server-side-encryption-configuration '{
-                "Rules": [
-                  {
-                    "ApplyServerSideEncryptionByDefault": {
-                      "SSEAlgorithm": "AES256"
-                    }
-                  }
-                ]
-              }'
-            
-            echo "🚫 Blocking public access..."
-            aws s3api put-public-access-block \
-              --bucket "$S3_BUCKET" \
-              --public-access-block-configuration \
-                BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
-            
-            echo "✅ S3 bucket created successfully"
-          fi
+  SecretName:
+    Type: String
+    Default: "ProductCatalog/DeepSeekApiKey"
+    Description: Secrets Manager 中的 Secret 名称前缀
 
-      - name: Validate Template
-        run: |
-          aws cloudformation validate-template \
-            --template-body file://cloudformation/productcatalog.yaml
+  # ============ 主应用参数 ============
+  DeployMainApp:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: 是否部署主应用
 
-      - name: Deploy Stack
-        run: |
-          STACK_NAME="productcatalog-app-${{ github.event.inputs.environment }}"
-          TIMESTAMP=$(date +%Y%m%d%H%M%S)
-          S3_BUCKET="${{ github.event.inputs.s3_bucket }}"
-          
-          echo "=========================================="
-          echo "Deploying infrastructure stack: $STACK_NAME"
-          echo "Environment: ${{ github.event.inputs.environment }}"
-          echo "Deploy Secret: ${{ github.event.inputs.deploy_secret }}"
-          echo "Deploy Main App: ${{ github.event.inputs.deploy_main_app }}"
-          echo "S3 Bucket: $S3_BUCKET"
-          echo "=========================================="
+  DeepSeekModel:
+    Type: String
+    Default: deepseek-v4-flash-260425
+    Description: DeepSeek 模型名称
 
-          # 构建基础参数
-          PARAMS="Environment=${{ github.event.inputs.environment }} \
-            DeploySecret=${{ github.event.inputs.deploy_secret }} \
-            DeployMainApp=${{ github.event.inputs.deploy_main_app }} \
-            MaxCategoriesPerRun=${{ github.event.inputs.max_categories }} \
-            MaxBrandsPerCategory=${{ github.event.inputs.max_brands }} \
-            MaxModelsPerBrand=${{ github.event.inputs.max_models }}"
+  DeepSeekApiUrl:
+    Type: String
+    Default: https://ark.cn-beijing.volces.com/api/v3/responses
+    Description: DeepSeek API URL
 
-          # 添加 S3 相关参数
-          if [ "${{ github.event.inputs.deploy_main_app }}" = "true" ]; then
-            if [ -z "$S3_BUCKET" ]; then
-              echo "❌ ERROR: s3_bucket is required when deploy_main_app=true"
-              exit 1
-            fi
-            
-            PARAMS="$PARAMS \
-              LambdaCodeS3Bucket=$S3_BUCKET \
-              LambdaCodeS3Key=productcatalog/lambda-$TIMESTAMP.zip"
-            
-            echo "📦 Lambda code will be deployed from: s3://$S3_BUCKET/productcatalog/lambda-$TIMESTAMP.zip"
-          fi
+  MaxCategoriesPerRun:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    MaxValue: 100
+    Description: 每次运行发现的最大品类数
 
-          # 如果部署 Secret，添加 API Key
-          if [ "${{ github.event.inputs.deploy_secret }}" = "true" ]; then
-            if [ -n "${{ github.event.inputs.api_key }}" ]; then
-              PARAMS="$PARAMS DeepSeekApiKey=${{ github.event.inputs.api_key }}"
-              echo "✅ API Key provided"
-            else
-              echo "⚠️ WARNING: deploy_secret=true but no API key provided"
-              echo "   Secret will be created with placeholder value"
-            fi
-          fi
+  MaxBrandsPerCategory:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    MaxValue: 100
+    Description: 每个品类发现的最大品牌数
 
-          echo ""
-          echo "📋 Parameters:"
-          echo "$PARAMS" | tr ' ' '\n' | grep -v '^$'
-          echo ""
+  MaxModelsPerBrand:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    MaxValue: 100
+    Description: 每个品牌发现的最大型号数
 
-          # 部署 CloudFormation 栈
-          aws cloudformation deploy \
-            --template-file cloudformation/productcatalog.yaml \
-            --stack-name "$STACK_NAME" \
-            --parameter-overrides $PARAMS \
-            --capabilities CAPABILITY_NAMED_IAM \
-            --no-fail-on-empty-changeset
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    MinValue: 1
+    MaxValue: 3653
+    Description: CloudWatch 日志保留天数
 
-      - name: Build and Upload Lambda Code
-        if: ${{ github.event.inputs.deploy_main_app == 'true' && success() }}
-        run: |
-          echo "🔨 Building Lambda package..."
-          
-          # 构建 Lambda 包
-          chmod +x build.sh
-          ./build.sh
-          
-          # 上传到 S3
-          TIMESTAMP=$(date +%Y%m%d%H%M%S)
-          S3_BUCKET="${{ github.event.inputs.s3_bucket }}"
-          S3_KEY="productcatalog/lambda-$TIMESTAMP.zip"
-          
-          echo "📤 Uploading Lambda code to S3..."
-          echo "Bucket: $S3_BUCKET"
-          echo "Key: $S3_KEY"
-          
-          aws s3 cp lambda.zip "s3://$S3_BUCKET/$S3_KEY"
-          
-          # 更新 Lambda 函数代码
-          FUNCTION_NAME="ProductCatalog-Discovery-${{ github.event.inputs.environment }}"
-          
-          echo "🔄 Updating Lambda function: $FUNCTION_NAME"
-          aws lambda update-function-code \
-            --function-name "$FUNCTION_NAME" \
-            --s3-bucket "$S3_BUCKET" \
-            --s3-key "$S3_KEY"
-          
-          echo "⏳ Waiting for Lambda update to complete..."
-          aws lambda wait function-updated \
-            --function-name "$FUNCTION_NAME"
-          
-          echo "✅ Lambda function updated with initial code"
-          
-          # 更新 CloudFormation 栈以使用正确的 S3 键
-          STACK_NAME="productcatalog-app-${{ github.event.inputs.environment }}"
-          
-          echo "🔄 Updating CloudFormation stack with correct S3 key..."
-          aws cloudformation update-stack \
-            --stack-name "$STACK_NAME" \
-            --use-previous-template \
-            --parameters \
-              ParameterKey=Environment,UsePreviousValue=true \
-              ParameterKey=DeploySecret,UsePreviousValue=true \
-              ParameterKey=DeployMainApp,UsePreviousValue=true \
-              ParameterKey=DeepSeekModel,UsePreviousValue=true \
-              ParameterKey=DeepSeekApiUrl,UsePreviousValue=true \
-              ParameterKey=MaxCategoriesPerRun,UsePreviousValue=true \
-              ParameterKey=MaxBrandsPerCategory,UsePreviousValue=true \
-              ParameterKey=MaxModelsPerBrand,UsePreviousValue=true \
-              ParameterKey=LogRetentionDays,UsePreviousValue=true \
-              ParameterKey=LambdaCodeS3Bucket,ParameterValue=$S3_BUCKET \
-              ParameterKey=LambdaCodeS3Key,ParameterValue=$S3_KEY \
-            --capabilities CAPABILITY_NAMED_IAM
-          
-          echo "⏳ Waiting for stack update to complete..."
-          aws cloudformation wait stack-update-complete \
-            --stack-name "$STACK_NAME"
-          
-          echo "✅ Stack updated with correct S3 key"
+Conditions:
+  DeploySecretCondition: !Equals [!Ref DeploySecret, "true"]
+  DeployMainAppCondition: !Equals [!Ref DeployMainApp, "true"]
+  HasApiKey: !Not [!Equals [!Ref DeepSeekApiKey, ""]]
 
-      - name: Show Stack Outputs
-        if: success()
-        run: |
-          STACK_NAME="productcatalog-app-${{ github.event.inputs.environment }}"
-          
-          echo "===== STACK OUTPUTS ====="
-          aws cloudformation describe-stacks \
-            --stack-name "$STACK_NAME" \
-            --query 'Stacks[0].Outputs' \
-            --output table
-          
-          echo ""
-          echo "===== DEPLOYMENT SUMMARY ====="
-          echo "🏗️ Stack: $STACK_NAME"
-          echo "📦 S3 Bucket: ${{ github.event.inputs.s3_bucket }}"
-          echo "⚡ Lambda: ProductCatalog-Discovery-${{ github.event.inputs.environment }}"
-          echo "🗄️ DynamoDB: ProductCatalog-${{ github.event.inputs.environment }}"
+Resources:
+  # ============================================
+  # S3 存储 Lambda 代码
+  # ============================================
+  LambdaCodeBucket:
+    Type: AWS::S3::Bucket
+    Condition: DeployMainAppCondition
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Ref LambdaCodeS3Bucket
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Application
+          Value: ProductCatalog
+        - Key: Environment
+          Value: !Ref Environment
 
-      - name: Show Failed Resources
-        if: failure()
-        run: |
-          STACK_NAME="productcatalog-app-${{ github.event.inputs.environment }}"
-          
-          echo "===== FAILED EVENTS ====="
-          aws cloudformation describe-stack-events \
-            --stack-name "$STACK_NAME" \
-            --query "StackEvents[?contains(ResourceStatus,'FAILED')].[LogicalResourceId,ResourceStatus,ResourceStatusReason,Timestamp]" \
-            --output table
-          
-          echo ""
-          echo "===== LAST 10 EVENTS ====="
-          aws cloudformation describe-stack-events \
-            --stack-name "$STACK_NAME" \
-            --max-items 10 \
-            --query "StackEvents[].[LogicalResourceId,ResourceStatus,ResourceStatusReason,Timestamp]" \
-            --output table
+  # ============================================
+  # 第一部分：DeepSeek API Secret（可选）
+  # ============================================
+  DeepSeekApiSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: DeploySecretCondition
+    Properties:
+      Name: !Sub "${SecretName}/${Environment}"
+      Description: DeepSeek API key for product catalog discovery
+      SecretString: !If
+        - HasApiKey
+        - !Sub '{"apiKey":"${DeepSeekApiKey}"}'
+        - '{"apiKey":"PLACEHOLDER-REPLACE-ME"}'
+      Tags:
+        - Key: Application
+          Value: ProductCatalog
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================
+  # 第二部分：主应用（可选）
+  # ============================================
+  
+  # ---------- DynamoDB 表 ----------
+  ProductCatalogTable:
+    Type: AWS::DynamoDB::Table
+    Condition: DeployMainAppCondition
+    Properties:
+      TableName: !Sub "ProductCatalog-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Application
+          Value: ProductCatalog
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ---------- CloudWatch Logs ----------
+  ProductCatalogLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: DeployMainAppCondition
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/ProductCatalog-Discovery-${Environment}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ---------- Lambda 执行角色 ----------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: DeployMainAppCondition
+    Properties:
+      RoleName: !Sub "ProductCatalog-LambdaRole-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: ProductCatalogDiscoveryPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: DynamoDBCatalogAccess
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:BatchWriteItem
+                Resource: !GetAtt ProductCatalogTable.Arn
+              - Sid: DynamoDBGSIAccess
+                Effect: Allow
+                Action:
+                  - dynamodb:Query
+                Resource: !Sub "${ProductCatalogTable.Arn}/index/*"
+              - Sid: ReadDeepSeekApiSecret
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}/${Environment}-*"
+              - Sid: WriteLambdaLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${ProductCatalogLogGroup.Arn}:*"
+
+  # ---------- Lambda 函数 ----------
+  ProductCatalogDiscovery:
+    Type: AWS::Lambda::Function
+    Condition: DeployMainAppCondition
+    DependsOn:
+      - ProductCatalogLogGroup
+    Properties:
+      FunctionName: !Sub "ProductCatalog-Discovery-${Environment}"
+      Description: 通过 DeepSeek AI 发现电子产品品类、品牌和型号（手动触发）
+      Runtime: python3.12
+      Architectures:
+        - arm64
+      Handler: lambda_function.lambda_handler
+      Timeout: 900
+      MemorySize: 512
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: !Ref LambdaCodeS3Key
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ProductCatalogTable
+          DEEPSEEK_SECRET_NAME: !Sub "${SecretName}/${Environment}"
+          DEEPSEEK_MODEL: !Ref DeepSeekModel
+          DEEPSEEK_API_URL: !Ref DeepSeekApiUrl
+          MAX_CATEGORIES: !Ref MaxCategoriesPerRun
+          MAX_BRANDS: !Ref MaxBrandsPerCategory
+          MAX_MODELS: !Ref MaxModelsPerBrand
+      Tags:
+        - Key: Application
+          Value: ProductCatalog
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  # ============ S3 输出 ============
+  LambdaCodeBucketName:
+    Description: S3 存储 Lambda 代码的存储桶名称
+    Condition: DeployMainAppCondition
+    Value: !Ref LambdaCodeBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-CodeBucket"
+
+  # ============ Secret 输出 ============
+  DeepSeekApiSecretArn:
+    Description: DeepSeek API Secret ARN
+    Condition: DeploySecretCondition
+    Value: !Ref DeepSeekApiSecret
+    Export:
+      Name: !Sub "${AWS::StackName}-SecretArn"
+
+  DeepSeekApiSecretName:
+    Description: DeepSeek API Secret 名称
+    Condition: DeploySecretCondition
+    Value: !Sub "${SecretName}/${Environment}"
+    Export:
+      Name: !Sub "${AWS::StackName}-SecretName"
+
+  # ============ 主应用输出 ============
+  ProductCatalogTableName:
+    Description: DynamoDB 产品目录表名称
+    Condition: DeployMainAppCondition
+    Value: !Ref ProductCatalogTable
+    Export:
+      Name: !Sub "${AWS::StackName}-TableName"
+
+  ProductCatalogTableArn:
+    Description: DynamoDB 产品目录表 ARN
+    Condition: DeployMainAppCondition
+    Value: !GetAtt ProductCatalogTable.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-TableArn"
+
+  DiscoveryLambdaName:
+    Description: Lambda 发现函数名称
+    Condition: DeployMainAppCondition
+    Value: !Ref ProductCatalogDiscovery
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaName"
+
+  DiscoveryLambdaArn:
+    Description: Lambda 发现函数 ARN
+    Condition: DeployMainAppCondition
+    Value: !GetAtt ProductCatalogDiscovery.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaArn"
