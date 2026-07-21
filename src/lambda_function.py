@@ -23,6 +23,7 @@ MAX_BRANDS = int(os.environ.get("MAX_BRANDS", "20"))
 MAX_MODELS = int(os.environ.get("MAX_MODELS", "50"))
 
 _api_key_cache = None
+_brand_date_cache = {}  # 品牌日期缓存
 
 
 def log(level, message, **fields):
@@ -108,11 +109,17 @@ def clean_json_content(content):
 
 
 def get_latest_model_date(brand):
-    """从数据库获取该品牌最晚发布的型号发布日期"""
+    """从数据库获取该品牌最晚发布的型号发布日期（带缓存）"""
+    brand_key = key_part(brand)
+    
+    # 检查缓存
+    if brand_key in _brand_date_cache:
+        return _brand_date_cache[brand_key]
+    
     try:
         response = table.query(
             IndexName="GSI1",
-            KeyConditionExpression=Key("GSI1PK").eq(f"BRAND#{key_part(brand)}"),
+            KeyConditionExpression=Key("GSI1PK").eq(f"BRAND#{brand_key}"),
             ScanIndexForward=False,  # 降序排列，最新的在前
             Limit=1
         )
@@ -120,7 +127,10 @@ def get_latest_model_date(brand):
         if items:
             latest_date = items[0].get("release_date", "")
             if latest_date:
+                _brand_date_cache[brand_key] = latest_date  # 缓存结果
                 return latest_date
+        
+        _brand_date_cache[brand_key] = None  # 缓存空结果
         return None
     except Exception as e:
         log("WARN", "获取最新型号日期失败", brand=brand, error=str(e))
@@ -190,12 +200,6 @@ def call_deepseek(task):
     body = {
         "model": MODEL,
         "stream": False,
-        "tools": [
-            {
-                "type": "web_search",
-                "max_keyword": 3
-            }
-        ],
         "input": [
             {
                 "role": "user",
@@ -208,6 +212,15 @@ def call_deepseek(task):
             }
         ]
     }
+
+    # 优化1：移除所有web_search工具，不启用搜索功能
+    # 之前这段代码会显著增加token消耗
+    # "tools": [
+    #     {
+    #         "type": "web_search",
+    #         "max_keyword": 3
+    #     }
+    # ]
 
     encoded_body = json.dumps(body, ensure_ascii=False).encode("utf-8")
     retryable_codes = {408, 409, 429, 500, 502, 503, 504}
@@ -464,7 +477,7 @@ def process_discovery(event):
             for cat, brand in brands[:3]:  # 限制处理前3个品牌
                 time.sleep(1)  # 速率限制保护
                 
-                # 从数据库获取该品牌最晚发布的型号日期
+                # 优化2：从数据库获取该品牌最晚发布的型号日期（带缓存）
                 latest_date = get_latest_model_date(brand)
                 
                 model_task = {
@@ -509,7 +522,7 @@ def process_discovery(event):
                 "body": json.dumps({"error": "需要提供 category 和 brand 参数"}, ensure_ascii=False)
             }
         
-        # 从数据库获取该品牌最晚发布的型号日期
+        # 优化2：从数据库获取该品牌最晚发布的型号日期（带缓存）
         latest_date = get_latest_model_date(brand)
         
         task = {
