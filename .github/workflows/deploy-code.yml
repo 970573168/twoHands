@@ -87,37 +87,6 @@ jobs:
           
           echo "✅ Lambda update confirmed"
 
-      - name: Update CloudFormation Stack
-        run: |
-          STACK_NAME="productcatalog-app-${{ github.event.inputs.environment }}"
-          S3_BUCKET="${{ github.event.inputs.s3_bucket }}"
-          S3_KEY="${{ env.s3_key }}"
-          
-          echo "🔄 Updating CloudFormation stack with new S3 key..."
-          
-          aws cloudformation update-stack \
-            --stack-name "$STACK_NAME" \
-            --use-previous-template \
-            --parameters \
-              ParameterKey=Environment,UsePreviousValue=true \
-              ParameterKey=DeploySecret,UsePreviousValue=true \
-              ParameterKey=DeployMainApp,UsePreviousValue=true \
-              ParameterKey=DeepSeekModel,UsePreviousValue=true \
-              ParameterKey=DeepSeekApiUrl,UsePreviousValue=true \
-              ParameterKey=MaxCategoriesPerRun,UsePreviousValue=true \
-              ParameterKey=MaxBrandsPerCategory,UsePreviousValue=true \
-              ParameterKey=MaxModelsPerBrand,UsePreviousValue=true \
-              ParameterKey=LogRetentionDays,UsePreviousValue=true \
-              ParameterKey=LambdaCodeS3Bucket,ParameterValue=$S3_BUCKET \
-              ParameterKey=LambdaCodeS3Key,ParameterValue=$S3_KEY \
-            --capabilities CAPABILITY_NAMED_IAM
-          
-          echo "⏳ Waiting for stack update to complete..."
-          aws cloudformation wait stack-update-complete \
-            --stack-name "$STACK_NAME"
-          
-          echo "✅ Stack update completed"
-
       - name: Show Deployment Info
         if: success()
         run: |
