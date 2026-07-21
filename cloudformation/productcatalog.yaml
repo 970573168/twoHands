@@ -1,7 +1,11 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: "Product Catalog Discovery System"
+
+Description: >
+  电子产品目录采集器 + DeepSeek API Secret（可选）
+  Lambda 代码通过已有 S3 Bucket 部署
 
 Parameters:
+  # ============ 通用参数 ============
   Environment:
     Type: String
     Default: dev
@@ -9,62 +13,118 @@ Parameters:
       - dev
       - test
       - prod
+    Description: 环境名称
 
+  # ============ S3 代码部署参数 ============
+  LambdaCodeS3Bucket:
+    Type: String
+    Description: 已存在的 S3 Bucket 名称，用于存储 Lambda 代码
+
+  LambdaCodeS3Key:
+    Type: String
+    Default: "productcatalog/lambda.zip"
+    Description: S3 中 Lambda 代码的对象键
+
+  # ============ Secret 控制参数 ============
   DeploySecret:
     Type: String
-    Default: "false"
+    Default: "true"
     AllowedValues:
       - "true"
       - "false"
+    Description: 是否部署 DeepSeek API Secret
 
+  DeepSeekApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: DeepSeek API Key（仅在 DeploySecret=true 时需要）
+
+  SecretName:
+    Type: String
+    Default: "ProductCatalog/DeepSeekApiKey"
+    Description: Secrets Manager 中的 Secret 名称前缀
+
+  # ============ 主应用参数 ============
   DeployMainApp:
     Type: String
     Default: "true"
     AllowedValues:
       - "true"
       - "false"
+    Description: 是否部署主应用
+
+  DeepSeekModel:
+    Type: String
+    Default: deepseek-v4-flash-260425
+    Description: DeepSeek 模型名称
+
+  DeepSeekApiUrl:
+    Type: String
+    Default: "https://ark.cn-beijing.volces.com/api/v3/responses"
+    Description: DeepSeek API URL
 
   MaxCategoriesPerRun:
-    Type: String
-    Default: "20"
+    Type: Number
+    Default: 20
+    MinValue: 1
+    MaxValue: 100
+    Description: 每次运行发现的最大品类数
 
   MaxBrandsPerCategory:
-    Type: String
-    Default: "20"
+    Type: Number
+    Default: 20
+    MinValue: 1
+    MaxValue: 100
+    Description: 每个品类发现的最大品牌数
 
   MaxModelsPerBrand:
-    Type: String
-    Default: "50"
+    Type: Number
+    Default: 50
+    MinValue: 1
+    MaxValue: 100
+    Description: 每个品牌发现的最大型号数
 
-  MaxTotalTokens:
-    Type: String
-    Default: "100000"
-
-  LambdaTimeoutSeconds:
-    Type: String
-    Default: "840"
-
-  LambdaTimeoutBuffer:
-    Type: String
-    Default: "30"
-
-  ApiCallDelay:
-    Type: String
-    Default: "1.0"
-
-  ApiKey:
-    Type: String
-    Default: ""
-    NoEcho: true
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    MinValue: 1
+    MaxValue: 3653
+    Description: CloudWatch 日志保留天数
 
 Conditions:
-  ShouldDeploySecret: !Equals [!Ref DeploySecret, "true"]
-  ShouldDeployMainApp: !Equals [!Ref DeployMainApp, "true"]
+  DeploySecretCondition: !Equals [!Ref DeploySecret, "true"]
+  DeployMainAppCondition: !Equals [!Ref DeployMainApp, "true"]
+  HasApiKey: !Not [!Equals [!Ref DeepSeekApiKey, ""]]
 
 Resources:
+  # ============================================
+  # DeepSeek API Secret（可选）
+  # ============================================
+  DeepSeekApiSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: DeploySecretCondition
+    Properties:
+      Name: !Sub "${SecretName}/${Environment}"
+      Description: DeepSeek API key for product catalog discovery
+      SecretString: !If
+        - HasApiKey
+        - !Sub '{"apiKey":"${DeepSeekApiKey}"}'
+        - '{"apiKey":"PLACEHOLDER-REPLACE-ME"}'
+      Tags:
+        - Key: Application
+          Value: ProductCatalog
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================
+  # 主应用（可选）
+  # ============================================
+
+  # ---------- DynamoDB 表 ----------
   ProductCatalogTable:
-    Condition: ShouldDeployMainApp
     Type: AWS::DynamoDB::Table
+    Condition: DeployMainAppCondition
     Properties:
       TableName: !Sub "ProductCatalog-${Environment}"
       BillingMode: PAY_PER_REQUEST
@@ -91,18 +151,31 @@ Resources:
               KeyType: RANGE
           Projection:
             ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Application
+          Value: ProductCatalog
+        - Key: Environment
+          Value: !Ref Environment
 
-  ApiSecret:
-    Condition: ShouldDeploySecret
-    Type: AWS::SecretsManager::Secret
+  # ---------- CloudWatch Logs ----------
+  ProductCatalogLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: DeployMainAppCondition
     Properties:
-      Name: !Sub "ProductCatalog-ApiKey-${Environment}"
-      Description: "API Key for AI model access"
-      SecretString: !Sub '{"apiKey":"${ApiKey}"}'
+      LogGroupName: !Sub "/aws/lambda/ProductCatalog-Discovery-${Environment}"
+      RetentionInDays: !Ref LogRetentionDays
 
+  # ---------- Lambda 执行角色 ----------
   LambdaExecutionRole:
-    Condition: ShouldDeployMainApp
     Type: AWS::IAM::Role
+    Condition: DeployMainAppCondition
     Properties:
       RoleName: !Sub "ProductCatalog-LambdaRole-${Environment}"
       AssumeRolePolicyDocument:
@@ -110,607 +183,135 @@ Resources:
         Statement:
           - Effect: Allow
             Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
       Policies:
-        - PolicyName: DynamoDBAccess
+        - PolicyName: ProductCatalogDiscoveryPolicy
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              - Effect: Allow
+              - Sid: DynamoDBCatalogAccess
+                Effect: Allow
                 Action:
                   - dynamodb:GetItem
                   - dynamodb:PutItem
                   - dynamodb:UpdateItem
                   - dynamodb:Query
+                  - dynamodb:BatchWriteItem
                 Resource: !GetAtt ProductCatalogTable.Arn
-              - Effect: Allow
+
+              - Sid: DynamoDBGSIAccess
+                Effect: Allow
                 Action:
                   - dynamodb:Query
-                Resource: !Sub "${ProductCatalogTable.Arn}/index/GSI1"
-        - !If
-          - ShouldDeploySecret
-          - PolicyName: SecretsManagerAccess
-            PolicyDocument:
-              Version: "2012-10-17"
-              Statement:
-                - Effect: Allow
-                  Action:
-                    - secretsmanager:GetSecretValue
-                  Resource: !Ref ApiSecret
-          - !Ref "AWS::NoValue"
+                Resource: !Sub "${ProductCatalogTable.Arn}/index/*"
 
-  DiscoveryFunction:
-    Condition: ShouldDeployMainApp
+              - Sid: ReadDeepSeekApiSecret
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}/${Environment}-*"
+
+              - Sid: WriteLambdaLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${ProductCatalogLogGroup.Arn}:*"
+
+  # ---------- Lambda 函数 ----------
+  ProductCatalogDiscovery:
     Type: AWS::Lambda::Function
+    Condition: DeployMainAppCondition
+    DependsOn:
+      - ProductCatalogLogGroup
+      - LambdaExecutionRole
     Properties:
       FunctionName: !Sub "ProductCatalog-Discovery-${Environment}"
+      Description: 通过 DeepSeek AI 发现电子产品品类、品牌和型号（手动触发）
       Runtime: python3.12
-      Handler: index.lambda_handler
+      Architectures:
+        - arm64
+      Handler: lambda_function.lambda_handler
+      Timeout: 900
+      MemorySize: 512
       Role: !GetAtt LambdaExecutionRole.Arn
-      Timeout: !Ref LambdaTimeoutSeconds
-      MemorySize: 256
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: !Ref LambdaCodeS3Key
       Environment:
         Variables:
           TABLE_NAME: !Ref ProductCatalogTable
-          DOUBAO_API_URL: "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
-          DOUBAO_MODEL: "doubao-seed-2-1-pro-260628"
-          DOUBAO_SECRET_NAME: !If [ShouldDeploySecret, !Ref ApiSecret, ""]
+          DEEPSEEK_SECRET_NAME: !Sub "${SecretName}/${Environment}"
+          DEEPSEEK_MODEL: !Ref DeepSeekModel
+          DEEPSEEK_API_URL: !Ref DeepSeekApiUrl
           MAX_CATEGORIES: !Ref MaxCategoriesPerRun
           MAX_BRANDS: !Ref MaxBrandsPerCategory
           MAX_MODELS: !Ref MaxModelsPerBrand
-          MAX_TOTAL_TOKENS: !Ref MaxTotalTokens
-          LAMBDA_TIMEOUT_SECONDS: !Ref LambdaTimeoutSeconds
-          LAMBDA_TIMEOUT_BUFFER: !Ref LambdaTimeoutBuffer
-          API_CALL_DELAY: !Ref ApiCallDelay
-          DOUBAO_TEMPERATURE: "0.7"
-          DOUBAO_MAX_TOKENS: "4000"
-          DOUBAO_TOP_P: "1.0"
-          DOUBAO_REQUEST_TIMEOUT: "90"
-          DOUBAO_MAX_RETRIES: "3"
-          CATEGORY_LIMIT: "5"
-          BRAND_LIMIT: "3"
-          DATA_SOURCE: "DOUBAO_AI"
-      Code:
-        ZipFile: !Sub |
-          import hashlib
-          import json
-          import os
-          import random
-          import re
-          import time
-          import urllib.error
-          import urllib.request
-          from boto3.dynamodb.conditions import Key
-
-          import boto3
-
-          dynamodb = boto3.resource("dynamodb")
-          table = dynamodb.Table(os.environ["TABLE_NAME"])
-          secretsmanager = boto3.client("secretsmanager")
-
-          API_URL = os.environ.get("DOUBAO_API_URL")
-          MODEL = os.environ.get("DOUBAO_MODEL")
-          SECRET_NAME = os.environ.get("DOUBAO_SECRET_NAME")
-
-          TEMPERATURE = float(os.environ.get("DOUBAO_TEMPERATURE", "0.7"))
-          MAX_TOKENS_PER_CALL = int(os.environ.get("DOUBAO_MAX_TOKENS", "4000"))
-          TOP_P = float(os.environ.get("DOUBAO_TOP_P", "1.0"))
-          REQUEST_TIMEOUT = int(os.environ.get("DOUBAO_REQUEST_TIMEOUT", "90"))
-          MAX_RETRIES = int(os.environ.get("DOUBAO_MAX_RETRIES", "3"))
-
-          MAX_CATEGORIES = int(os.environ.get("MAX_CATEGORIES", "20"))
-          MAX_BRANDS = int(os.environ.get("MAX_BRANDS", "20"))
-          MAX_MODELS = int(os.environ.get("MAX_MODELS", "50"))
-
-          MAX_TOTAL_TOKENS = int(os.environ.get("MAX_TOTAL_TOKENS", "100000"))
-          LAMBDA_TIMEOUT_SECONDS = int(os.environ.get("LAMBDA_TIMEOUT_SECONDS", "840"))
-          LAMBDA_TIMEOUT_BUFFER = int(os.environ.get("LAMBDA_TIMEOUT_BUFFER", "30"))
-
-          CATEGORY_LIMIT = int(os.environ.get("CATEGORY_LIMIT", "5"))
-          BRAND_LIMIT = int(os.environ.get("BRAND_LIMIT", "3"))
-          API_CALL_DELAY = float(os.environ.get("API_CALL_DELAY", "1.0"))
-
-          DATA_SOURCE = os.environ.get("DATA_SOURCE", "DOUBAO_AI")
-
-          _api_key_cache = None
-          _brand_date_cache = {}
-          _total_tokens_used = 0
-          _lambda_start_time = None
-
-
-          def log(level, message, **fields):
-              entry = {
-                  "level": level,
-                  "message": message,
-                  "total_tokens": _total_tokens_used,
-                  "elapsed_seconds": get_elapsed_seconds(),
-                  **fields,
-              }
-              print(json.dumps(entry, ensure_ascii=False, default=str))
-
-
-          def get_elapsed_seconds():
-              if _lambda_start_time is None:
-                  return 0
-              return time.time() - _lambda_start_time
-
-
-          def get_remaining_seconds():
-              elapsed = get_elapsed_seconds()
-              remaining = LAMBDA_TIMEOUT_SECONDS - elapsed - LAMBDA_TIMEOUT_BUFFER
-              return max(0, remaining)
-
-
-          def check_timeout():
-              remaining = get_remaining_seconds()
-              if remaining <= 0:
-                  raise RuntimeError(
-                      f"Lambda timeout: elapsed {get_elapsed_seconds():.1f}s"
-                  )
-
-
-          def check_limits():
-              check_token_limit()
-              check_timeout()
-
-
-          def get_api_key():
-              global _api_key_cache
-              if _api_key_cache:
-                  return _api_key_cache
-
-              response = secretsmanager.get_secret_value(SecretId=SECRET_NAME)
-              secret_string = response.get("SecretString")
-              if not secret_string:
-                  raise RuntimeError("API secret has no SecretString value")
-
-              try:
-                  value = json.loads(secret_string)
-                  api_key = value.get("apiKey") or value.get("api_key") or value.get("key")
-              except json.JSONDecodeError:
-                  api_key = secret_string
-
-              if not api_key:
-                  raise RuntimeError("API secret does not contain apiKey")
-
-              _api_key_cache = api_key
-              return _api_key_cache
-
-
-          def normalize(value):
-              value = str(value or "").strip()
-              value = value.translate(str.maketrans(
-                  '\uff21\uff22\uff23\uff24\uff25\uff26\uff27\uff28\uff29\uff2a\uff2b\uff2c\uff2d\uff2e\uff2f\uff30\uff31\uff32\uff33\uff34\uff35\uff36\uff37\uff38\uff39\uff3a'
-                  '\uff41\uff42\uff43\uff44\uff45\uff46\uff47\uff48\uff49\uff4a\uff4b\uff4c\uff4d\uff4e\uff4f\uff50\uff51\uff52\uff53\uff54\uff55\uff56\uff57\uff58\uff59\uff5a'
-                  '\uff10\uff11\uff12\uff13\uff14\uff15\uff16\uff17\uff18\uff19',
-                  'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
-                  'abcdefghijklmnopqrstuvwxyz'
-                  '0123456789'
-              ))
-              return re.sub(r"\s+", " ", value)
-
-
-          def key_part(value):
-              value = normalize(value).upper()
-              value = re.sub(r"[^A-Z0-9\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]+", "-", value)
-              return value.strip("-")[:180]
-
-
-          def stable_id(*values):
-              raw = "|".join(normalize(value).casefold() for value in values)
-              return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
-
-
-          def clean_json_content(content):
-              if isinstance(content, dict):
-                  return content
-              if isinstance(content, list):
-                  text_parts = []
-                  for part in content:
-                      if isinstance(part, dict):
-                          t = part.get("type", "")
-                          if t in ("input_text", "text"):
-                              text_parts.append(str(part.get("text", "")))
-                  content = "".join(text_parts)
-              text = str(content or "").strip()
-              text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-              text = re.sub(r"\s*```$", "", text)
-              json_match = re.search(r'\{[\s\S]*\}', text)
-              if json_match:
-                  text = json_match.group(0)
-              return json.loads(text)
-
-
-          def get_latest_model_date(brand):
-              brand_key = key_part(brand)
-              if brand_key in _brand_date_cache:
-                  return _brand_date_cache[brand_key]
-              try:
-                  response = table.query(
-                      IndexName="GSI1",
-                      KeyConditionExpression=Key("GSI1PK").eq(f"BRAND#{brand_key}"),
-                      ScanIndexForward=False,
-                      Limit=1
-                  )
-                  items = response.get("Items", [])
-                  if items:
-                      latest_date = items[0].get("release_date", "")
-                      if latest_date:
-                          _brand_date_cache[brand_key] = latest_date
-                          return latest_date
-                  _brand_date_cache[brand_key] = None
-                  return None
-              except Exception as e:
-                  log("WARN", "Failed to get latest model date", brand=brand, error=str(e))
-                  return None
-
-
-          def check_token_limit():
-              if _total_tokens_used >= MAX_TOTAL_TOKENS:
-                  raise RuntimeError(
-                      f"Token limit reached: {_total_tokens_used}/{MAX_TOTAL_TOKENS}"
-                  )
-
-
-          def update_token_usage(usage):
-              global _total_tokens_used
-              if usage:
-                  total = usage.get("total_tokens", 0)
-                  _total_tokens_used += total
-                  log("INFO", "Token usage updated",
-                      added_tokens=total,
-                      total_tokens=_total_tokens_used,
-                      limit=MAX_TOTAL_TOKENS)
-
-
-          def build_prompt(task):
-              task_type = task.get("task_type")
-              max_items = int(task.get("max_items", 20))
-              search_date = task.get("search_date", "")
-
-              if task_type == "DISCOVER_CATEGORIES":
-                  instruction = (
-                      "List general electronic product categories. "
-                      "Include only 'category' field per entry. "
-                      "No brands, accessories, services, or duplicate synonyms."
-                  )
-              elif task_type == "DISCOVER_BRANDS":
-                  category = normalize(task.get("category"))
-                  instruction = (
-                      f"List real brands for electronic category '{category}'. "
-                      "Include 'category' and 'brand' fields. No fictional brands."
-                  )
-              elif task_type == "DISCOVER_MODELS":
-                  category = normalize(task.get("category"))
-                  brand = normalize(task.get("brand"))
-                  date_condition = ""
-                  if search_date:
-                      date_condition = f"Only include products released after {search_date}. "
-                  instruction = (
-                      f"List specific product models for brand '{brand}' in category '{category}'. "
-                      f"{date_condition}"
-                      "Include category, brand, model, confidence, release_date fields."
-                  )
-              else:
-                  raise ValueError(f"Unknown task_type: {task_type}")
-
-              prompt = f"""
-          {instruction}
-
-          Return JSON object with 'items' array. Max {max_items} entries.
-          Each entry has these fields (empty string for optional):
-          - category: string
-          - brand: string or empty
-          - model: string or empty
-          - confidence: 0-1 number or null
-          - release_date: YYYY-MM-DD or empty
-
-          Rules:
-          - Return ONLY JSON, no markdown
-          - Use ONLY your knowledge base, NO web_search
-          - Only real electronic product data
-          - Lower confidence if uncertain
-          - Merge duplicates by normalizing case/spaces
-          """
-              return prompt
-
-
-          def call_api(task):
-              check_limits()
-              remaining = get_remaining_seconds()
-              if remaining < REQUEST_TIMEOUT + 10:
-                  raise RuntimeError(f"Insufficient time: {remaining:.1f}s remaining")
-
-              prompt = build_prompt(task)
-              body = {
-                  "model": MODEL,
-                  "messages": [
-                      {"role": "system", "content": "You are a helpful assistant that returns data in JSON format."},
-                      {"role": "user", "content": prompt}
-                  ],
-                  "temperature": TEMPERATURE,
-                  "max_tokens": MAX_TOKENS_PER_CALL,
-                  "top_p": TOP_P
-              }
-
-              encoded_body = json.dumps(body, ensure_ascii=False).encode("utf-8")
-              last_error = None
-
-              for attempt in range(MAX_RETRIES):
-                  req = urllib.request.Request(
-                      API_URL,
-                      data=encoded_body,
-                      headers={
-                          "Authorization": "Bearer " + get_api_key(),
-                          "Content-Type": "application/json",
-                      },
-                      method="POST",
-                  )
-
-                  try:
-                      with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
-                          result = json.loads(resp.read().decode("utf-8"))
-                          if "choices" in result and len(result["choices"]) > 0:
-                              content = result["choices"][0].get("message", {}).get("content", "")
-                          else:
-                              content = result.get("content") or "{}"
-
-                          parsed = clean_json_content(content)
-                          items = parsed.get("items", [])
-                          if not isinstance(items, list):
-                              for v in parsed.values():
-                                  if isinstance(v, list):
-                                      items = v
-                                      break
-
-                          if not isinstance(items, list):
-                              raise ValueError("API response items is not a list")
-
-                          update_token_usage(result.get("usage", {}))
-                          log("INFO", "API request completed", item_count=len(items))
-                          return items
-
-                  except urllib.error.HTTPError as error:
-                      error_body = error.read().decode("utf-8", errors="replace")
-                      last_error = RuntimeError(f"API HTTP {error.code}: {error_body[:500]}")
-                      if error.code not in (408, 409, 429, 500, 502, 503, 504):
-                          raise last_error
-                  except (urllib.error.URLError, TimeoutError) as error:
-                      last_error = RuntimeError(f"API network error: {error}")
-
-                  if attempt < MAX_RETRIES - 1:
-                      time.sleep((2 ** attempt) + random.random())
-
-              raise last_error or RuntimeError("API request failed")
-
-
-          def upsert_category(category):
-              category = normalize(category)
-              if not category:
-                  return
-              now = int(time.time())
-              table.update_item(
-                  Key={"PK": f"CATEGORY#{key_part(category)}", "SK": "META"},
-                  UpdateExpression=(
-                      "SET entity_type = :t, #n = :n, #s = :s, "
-                      "first_seen_at = if_not_exists(first_seen_at, :now), "
-                      "last_seen_at = :now, #src = :src"
-                  ),
-                  ExpressionAttributeNames={"#n": "name", "#s": "status", "#src": "source"},
-                  ExpressionAttributeValues={
-                      ":t": "CATEGORY", ":n": category, ":s": "ACTIVE",
-                      ":now": now, ":src": DATA_SOURCE
-                  },
-              )
-
-
-          def upsert_brand(category, brand):
-              category = normalize(category)
-              brand = normalize(brand)
-              if not category or not brand:
-                  return
-              now = int(time.time())
-              table.update_item(
-                  Key={"PK": f"CATEGORY#{key_part(category)}", "SK": f"BRAND#{key_part(brand)}"},
-                  UpdateExpression=(
-                      "SET entity_type = :t, category = :c, brand = :b, "
-                      "#s = :s, first_seen_at = if_not_exists(first_seen_at, :now), "
-                      "last_seen_at = :now, #src = :src"
-                  ),
-                  ExpressionAttributeNames={"#s": "status", "#src": "source"},
-                  ExpressionAttributeValues={
-                      ":t": "BRAND", ":c": category, ":b": brand,
-                      ":s": "ACTIVE", ":now": now, ":src": DATA_SOURCE
-                  },
-              )
-
-
-          def upsert_product(category, brand, model, confidence=None, release_date=None):
-              category = normalize(category)
-              brand = normalize(brand)
-              model = normalize(model)
-              if not category or not brand or not model:
-                  return
-              now = int(time.time())
-              product_id = stable_id(category, brand, model)
-              product_pk = f"PRODUCT#{product_id}"
-              expr = (
-                  "SET entity_type = :t, category = :c, brand = :b, "
-                  "model = :m, normalized_model = :nm, "
-                  "#s = :s, verification_status = if_not_exists(verification_status, :uv), "
-                  "first_seen_at = if_not_exists(first_seen_at, :now), last_seen_at = :now, "
-                  "#src = :src"
-              )
-              vals = {
-                  ":t": "PRODUCT", ":c": category, ":b": brand,
-                  ":m": model, ":nm": normalize(model).casefold(),
-                  ":s": "ACTIVE", ":uv": "UNVERIFIED",
-                  ":now": now, ":src": DATA_SOURCE
-              }
-              if confidence is not None:
-                  try:
-                      vals[":conf"] = str(max(0.0, min(1.0, float(confidence))))
-                      expr += ", confidence = :conf"
-                  except (TypeError, ValueError):
-                      pass
-              if release_date:
-                  release_date = normalize(release_date)
-                  if re.match(r"^\d{4}-\d{2}-\d{2}", release_date):
-                      expr += ", release_date = :rd"
-                      vals[":rd"] = release_date
-              table.update_item(
-                  Key={"PK": product_pk, "SK": "META"},
-                  UpdateExpression=expr,
-                  ExpressionAttributeNames={"#s": "status", "#src": "source"},
-                  ExpressionAttributeValues=vals,
-              )
-              gsi_item = {
-                  "PK": f"BRAND#{key_part(brand)}",
-                  "SK": f"MODEL#{key_part(model)}",
-                  "GSI1PK": f"BRAND#{key_part(brand)}",
-                  "GSI1SK": release_date if release_date else "0000-00-00",
-                  "entity_type": "BRAND_MODEL",
-                  "category": category, "brand": brand, "model": model,
-                  "product_pk": product_pk, "last_seen_at": now
-              }
-              if release_date:
-                  gsi_item["release_date"] = release_date
-              table.put_item(Item=gsi_item)
-
-
-          def process_discovery(event):
-              global _total_tokens_used, _lambda_start_time
-              _total_tokens_used = 0
-              _lambda_start_time = time.time()
-
-              task_type = event.get("task_type", "DISCOVER_CATEGORIES")
-              log("INFO", "Starting discovery", task_type=task_type)
-
-              try:
-                  if task_type == "DISCOVER_CATEGORIES":
-                      items = call_api({"task_type": "DISCOVER_CATEGORIES", "max_items": MAX_CATEGORIES})
-                      categories = []
-                      for item in items:
-                          if isinstance(item, dict) and "category" in item:
-                              cat = normalize(item["category"])
-                              if cat:
-                                  upsert_category(cat)
-                                  categories.append(cat)
-                      log("INFO", "Categories discovered", count=len(categories))
-
-                      for category in categories[:CATEGORY_LIMIT]:
-                          if _total_tokens_used >= MAX_TOTAL_TOKENS or get_remaining_seconds() < REQUEST_TIMEOUT + 10:
-                              log("WARN", "Limit reached, stopping brand discovery")
-                              break
-                          time.sleep(API_CALL_DELAY)
-                          brand_items = call_api({"task_type": "DISCOVER_BRANDS", "category": category, "max_items": MAX_BRANDS})
-                          brands = []
-                          for item in brand_items:
-                              if isinstance(item, dict) and "brand" in item:
-                                  b = normalize(item["brand"])
-                                  if b:
-                                      upsert_brand(category, b)
-                                      brands.append((category, b))
-                          log("INFO", "Brands discovered", category=category, count=len(brands))
-
-                          for cat, brand in brands[:BRAND_LIMIT]:
-                              if _total_tokens_used >= MAX_TOTAL_TOKENS or get_remaining_seconds() < REQUEST_TIMEOUT + 10:
-                                  log("WARN", "Limit reached, stopping model discovery")
-                                  break
-                              time.sleep(API_CALL_DELAY)
-                              latest_date = get_latest_model_date(brand)
-                              model_items = call_api({
-                                  "task_type": "DISCOVER_MODELS",
-                                  "category": cat, "brand": brand,
-                                  "max_items": MAX_MODELS, "search_date": latest_date
-                              })
-                              mc = 0
-                              for item in model_items:
-                                  if isinstance(item, dict) and "model" in item:
-                                      upsert_product(cat, brand, item.get("model"),
-                                                     item.get("confidence"), item.get("release_date"))
-                                      mc += 1
-                              log("INFO", "Models discovered", category=cat, brand=brand, count=mc)
-
-                      return {
-                          "statusCode": 200,
-                          "body": json.dumps({
-                              "message": "Discovery completed",
-                              "categories_discovered": len(categories),
-                              "total_tokens_used": _total_tokens_used
-                          })
-                      }
-
-                  elif task_type == "DISCOVER_MODELS":
-                      category = event.get("category", "")
-                      brand = event.get("brand", "")
-                      if not category or not brand:
-                          return {"statusCode": 400, "body": json.dumps({"error": "category and brand required"})}
-                      latest_date = get_latest_model_date(brand)
-                      items = call_api({
-                          "task_type": "DISCOVER_MODELS",
-                          "category": category, "brand": brand,
-                          "max_items": MAX_MODELS, "search_date": latest_date
-                      })
-                      mc = 0
-                      for item in items:
-                          if isinstance(item, dict) and "model" in item:
-                              upsert_product(category, brand, item.get("model"),
-                                             item.get("confidence"), item.get("release_date"))
-                              mc += 1
-                      return {
-                          "statusCode": 200,
-                          "body": json.dumps({
-                              "message": "Model discovery completed",
-                              "models_discovered": mc,
-                              "total_tokens_used": _total_tokens_used
-                          })
-                      }
-                  else:
-                      return {"statusCode": 400, "body": json.dumps({"error": f"Unknown task_type: {task_type}"})}
-
-              except RuntimeError as e:
-                  if "Token limit" in str(e) or "timeout" in str(e) or "Insufficient time" in str(e):
-                      log("WARN", "Task interrupted", reason=str(e))
-                      return {
-                          "statusCode": 200,
-                          "body": json.dumps({
-                              "message": "Task safely interrupted",
-                              "reason": str(e),
-                              "total_tokens_used": _total_tokens_used
-                          })
-                      }
-                  raise
-
-
-          def lambda_handler(event, context):
-              global _lambda_start_time
-              _lambda_start_time = time.time()
-              try:
-                  log("INFO", "Lambda started")
-                  return process_discovery(event)
-              except Exception as error:
-                  log("ERROR", "Lambda failed", error=str(error))
-                  return {
-                      "statusCode": 500,
-                      "body": json.dumps({"error": "Internal error", "details": str(error)})
-                  }
+      Tags:
+        - Key: Application
+          Value: ProductCatalog
+        - Key: Environment
+          Value: !Ref Environment
 
 Outputs:
-  TableName:
-    Condition: ShouldDeployMainApp
-    Description: "DynamoDB Table Name"
+  # ============ S3 输出 ============
+  LambdaCodeBucketName:
+    Description: S3 存储 Lambda 代码的存储桶名称
+    Condition: DeployMainAppCondition
+    Value: !Ref LambdaCodeS3Bucket
+    Export:
+      Name: !Sub "${AWS::StackName}-CodeBucket"
+
+  LambdaCodeObjectKey:
+    Description: S3 中 Lambda 代码对象键
+    Condition: DeployMainAppCondition
+    Value: !Ref LambdaCodeS3Key
+    Export:
+      Name: !Sub "${AWS::StackName}-CodeKey"
+
+  # ============ Secret 输出 ============
+  DeepSeekApiSecretArn:
+    Description: DeepSeek API Secret ARN
+    Condition: DeploySecretCondition
+    Value: !Ref DeepSeekApiSecret
+    Export:
+      Name: !Sub "${AWS::StackName}-SecretArn"
+
+  DeepSeekApiSecretName:
+    Description: DeepSeek API Secret 名称
+    Condition: DeploySecretCondition
+    Value: !Sub "${SecretName}/${Environment}"
+    Export:
+      Name: !Sub "${AWS::StackName}-SecretName"
+
+  # ============ 主应用输出 ============
+  ProductCatalogTableName:
+    Description: DynamoDB 产品目录表名称
+    Condition: DeployMainAppCondition
     Value: !Ref ProductCatalogTable
+    Export:
+      Name: !Sub "${AWS::StackName}-TableName"
 
-  LambdaFunctionName:
-    Condition: ShouldDeployMainApp
-    Description: "Lambda Function Name"
-    Value: !Ref DiscoveryFunction
+  ProductCatalogTableArn:
+    Description: DynamoDB 产品目录表 ARN
+    Condition: DeployMainAppCondition
+    Value: !GetAtt ProductCatalogTable.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-TableArn"
 
-  SecretName:
-    Condition: ShouldDeploySecret
-    Description: "Secrets Manager Secret Name"
-    Value: !Ref ApiSecret
+  DiscoveryLambdaName:
+    Description: Lambda 发现函数名称
+    Condition: DeployMainAppCondition
+    Value: !Ref ProductCatalogDiscovery
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaName"
+
+  DiscoveryLambdaArn:
+    Description: Lambda 发现函数 ARN
+    Condition: DeployMainAppCondition
+    Value: !GetAtt ProductCatalogDiscovery.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaArn"
