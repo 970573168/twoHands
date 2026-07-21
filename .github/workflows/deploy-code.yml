@@ -17,6 +17,7 @@ on:
         description: 'S3 bucket for Lambda code'
         required: true
         type: string
+        default: 'productcatalog-lambda-code-767076981380'
 
 permissions:
   id-token: write
