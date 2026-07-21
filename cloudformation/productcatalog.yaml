@@ -279,13 +279,6 @@ Resources:
           Value: !Ref Environment
 
 Outputs:
-  # ============ S3 输出 ============
-  LambdaCodeBucketName:
-    Description: S3 存储 Lambda 代码的存储桶名称
-    Condition: DeployMainAppCondition
-    Value: !Ref LambdaCodeBucket
-    Export:
-      Name: !Sub "${AWS::StackName}-CodeBucket"
 
   # ============ Secret 输出 ============
   DeepSeekApiSecretArn:
