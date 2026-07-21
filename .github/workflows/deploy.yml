@@ -24,9 +24,27 @@ on:
           - 'false'
       
       deploy_main_app:
-        description: 'Deploy Main Application?'
+        description: 'Deploy Lambda Function?'
         required: true
         default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      
+      deploy_dynamodb:
+        description: 'Deploy DynamoDB Table?'
+        required: true
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+      
+      deploy_lambda_role:
+        description: 'Deploy Lambda IAM Role?'
+        required: true
+        default: 'false'
         type: choice
         options:
           - 'true'
@@ -38,18 +56,16 @@ on:
         required: false
         type: string
       
-      # ========== 主应用参数 ==========
-      schedule_state:
-        description: 'Schedule state'
-        required: true
-        default: 'DISABLED'
-        type: choice
-        options:
-          - ENABLED
-          - DISABLED
+      # ========== Lambda 角色参数 ==========
+      lambda_role_arn:
+        description: 'Existing Lambda Role ARN - required if deploy_lambda_role=false'
+        required: false
+        default: ''
+        type: string
       
+      # ========== 主应用参数 ==========
       max_categories:
-        description: 'Max categories'
+        description: 'Max categories per run'
         required: false
         default: '20'
         type: string
@@ -100,61 +116,108 @@ jobs:
           echo "=========================================="
           echo "Deploying stack: $STACK_NAME"
           echo "Deploy Secret: ${{ github.event.inputs.deploy_secret }}"
-          echo "Deploy Main App: ${{ github.event.inputs.deploy_main_app }}"
+          echo "Deploy Lambda: ${{ github.event.inputs.deploy_main_app }}"
+          echo "Deploy DynamoDB: ${{ github.event.inputs.deploy_dynamodb }}"
+          echo "Deploy Lambda Role: ${{ github.event.inputs.deploy_lambda_role }}"
           echo "=========================================="
 
-          # 构建参数
+          # 构建基础参数
           PARAMS="Environment=${{ github.event.inputs.environment }} \
             DeploySecret=${{ github.event.inputs.deploy_secret }} \
             DeployMainApp=${{ github.event.inputs.deploy_main_app }} \
-            ScheduleState=${{ github.event.inputs.schedule_state }} \
+            DeployDynamoDB=${{ github.event.inputs.deploy_dynamodb }} \
+            DeployLambdaRole=${{ github.event.inputs.deploy_lambda_role }} \
             MaxCategoriesPerRun=${{ github.event.inputs.max_categories }} \
             MaxBrandsPerCategory=${{ github.event.inputs.max_brands }} \
             MaxModelsPerBrand=${{ github.event.inputs.max_models }}"
 
-          # 如果部署 Secret，添加 API Key
+          # ========================================
+          # Secret 处理
+          # ========================================
           if [ "${{ github.event.inputs.deploy_secret }}" = "true" ]; then
             if [ -n "${{ github.event.inputs.api_key }}" ]; then
               PARAMS="$PARAMS DeepSeekApiKey=${{ github.event.inputs.api_key }}"
-              echo "✅ API Key provided"
+              echo "✅ API Key provided for new secret"
             else
-              echo "⚠️ WARNING: deploy_secret=true but no API key provided"
+              echo "⚠️  WARNING: deploy_secret=true but no API key provided"
               echo "   Secret will be created with placeholder value"
             fi
           fi
 
-          # 如果只部署主应用（不部署新 Secret），尝试获取已有 Secret ARN
+          # 如果部署主应用但不部署新 Secret，尝试获取已有 Secret ARN
           if [ "${{ github.event.inputs.deploy_secret }}" = "false" ] && [ "${{ github.event.inputs.deploy_main_app }}" = "true" ]; then
             # 尝试从已有栈获取 Secret ARN
-            SECRET_STACK="productcatalog-secret-${{ github.event.inputs.environment }}"
+            SECRET_STACK="productcatalog-app-${{ github.event.inputs.environment }}"
             if aws cloudformation describe-stacks --stack-name "$SECRET_STACK" &>/dev/null; then
               SECRET_ARN=$(aws cloudformation describe-stacks \
                 --stack-name "$SECRET_STACK" \
                 --query "Stacks[0].Outputs[?OutputKey=='DeepSeekApiSecretArn'].OutputValue" \
                 --output text 2>/dev/null || echo "")
               
-              if [ -n "$SECRET_ARN" ]; then
+              if [ -n "$SECRET_ARN" ] && [ "$SECRET_ARN" != "None" ]; then
                 PARAMS="$PARAMS DeepSeekSecretArn=$SECRET_ARN"
-                echo "✅ Found existing Secret ARN: $SECRET_ARN"
+                echo "✅ Found existing Secret ARN from stack: $SECRET_ARN"
               fi
-            else
-              # 尝试通过名称查找
+            fi
+            
+            # 如果还没找到，尝试通过名称查找
+            if ! echo "$PARAMS" | grep -q "DeepSeekSecretArn"; then
               SECRET_NAME="ProductCatalog/DeepSeekApiKey/${{ github.event.inputs.environment }}"
               if aws secretsmanager describe-secret --secret-id "$SECRET_NAME" &>/dev/null; then
-                echo "✅ Found existing secret by name: $SECRET_NAME"
-                # 不传 ARN，让模板通过名称查找
+                SECRET_ARN=$(aws secretsmanager describe-secret --secret-id "$SECRET_NAME" --query 'ARN' --output text)
+                PARAMS="$PARAMS DeepSeekSecretArn=$SECRET_ARN"
+                echo "✅ Found existing Secret by name: $SECRET_NAME"
               else
-                echo "⚠️ WARNING: No existing secret found!"
+                echo "⚠️  WARNING: No existing secret found!"
                 echo "   Please deploy secret first or set deploy_secret=true"
               fi
             fi
           fi
 
+          # ========================================
+          # Lambda Role 处理
+          # ========================================
+          if [ "${{ github.event.inputs.deploy_lambda_role }}" = "false" ] && [ "${{ github.event.inputs.deploy_main_app }}" = "true" ]; then
+            if [ -n "${{ github.event.inputs.lambda_role_arn }}" ]; then
+              PARAMS="$PARAMS LambdaRoleArn=${{ github.event.inputs.lambda_role_arn }}"
+              echo "✅ Using provided Lambda Role ARN"
+            else
+              # 尝试从已有栈获取 Role ARN
+              ROLE_STACK="productcatalog-app-${{ github.event.inputs.environment }}"
+              if aws cloudformation describe-stacks --stack-name "$ROLE_STACK" &>/dev/null; then
+                ROLE_ARN=$(aws cloudformation describe-stacks \
+                  --stack-name "$ROLE_STACK" \
+                  --query "Stacks[0].Outputs[?OutputKey=='LambdaRoleArn'].OutputValue" \
+                  --output text 2>/dev/null || echo "")
+                
+                if [ -n "$ROLE_ARN" ] && [ "$ROLE_ARN" != "None" ]; then
+                  PARAMS="$PARAMS LambdaRoleArn=$ROLE_ARN"
+                  echo "✅ Found existing Lambda Role ARN from stack: $ROLE_ARN"
+                fi
+              fi
+              
+              # 如果还没找到，尝试通过名称查找
+              if ! echo "$PARAMS" | grep -q "LambdaRoleArn"; then
+                ROLE_NAME="ProductCatalog-LambdaRole-${{ github.event.inputs.environment }}"
+                if aws iam get-role --role-name "$ROLE_NAME" &>/dev/null; then
+                  ROLE_ARN=$(aws iam get-role --role-name "$ROLE_NAME" --query 'Role.Arn' --output text)
+                  PARAMS="$PARAMS LambdaRoleArn=$ROLE_ARN"
+                  echo "✅ Found existing Lambda Role by name: $ROLE_NAME"
+                else
+                  echo "❌ ERROR: No Lambda Role ARN provided and no existing role found!"
+                  echo "   Please provide lambda_role_arn or set deploy_lambda_role=true"
+                  exit 1
+                fi
+              fi
+            fi
+          fi
+
           echo ""
-          echo "📋 Parameters:"
-          echo "$PARAMS" | tr ' ' '\n'
+          echo "📋 Final Parameters:"
+          echo "$PARAMS" | tr ' ' '\n' | grep -v '^$'
           echo ""
 
+          # 部署
           aws cloudformation deploy \
             --template-file cloudformation/productcatalog.yaml \
             --stack-name "$STACK_NAME" \
@@ -170,8 +233,39 @@ jobs:
           echo "===== STACK OUTPUTS ====="
           aws cloudformation describe-stacks \
             --stack-name "$STACK_NAME" \
-            --query 'Stacks[0].Outputs' \
+            --query 'Stacks[0].Outputs[*].[OutputKey,OutputValue]' \
             --output table
+
+      - name: Show Deployed Resources Summary
+        if: success()
+        run: |
+          echo "===== DEPLOYMENT SUMMARY ====="
+          echo "Environment: ${{ github.event.inputs.environment }}"
+          echo ""
+          
+          if [ "${{ github.event.inputs.deploy_secret }}" = "true" ]; then
+            echo "✅ Secret: DEPLOYED (new)"
+          else
+            echo "ℹ️  Secret: Using existing"
+          fi
+          
+          if [ "${{ github.event.inputs.deploy_dynamodb }}" = "true" ]; then
+            echo "✅ DynamoDB: DEPLOYED (new)"
+          else
+            echo "ℹ️  DynamoDB: Using existing"
+          fi
+          
+          if [ "${{ github.event.inputs.deploy_lambda_role }}" = "true" ]; then
+            echo "✅ Lambda Role: DEPLOYED (new)"
+          else
+            echo "ℹ️  Lambda Role: Using existing"
+          fi
+          
+          if [ "${{ github.event.inputs.deploy_main_app }}" = "true" ]; then
+            echo "✅ Lambda Function: DEPLOYED (new)"
+          else
+            echo "ℹ️  Lambda Function: Not deployed"
+          fi
 
       - name: Show Failed Resources
         if: failure()
