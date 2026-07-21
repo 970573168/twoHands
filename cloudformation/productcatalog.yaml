@@ -54,16 +54,6 @@ Parameters:
       - "false"
     Description: 是否部署主应用
 
-  AiModel:
-    Type: String
-    Default: default-model
-    Description: AI 模型名称
-
-  ApiUrl:
-    Type: String
-    Default: "https://api.example.com/v1/chat/completions"
-    Description: API URL
-
   MaxCategoriesPerRun:
     Type: Number
     Default: 20
@@ -286,8 +276,7 @@ Resources:
           
           # API 配置
           SECRET_NAME: !Sub "${SecretName}/${Environment}"
-          AI_MODEL: !Ref AiModel
-          API_URL: !Ref ApiUrl
+
           
           # 发现任务配置
           MAX_CATEGORIES: !Ref MaxCategoriesPerRun
