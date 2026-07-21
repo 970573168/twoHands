@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: "2010-09-09"
 
 Description: >
-  电子产品目录采集器 + DeepSeek API Secret（可选）
+  电子产品目录采集器 + AI API Secret（可选）
   Lambda 代码通过已有 S3 Bucket 部署
 
 Parameters:
@@ -32,17 +32,17 @@ Parameters:
     AllowedValues:
       - "true"
       - "false"
-    Description: 是否部署 DeepSeek API Secret
+    Description: 是否部署 AI API Secret
 
-  DeepSeekApiKey:
+  ApiKey:
     Type: String
     NoEcho: true
     Default: ""
-    Description: DeepSeek API Key（仅在 DeploySecret=true 时需要）
+    Description: API Key（仅在 DeploySecret=true 时需要）
 
   SecretName:
     Type: String
-    Default: "ProductCatalog/DeepSeekApiKey"
+    Default: "ProductCatalog/ApiSecret"
     Description: Secrets Manager 中的 Secret 名称前缀
 
   # ============ 主应用参数 ============
@@ -54,15 +54,15 @@ Parameters:
       - "false"
     Description: 是否部署主应用
 
-  DeepSeekModel:
+  AiModel:
     Type: String
-    Default: deepseek-v4-flash-260425
-    Description: DeepSeek 模型名称
+    Default: default-model
+    Description: AI 模型名称
 
-  DeepSeekApiUrl:
+  ApiUrl:
     Type: String
-    Default: "https://ark.cn-beijing.volces.com/api/v3/responses"
-    Description: DeepSeek API URL
+    Default: "https://api.example.com/v1/chat/completions"
+    Description: API URL
 
   MaxCategoriesPerRun:
     Type: Number
@@ -133,21 +133,21 @@ Parameters:
 Conditions:
   DeploySecretCondition: !Equals [!Ref DeploySecret, "true"]
   DeployMainAppCondition: !Equals [!Ref DeployMainApp, "true"]
-  HasApiKey: !Not [!Equals [!Ref DeepSeekApiKey, ""]]
+  HasApiKey: !Not [!Equals [!Ref ApiKey, ""]]
 
 Resources:
   # ============================================
-  # DeepSeek API Secret（可选）
+  # AI API Secret（可选）
   # ============================================
-  DeepSeekApiSecret:
+  ApiSecret:
     Type: AWS::SecretsManager::Secret
     Condition: DeploySecretCondition
     Properties:
       Name: !Sub "${SecretName}/${Environment}"
-      Description: DeepSeek API key for product catalog discovery
+      Description: AI API key for product catalog discovery
       SecretString: !If
         - HasApiKey
-        - !Sub '{"apiKey":"${DeepSeekApiKey}"}'
+        - !Sub '{"apiKey":"${ApiKey}"}'
         - '{"apiKey":"PLACEHOLDER-REPLACE-ME"}'
       Tags:
         - Key: Application
@@ -246,7 +246,7 @@ Resources:
                   - dynamodb:Query
                 Resource: !Sub "${ProductCatalogTable.Arn}/index/*"
 
-              - Sid: ReadDeepSeekApiSecret
+              - Sid: ReadApiSecret
                 Effect: Allow
                 Action:
                   - secretsmanager:GetSecretValue
@@ -285,9 +285,9 @@ Resources:
           TABLE_NAME: !Ref ProductCatalogTable
           
           # API 配置
-          DEEPSEEK_SECRET_NAME: !Sub "${SecretName}/${Environment}"
-          DEEPSEEK_MODEL: !Ref DeepSeekModel
-          DEEPSEEK_API_URL: !Ref DeepSeekApiUrl
+          SECRET_NAME: !Sub "${SecretName}/${Environment}"
+          AI_MODEL: !Ref AiModel
+          API_URL: !Ref ApiUrl
           
           # 发现任务配置
           MAX_CATEGORIES: !Ref MaxCategoriesPerRun
@@ -300,14 +300,14 @@ Resources:
           LAMBDA_TIMEOUT_BUFFER: !Ref LambdaTimeoutBuffer
           
           # API 调用参数
-          DOUBAO_TEMPERATURE: "0.7"
-          DOUBAO_MAX_TOKENS: "4000"
-          DOUBAO_TOP_P: "1.0"
-          DOUBAO_REQUEST_TIMEOUT: "90"
-          DOUBAO_MAX_RETRIES: "3"
+          TEMPERATURE: "0.7"
+          MAX_TOKENS: "4000"
+          TOP_P: "1.0"
+          REQUEST_TIMEOUT: "90"
+          MAX_RETRIES: "3"
           
           # 系统提示词
-          DOUBAO_SYSTEM_PROMPT: "You are a helpful assistant that returns data in JSON format."
+          SYSTEM_PROMPT: "You are a helpful assistant that returns data in JSON format."
           
           # 处理流程控制
           CATEGORY_LIMIT: !Ref CategoryLimit
@@ -339,15 +339,15 @@ Outputs:
       Name: !Sub "${AWS::StackName}-CodeKey"
 
   # ============ Secret 输出 ============
-  DeepSeekApiSecretArn:
-    Description: DeepSeek API Secret ARN
+  ApiSecretArn:
+    Description: API Secret ARN
     Condition: DeploySecretCondition
-    Value: !Ref DeepSeekApiSecret
+    Value: !Ref ApiSecret
     Export:
       Name: !Sub "${AWS::StackName}-SecretArn"
 
-  DeepSeekApiSecretName:
-    Description: DeepSeek API Secret 名称
+  ApiSecretName:
+    Description: API Secret 名称
     Condition: DeploySecretCondition
     Value: !Sub "${SecretName}/${Environment}"
     Export:
