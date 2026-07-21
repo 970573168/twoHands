@@ -20,8 +20,8 @@ secretsmanager = boto3.client("secretsmanager")
 # ============================================
 
 # API 配置
-API_URL = os.environ.get("API_URL", "https://api.example.com/v1/chat/completions")
-MODEL = os.environ.get("AI_MODEL", "default-model")
+API_URL = os.environ.get("API_URL", "https://ark.cn-beijing.volces.com/api/v3/bots/chat/completions")
+MODEL = os.environ.get("AI_MODEL", "doubao-seed-2-1-pro-260628")
 SECRET_NAME = os.environ.get("SECRET_NAME", "")
 API_KEY = os.environ.get("API_KEY", "")
 
