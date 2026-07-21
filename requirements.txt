@@ -32,8 +32,5 @@ aws-lambda-powertools>=2.35.0
 # Retry Logic
 tenacity>=8.2.0
 
-# Concurrent Processing (if needed)
-concurrent-futures>=3.1.1
-
 # Data Validation
 pydantic>=2.6.0
