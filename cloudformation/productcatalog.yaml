@@ -44,11 +44,6 @@ Parameters:
       - "false"
     Description: 是否部署主应用
 
-  DeepSeekSecretArn:
-    Type: String
-    Default: ""
-    Description: 已有 Secret 的 ARN
-
   DeepSeekModel:
     Type: String
     Default: deepseek-v4-flash-260425
@@ -90,9 +85,6 @@ Parameters:
 Conditions:
   DeploySecretCondition: !Equals [!Ref DeploySecret, "true"]
   DeployMainAppCondition: !Equals [!Ref DeployMainApp, "true"]
-  UseExistingSecretArn: !And
-    - !Condition DeployMainAppCondition
-    - !Not [!Equals [!Ref DeepSeekSecretArn, ""]]
   HasApiKey: !Not [!Equals [!Ref DeepSeekApiKey, ""]]
 
 Resources:
@@ -208,13 +200,7 @@ Resources:
                 Effect: Allow
                 Action:
                   - secretsmanager:GetSecretValue
-                Resource: !If
-                  - UseExistingSecretArn
-                  - !Ref DeepSeekSecretArn
-                  - !If
-                    - DeploySecretCondition
-                    - !Ref DeepSeekApiSecret
-                    - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}-*"
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}/${Environment}-*"
               - Sid: WriteLambdaLogs
                 Effect: Allow
                 Action:
@@ -241,13 +227,7 @@ Resources:
       Environment:
         Variables:
           TABLE_NAME: !Ref ProductCatalogTable
-          DEEPSEEK_SECRET_ARN: !If
-            - UseExistingSecretArn
-            - !Ref DeepSeekSecretArn
-            - !If
-              - DeploySecretCondition
-              - !Ref DeepSeekApiSecret
-              - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}"
+          DEEPSEEK_SECRET_NAME: !Sub "${SecretName}/${Environment}"
           DEEPSEEK_MODEL: !Ref DeepSeekModel
           DEEPSEEK_API_URL: !Ref DeepSeekApiUrl
           MAX_CATEGORIES: !Ref MaxCategoriesPerRun
@@ -274,7 +254,7 @@ Resources:
 
           API_URL = os.environ["DEEPSEEK_API_URL"]
           MODEL = os.environ["DEEPSEEK_MODEL"]
-          SECRET_ARN = os.environ["DEEPSEEK_SECRET_ARN"]
+          SECRET_NAME = os.environ["DEEPSEEK_SECRET_NAME"]
           MAX_CATEGORIES = int(os.environ.get("MAX_CATEGORIES", "20"))
           MAX_BRANDS = int(os.environ.get("MAX_BRANDS", "20"))
           MAX_MODELS = int(os.environ.get("MAX_MODELS", "50"))
@@ -296,7 +276,7 @@ Resources:
               if _api_key_cache:
                   return _api_key_cache
 
-              response = secretsmanager.get_secret_value(SecretId=SECRET_ARN)
+              response = secretsmanager.get_secret_value(SecretId=SECRET_NAME)
               secret_string = response.get("SecretString")
               if not secret_string:
                   raise RuntimeError("DeepSeek API secret has no SecretString value")
