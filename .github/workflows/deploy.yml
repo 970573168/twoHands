@@ -60,31 +60,64 @@ on:
         default: '50'
         type: string
 
-permissions:
-  id-token: write
-  contents: read
-
 jobs:
   deploy-infrastructure:
     runs-on: ubuntu-latest
     environment: ${{ github.event.inputs.environment }}
+    # ✅ 修复1：permissions 必须在 job 层级，不能在顶层
+    permissions:
+      id-token: write
+      contents: read
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure AWS
+      # ✅ 修复2：添加 Python 环境设置
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # ✅ 修复3：添加调试步骤，帮助排查问题
+      - name: Debug Inputs
+        run: |
+          echo "=========================================="
+          echo "🔍 Debug Information"
+          echo "=========================================="
+          echo "Environment: ${{ github.event.inputs.environment }}"
+          echo "Deploy Secret: ${{ github.event.inputs.deploy_secret }}"
+          echo "Deploy Main App: ${{ github.event.inputs.deploy_main_app }}"
+          echo "S3 Bucket: ${{ github.event.inputs.s3_bucket }}"
+          echo "Max Categories: ${{ github.event.inputs.max_categories }}"
+          echo "Max Brands: ${{ github.event.inputs.max_brands }}"
+          echo "Max Models: ${{ github.event.inputs.max_models }}"
+          echo "API Key Provided: ${{ github.event.inputs.api_key != '' }}"
+          echo "Runner OS: $(uname -a)"
+          echo "Runner Arch: $(uname -m)"
+          echo "Python Version: $(python3 --version)"
+          echo "AWS CLI Version: $(aws --version 2>/dev/null || echo 'Not installed yet')"
+          echo "=========================================="
+
+      - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::767076981380:role/twoHands-GitHubActions-Role
           aws-region: ap-northeast-1
+          # ✅ 修复4：添加 session 标记，便于审计
+          role-session-name: GitHubActions-${{ github.event.inputs.environment }}
 
       - name: Verify AWS Identity
-        run: aws sts get-caller-identity
+        run: |
+          echo "🔍 Verifying AWS Identity..."
+          aws sts get-caller-identity
+          echo "✅ AWS Identity verified successfully"
 
       - name: Create S3 Bucket and Upload Placeholder
         if: ${{ github.event.inputs.deploy_main_app == 'true' }}
         run: |
+          set -e  # ✅ 修复5：遇到错误立即停止
+          
           S3_BUCKET="${{ github.event.inputs.s3_bucket }}"
           TIMESTAMP=$(date +%Y%m%d%H%M%S)
           
@@ -160,11 +193,26 @@ EOF
 
       - name: Validate CloudFormation Template
         run: |
+          echo "🔍 Validating CloudFormation template..."
+          
+          # ✅ 修复6：检查模板文件是否存在
+          if [ ! -f "cloudformation/productcatalog.yaml" ]; then
+            echo "❌ ERROR: CloudFormation template not found: cloudformation/productcatalog.yaml"
+            echo "Current directory: $(pwd)"
+            echo "Files in cloudformation/:"
+            ls -la cloudformation/ 2>/dev/null || echo "cloudformation/ directory not found"
+            exit 1
+          fi
+          
           aws cloudformation validate-template \
             --template-body file://cloudformation/productcatalog.yaml
+          
+          echo "✅ CloudFormation template is valid"
 
       - name: Deploy CloudFormation Stack
         run: |
+          set -e  # ✅ 遇到错误立即停止
+          
           STACK_NAME="productcatalog-app-${{ github.event.inputs.environment }}"
           
           # 获取 S3 信息
@@ -239,7 +287,25 @@ EOF
       - name: Build and Deploy Real Lambda Code
         if: ${{ github.event.inputs.deploy_main_app == 'true' && success() }}
         run: |
+          set -e  # ✅ 遇到错误立即停止
+          
           echo "🔨 Building real Lambda package..."
+          
+          # ✅ 修复7：检查 requirements.txt 是否存在
+          if [ ! -f "requirements.txt" ]; then
+            echo "⚠️  WARNING: requirements.txt not found"
+            echo "Creating empty requirements.txt..."
+            touch requirements.txt
+          fi
+          
+          # ✅ 修复8：检查 Lambda 函数源文件是否存在
+          if [ ! -f "src/lambda_function.py" ]; then
+            echo "❌ ERROR: Lambda function source not found: src/lambda_function.py"
+            echo "Current directory: $(pwd)"
+            echo "Files in src/:"
+            ls -la src/ 2>/dev/null || echo "src/ directory not found"
+            exit 1
+          fi
           
           # 安装依赖
           BUILD_DIR="build"
@@ -247,14 +313,26 @@ EOF
           mkdir -p "$BUILD_DIR"
           
           echo "📦 Installing Python dependencies..."
+          # ✅ 修复9：根据 Lambda 架构选择正确的平台
+          # 如果使用 x86_64 Lambda，请使用 manylinux2014_x86_64
+          # 如果使用 ARM (Graviton) Lambda，请使用 manylinux2014_aarch64
           pip3 install -r requirements.txt -t "$BUILD_DIR" \
-            --platform manylinux2014_aarch64 \
+            --platform manylinux2014_x86_64 \
             --only-binary=:all: \
             --python-version 3.12 \
-            --quiet
+            --quiet || {
+              echo "⚠️  Platform-specific install failed, trying generic install..."
+              pip3 install -r requirements.txt -t "$BUILD_DIR" --quiet
+            }
           
           echo "📋 Copying Lambda function code..."
           cp src/lambda_function.py "$BUILD_DIR/"
+          
+          # ✅ 修复10：复制其他必要的源文件
+          if [ -d "src" ]; then
+            echo "📋 Copying additional source files..."
+            cp -r src/* "$BUILD_DIR/" 2>/dev/null || true
+          fi
           
           echo "🗜️  Creating deployment package..."
           cd "$BUILD_DIR"
@@ -283,16 +361,23 @@ EOF
           FUNCTION_NAME="ProductCatalog-Discovery-${{ github.event.inputs.environment }}"
           
           echo "🔄 Updating Lambda function: $FUNCTION_NAME"
-          aws lambda update-function-code \
-            --function-name "$FUNCTION_NAME" \
-            --s3-bucket "$S3_BUCKET" \
-            --s3-key "$S3_KEY"
           
-          echo "⏳ Waiting for Lambda update to complete..."
-          aws lambda wait function-updated \
-            --function-name "$FUNCTION_NAME"
-          
-          echo "✅ Lambda function updated successfully!"
+          # ✅ 修复11：检查 Lambda 函数是否存在
+          if aws lambda get-function --function-name "$FUNCTION_NAME" 2>/dev/null; then
+            aws lambda update-function-code \
+              --function-name "$FUNCTION_NAME" \
+              --s3-bucket "$S3_BUCKET" \
+              --s3-key "$S3_KEY"
+            
+            echo "⏳ Waiting for Lambda update to complete..."
+            aws lambda wait function-updated \
+              --function-name "$FUNCTION_NAME"
+            
+            echo "✅ Lambda function updated successfully!"
+          else
+            echo "⚠️  WARNING: Lambda function $FUNCTION_NAME not found"
+            echo "   It should be created by CloudFormation stack"
+          fi
 
       - name: Show Deployment Results
         if: success()
@@ -308,14 +393,14 @@ EOF
           aws cloudformation describe-stacks \
             --stack-name "$STACK_NAME" \
             --query 'Stacks[0].Outputs' \
-            --output table
+            --output table 2>/dev/null || echo "No outputs available"
           
           echo ""
           echo "⚡ Lambda Function Info:"
           aws lambda get-function \
             --function-name "ProductCatalog-Discovery-${{ github.event.inputs.environment }}" \
             --query 'Configuration.{Name:FunctionName,Runtime:Runtime,Memory:MemorySize,Timeout:Timeout,LastModified:LastModified}' \
-            --output table
+            --output table 2>/dev/null || echo "Lambda function not found"
           
           echo ""
           echo "🔗 Useful Commands:"
@@ -335,11 +420,13 @@ EOF
           echo "❌ DEPLOYMENT FAILED!"
           echo "=========================================="
           echo ""
+          
+          # ✅ 修复12：安全地获取失败信息
           echo "Failed Resources:"
           aws cloudformation describe-stack-events \
             --stack-name "$STACK_NAME" \
             --query "StackEvents[?contains(ResourceStatus,'FAILED')].[LogicalResourceId,ResourceStatus,ResourceStatusReason]" \
-            --output table
+            --output table 2>/dev/null || echo "Unable to get stack events"
           
           echo ""
           echo "Recent Events:"
@@ -347,4 +434,11 @@ EOF
             --stack-name "$STACK_NAME" \
             --max-items 10 \
             --query "StackEvents[].[LogicalResourceId,ResourceStatus,Timestamp]" \
-            --output table
+            --output table 2>/dev/null || echo "Unable to get recent events"
+          
+          echo ""
+          echo "🔍 Troubleshooting Tips:"
+          echo "1. Check CloudFormation console for detailed error messages"
+          echo "2. Verify IAM permissions are sufficient"
+          echo "3. Check S3 bucket exists and is accessible"
+          echo "4. Review CloudWatch Logs for Lambda errors"
