@@ -20,7 +20,7 @@ secretsmanager = boto3.client("secretsmanager")
 # ============================================
 
 # 豆包模型配置
-API_URL = os.environ.get("DOUBAO_API_URL", "https://ark.cn-beijing.volces.com/api/v3/chat/completions")
+API_URL = os.environ.get("DEEPSEEK_SECRET_NAME", "https://ark.cn-beijing.volces.com/api/v3/chat/completions")
 MODEL = os.environ.get("DOUBAO_MODEL", "doubao-seed-2-1-pro-260628")
 SECRET_NAME = os.environ.get("DOUBAO_SECRET_NAME", "")
 API_KEY = os.environ.get("DOUBAO_API_KEY", "")
