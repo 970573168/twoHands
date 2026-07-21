@@ -19,21 +19,21 @@ secretsmanager = boto3.client("secretsmanager")
 # 所有配置项都从环境变量读取
 # ============================================
 
-# 豆包模型配置
-API_URL = os.environ.get("DEEPSEEK_SECRET_NAME", "https://ark.cn-beijing.volces.com/api/v3/chat/completions")
-MODEL = os.environ.get("DOUBAO_MODEL", "doubao-seed-2-1-pro-260628")
-SECRET_NAME = os.environ.get("DOUBAO_SECRET_NAME", "")
-API_KEY = os.environ.get("DOUBAO_API_KEY", "")
+# API 配置
+API_URL = os.environ.get("API_URL", "https://api.example.com/v1/chat/completions")
+MODEL = os.environ.get("AI_MODEL", "default-model")
+SECRET_NAME = os.environ.get("SECRET_NAME", "")
+API_KEY = os.environ.get("API_KEY", "")
 
 # API 调用参数配置
-TEMPERATURE = float(os.environ.get("DOUBAO_TEMPERATURE", "0.7"))
-MAX_TOKENS = int(os.environ.get("DOUBAO_MAX_TOKENS", "4000"))
-TOP_P = float(os.environ.get("DOUBAO_TOP_P", "1.0"))
-REQUEST_TIMEOUT = int(os.environ.get("DOUBAO_REQUEST_TIMEOUT", "90"))
-MAX_RETRIES = int(os.environ.get("DOUBAO_MAX_RETRIES", "3"))
+TEMPERATURE = float(os.environ.get("TEMPERATURE", "0.7"))
+MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "4000"))
+TOP_P = float(os.environ.get("TOP_P", "1.0"))
+REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "90"))
+MAX_RETRIES = int(os.environ.get("MAX_RETRIES", "3"))
 
 # 系统提示词配置
-SYSTEM_PROMPT = os.environ.get("DOUBAO_SYSTEM_PROMPT", 
+SYSTEM_PROMPT = os.environ.get("SYSTEM_PROMPT", 
     "You are a helpful assistant that returns data in JSON format.")
 
 # 发现任务配置
@@ -55,7 +55,7 @@ API_CALL_DELAY = float(os.environ.get("API_CALL_DELAY", "1.0"))
 RETRYABLE_CODES = {408, 409, 429, 500, 502, 503, 504}
 
 # 数据来源标识
-DATA_SOURCE = os.environ.get("DATA_SOURCE", "DOUBAO_AI")
+DATA_SOURCE = os.environ.get("DATA_SOURCE", "AI_DISCOVERY")
 
 # ============================================
 
@@ -120,7 +120,7 @@ def get_api_key():
         return _api_key_cache
 
     if not SECRET_NAME:
-        raise RuntimeError("未配置 DOUBAO_SECRET_NAME 或 DOUBAO_API_KEY 环境变量")
+        raise RuntimeError("未配置 SECRET_NAME 或 API_KEY 环境变量")
 
     response = secretsmanager.get_secret_value(SecretId=SECRET_NAME)
     secret_string = response.get("SecretString")
@@ -296,7 +296,7 @@ def build_prompt(task):
 
 
 def call_api(task):
-    """调用豆包API"""
+    """调用 AI API"""
     check_limits()  # 检查Token和超时限制
     
     # 再次检查剩余时间是否足够完成一次API调用
