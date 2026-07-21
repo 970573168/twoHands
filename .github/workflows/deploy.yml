@@ -37,7 +37,7 @@ on:
         type: string
       
       s3_bucket:
-        description: 'S3 bucket for Lambda code'
+        description: 'S3 bucket name prefix for Lambda code'
         required: true
         default: 'productcatalog-lambda-code'
         type: string
@@ -83,13 +83,19 @@ jobs:
         run: aws sts get-caller-identity
 
       # ============================================
-      # 新增：创建 S3 存储桶（如果不存在）
+      # 创建 S3 存储桶（带账号 ID 后缀确保唯一性）
       # ============================================
       - name: Create S3 Bucket if not exists
         if: ${{ github.event.inputs.deploy_main_app == 'true' }}
         run: |
-          S3_BUCKET="${{ github.event.inputs.s3_bucket }}"
+          S3_BUCKET_BASE="${{ github.event.inputs.s3_bucket }}"
           AWS_REGION="ap-northeast-1"
+          
+          # 获取 AWS 账号 ID，用于创建唯一存储桶名称
+          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          
+          # 生成唯一存储桶名称：基础名称-账号ID
+          S3_BUCKET="${S3_BUCKET_BASE}-${AWS_ACCOUNT_ID}"
           
           echo "🔍 Checking if S3 bucket exists: $S3_BUCKET"
           
@@ -144,10 +150,14 @@ jobs:
             echo "✅ S3 bucket created and configured successfully"
           fi
           
+          # 将存储桶名称保存到环境变量，供后续步骤使用
+          echo "S3_BUCKET=$S3_BUCKET" >> $GITHUB_ENV
+          
           echo ""
           echo "📊 S3 Bucket Details:"
-          aws s3api get-bucket-versioning --bucket "$S3_BUCKET" --query 'Status' --output text
-          aws s3api get-bucket-encryption --bucket "$S3_BUCKET" --query 'ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm' --output text
+          echo "   Name: $S3_BUCKET"
+          aws s3api get-bucket-versioning --bucket "$S3_BUCKET" --query 'Status' --output text 2>/dev/null || echo "N/A"
+          aws s3api get-bucket-encryption --bucket "$S3_BUCKET" --query 'ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault.SSEAlgorithm' --output text 2>/dev/null || echo "N/A"
 
       - name: Validate Template
         run: |
@@ -158,7 +168,9 @@ jobs:
         run: |
           STACK_NAME="productcatalog-app-${{ github.event.inputs.environment }}"
           TIMESTAMP=$(date +%Y%m%d%H%M%S)
-          S3_BUCKET="${{ github.event.inputs.s3_bucket }}"
+          
+          # 使用上一步创建的环境变量
+          S3_BUCKET="${{ env.S3_BUCKET }}"
           
           # 设置默认值
           MAX_CATEGORIES="${{ github.event.inputs.max_categories }}"
@@ -247,7 +259,7 @@ jobs:
           
           # 上传到 S3
           TIMESTAMP=$(date +%Y%m%d%H%M%S)
-          S3_BUCKET="${{ github.event.inputs.s3_bucket }}"
+          S3_BUCKET="${{ env.S3_BUCKET }}"
           S3_KEY="productcatalog/lambda-$TIMESTAMP.zip"
           
           echo "📤 Uploading Lambda code to S3..."
@@ -285,7 +297,7 @@ jobs:
           echo ""
           echo "===== DEPLOYMENT SUMMARY ====="
           echo "🏗️ Stack: $STACK_NAME"
-          echo "📦 S3 Bucket: ${{ github.event.inputs.s3_bucket }}"
+          echo "📦 S3 Bucket: ${{ env.S3_BUCKET }}"
           echo "⚡ Lambda: ProductCatalog-Discovery-${{ github.event.inputs.environment }}"
           echo "🗄️ DynamoDB: ProductCatalog-${{ github.event.inputs.environment }}"
           
