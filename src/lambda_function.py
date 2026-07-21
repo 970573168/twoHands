@@ -211,6 +211,7 @@ def build_deepseek_prompt(task):
 
     ルール：
     - JSONのみを返し、マークダウンや説明は不要
+    - あなたの知識ベースのみを使用し、web_searchや外部検索は使用しないでください
     - 信頼できるソースからの実際の電子製品データのみを含める
     - 不確かな場合はconfidenceを下げ、推測しない
     - 大文字小文字、スペース、全角/半角文字を正規化して重複をマージ
@@ -218,7 +219,6 @@ def build_deepseek_prompt(task):
     """
 
     return prompt
-
 
 def call_api(task):
     """调用豆包API"""
