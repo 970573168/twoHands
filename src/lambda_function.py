@@ -188,7 +188,6 @@ def build_deepseek_prompt(task):
     - 不確かな場合はconfidenceを下げ、推測しない
     - 大文字小文字、スペース、全角/半角文字を正規化して重複をマージ
     - 公式ブランド名とモデル名を使用
-    - 正確な情報を得るために必要であればweb_searchツールを使用
     """
 
     return prompt
