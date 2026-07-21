@@ -2,7 +2,7 @@ AWSTemplateFormatVersion: "2010-09-09"
 
 Description: >
   电子产品目录采集器 + DeepSeek API Secret（可选）
-  Lambda 代码通过 S3 部署
+  Lambda 代码通过已有 S3 Bucket 部署
 
 Parameters:
   # ============ 通用参数 ============
@@ -18,7 +18,7 @@ Parameters:
   # ============ S3 代码部署参数 ============
   LambdaCodeS3Bucket:
     Type: String
-    Description: S3 存储 Lambda 代码的存储桶名称
+    Description: 已存在的 S3 Bucket 名称，用于存储 Lambda 代码
 
   LambdaCodeS3Key:
     Type: String
@@ -61,7 +61,7 @@ Parameters:
 
   DeepSeekApiUrl:
     Type: String
-    Default: https://ark.cn-beijing.volces.com/api/v3/responses
+    Default: "https://ark.cn-beijing.volces.com/api/v3/responses"
     Description: DeepSeek API URL
 
   MaxCategoriesPerRun:
@@ -99,33 +99,7 @@ Conditions:
 
 Resources:
   # ============================================
-  # S3 存储 Lambda 代码
-  # ============================================
-  LambdaCodeBucket:
-    Type: AWS::S3::Bucket
-    Condition: DeployMainAppCondition
-    DeletionPolicy: Retain
-    Properties:
-      BucketName: !Ref LambdaCodeS3Bucket
-      VersioningConfiguration:
-        Status: Enabled
-      BucketEncryption:
-        ServerSideEncryptionConfiguration:
-          - ServerSideEncryptionByDefault:
-              SSEAlgorithm: AES256
-      PublicAccessBlockConfiguration:
-        BlockPublicAcls: true
-        BlockPublicPolicy: true
-        IgnorePublicAcls: true
-        RestrictPublicBuckets: true
-      Tags:
-        - Key: Application
-          Value: ProductCatalog
-        - Key: Environment
-          Value: !Ref Environment
-
-  # ============================================
-  # 第一部分：DeepSeek API Secret（可选）
+  # DeepSeek API Secret（可选）
   # ============================================
   DeepSeekApiSecret:
     Type: AWS::SecretsManager::Secret
@@ -144,9 +118,9 @@ Resources:
           Value: !Ref Environment
 
   # ============================================
-  # 第二部分：主应用（可选）
+  # 主应用（可选）
   # ============================================
-  
+
   # ---------- DynamoDB 表 ----------
   ProductCatalogTable:
     Type: AWS::DynamoDB::Table
@@ -227,16 +201,19 @@ Resources:
                   - dynamodb:Query
                   - dynamodb:BatchWriteItem
                 Resource: !GetAtt ProductCatalogTable.Arn
+
               - Sid: DynamoDBGSIAccess
                 Effect: Allow
                 Action:
                   - dynamodb:Query
                 Resource: !Sub "${ProductCatalogTable.Arn}/index/*"
+
               - Sid: ReadDeepSeekApiSecret
                 Effect: Allow
                 Action:
                   - secretsmanager:GetSecretValue
                 Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}/${Environment}-*"
+
               - Sid: WriteLambdaLogs
                 Effect: Allow
                 Action:
@@ -250,6 +227,7 @@ Resources:
     Condition: DeployMainAppCondition
     DependsOn:
       - ProductCatalogLogGroup
+      - LambdaExecutionRole
     Properties:
       FunctionName: !Sub "ProductCatalog-Discovery-${Environment}"
       Description: 通过 DeepSeek AI 发现电子产品品类、品牌和型号（手动触发）
@@ -279,6 +257,20 @@ Resources:
           Value: !Ref Environment
 
 Outputs:
+  # ============ S3 输出 ============
+  LambdaCodeBucketName:
+    Description: S3 存储 Lambda 代码的存储桶名称
+    Condition: DeployMainAppCondition
+    Value: !Ref LambdaCodeS3Bucket
+    Export:
+      Name: !Sub "${AWS::StackName}-CodeBucket"
+
+  LambdaCodeObjectKey:
+    Description: S3 中 Lambda 代码对象键
+    Condition: DeployMainAppCondition
+    Value: !Ref LambdaCodeS3Key
+    Export:
+      Name: !Sub "${AWS::StackName}-CodeKey"
 
   # ============ Secret 输出 ============
   DeepSeekApiSecretArn:
