@@ -18,7 +18,7 @@ Parameters:
   # ============ Secret 控制参数 ============
   DeploySecret:
     Type: String
-    Default: "false"
+    Default: "true"
     AllowedValues:
       - "true"
       - "false"
@@ -38,36 +38,12 @@ Parameters:
   # ============ 主应用参数 ============
   DeployMainApp:
     Type: String
-    Default: "false"
+    Default: "true"
     AllowedValues:
       - "true"
       - "false"
-    Description: 是否部署主应用（Lambda函数）
+    Description: 是否部署主应用
 
-  # ============ DynamoDB 控制参数 ============
-  DeployDynamoDB:
-    Type: String
-    Default: "false"
-    AllowedValues:
-      - "true"
-      - "false"
-    Description: 是否部署 DynamoDB 表
-
-  # ============ IAM Role 控制参数 ============
-  DeployLambdaRole:
-    Type: String
-    Default: "false"
-    AllowedValues:
-      - "true"
-      - "false"
-    Description: 是否部署 Lambda 执行角色
-
-  LambdaRoleArn:
-    Type: String
-    Default: ""
-    Description: 已有 Lambda 执行角色 ARN（仅在 DeployLambdaRole=false 时需要）
-
-  # ============ Lambda 配置参数 ============
   DeepSeekSecretArn:
     Type: String
     Default: ""
@@ -114,19 +90,14 @@ Parameters:
 Conditions:
   DeploySecretCondition: !Equals [!Ref DeploySecret, "true"]
   DeployMainAppCondition: !Equals [!Ref DeployMainApp, "true"]
-  DeployDynamoDBCondition: !Equals [!Ref DeployDynamoDB, "true"]
-  DeployLambdaRoleCondition: !Equals [!Ref DeployLambdaRole, "true"]
   UseExistingSecretArn: !And
     - !Condition DeployMainAppCondition
     - !Not [!Equals [!Ref DeepSeekSecretArn, ""]]
   HasApiKey: !Not [!Equals [!Ref DeepSeekApiKey, ""]]
-  UseExistingLambdaRole: !And
-    - !Condition DeployMainAppCondition
-    - !Not [!Equals [!Ref LambdaRoleArn, ""]]
 
 Resources:
   # ============================================
-  # 第一部分：DeepSeek API Secret（可选，默认不部署）
+  # 第一部分：DeepSeek API Secret（可选）
   # ============================================
   DeepSeekApiSecret:
     Type: AWS::SecretsManager::Secret
@@ -145,11 +116,13 @@ Resources:
           Value: !Ref Environment
 
   # ============================================
-  # 第二部分：DynamoDB 表（可选，默认不部署）
+  # 第二部分：主应用（可选）
   # ============================================
+  
+  # ---------- DynamoDB 表 ----------
   ProductCatalogTable:
     Type: AWS::DynamoDB::Table
-    Condition: DeployDynamoDBCondition
+    Condition: DeployMainAppCondition
     Properties:
       TableName: !Sub "ProductCatalog-${Environment}"
       BillingMode: PAY_PER_REQUEST
@@ -197,12 +170,10 @@ Resources:
       LogGroupName: !Sub "/aws/lambda/ProductCatalog-Discovery-${Environment}"
       RetentionInDays: !Ref LogRetentionDays
 
-  # ============================================
-  # 第三部分：Lambda 执行角色（可选，默认不部署）
-  # ============================================
+  # ---------- Lambda 执行角色 ----------
   LambdaExecutionRole:
     Type: AWS::IAM::Role
-    Condition: DeployLambdaRoleCondition
+    Condition: DeployMainAppCondition
     Properties:
       RoleName: !Sub "ProductCatalog-LambdaRole-${Environment}"
       AssumeRolePolicyDocument:
@@ -227,20 +198,12 @@ Resources:
                   - dynamodb:UpdateItem
                   - dynamodb:Query
                   - dynamodb:BatchWriteItem
-                Resource: 
-                  - !If
-                    - DeployDynamoDBCondition
-                    - !GetAtt ProductCatalogTable.Arn
-                    - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/ProductCatalog-${Environment}"
+                Resource: !GetAtt ProductCatalogTable.Arn
               - Sid: DynamoDBGSIAccess
                 Effect: Allow
                 Action:
                   - dynamodb:Query
-                Resource: 
-                  - !If
-                    - DeployDynamoDBCondition
-                    - !Sub "${ProductCatalogTable.Arn}/index/*"
-                    - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/ProductCatalog-${Environment}/index/*"
+                Resource: !Sub "${ProductCatalogTable.Arn}/index/*"
               - Sid: ReadDeepSeekApiSecret
                 Effect: Allow
                 Action:
@@ -259,9 +222,7 @@ Resources:
                   - logs:PutLogEvents
                 Resource: !Sub "${ProductCatalogLogGroup.Arn}:*"
 
-  # ============================================
-  # 第四部分：Lambda 函数（可选，默认不部署）
-  # ============================================
+  # ---------- Lambda 函数 ----------
   ProductCatalogDiscovery:
     Type: AWS::Lambda::Function
     Condition: DeployMainAppCondition
@@ -276,16 +237,10 @@ Resources:
       Handler: index.lambda_handler
       Timeout: 900
       MemorySize: 512
-      Role: !If
-        - UseExistingLambdaRole
-        - !Ref LambdaRoleArn
-        - !If
-          - DeployLambdaRoleCondition
-          - !GetAtt LambdaExecutionRole.Arn
-          - !Ref LambdaRoleArn
+      Role: !GetAtt LambdaExecutionRole.Arn
       Environment:
         Variables:
-          TABLE_NAME: !Sub "ProductCatalog-${Environment}"
+          TABLE_NAME: !Ref ProductCatalogTable
           DEEPSEEK_SECRET_ARN: !If
             - UseExistingSecretArn
             - !Ref DeepSeekSecretArn
@@ -890,37 +845,21 @@ Outputs:
     Export:
       Name: !Sub "${AWS::StackName}-SecretName"
 
-  # ============ DynamoDB 输出 ============
+  # ============ 主应用输出 ============
   ProductCatalogTableName:
     Description: DynamoDB 产品目录表名称
-    Condition: DeployDynamoDBCondition
+    Condition: DeployMainAppCondition
     Value: !Ref ProductCatalogTable
     Export:
       Name: !Sub "${AWS::StackName}-TableName"
 
   ProductCatalogTableArn:
     Description: DynamoDB 产品目录表 ARN
-    Condition: DeployDynamoDBCondition
+    Condition: DeployMainAppCondition
     Value: !GetAtt ProductCatalogTable.Arn
     Export:
       Name: !Sub "${AWS::StackName}-TableArn"
 
-  # ============ Lambda Role 输出 ============
-  LambdaRoleArn:
-    Description: Lambda 执行角色 ARN
-    Condition: DeployLambdaRoleCondition
-    Value: !GetAtt LambdaExecutionRole.Arn
-    Export:
-      Name: !Sub "${AWS::StackName}-LambdaRoleArn"
-
-  LambdaRoleName:
-    Description: Lambda 执行角色名称
-    Condition: DeployLambdaRoleCondition
-    Value: !Ref LambdaExecutionRole
-    Export:
-      Name: !Sub "${AWS::StackName}-LambdaRoleName"
-
-  # ============ Lambda 函数输出 ============
   DiscoveryLambdaName:
     Description: Lambda 发现函数名称
     Condition: DeployMainAppCondition
