@@ -2,7 +2,7 @@ AWSTemplateFormatVersion: "2010-09-09"
 
 Description: >
   电子产品目录采集器 + DeepSeek API Secret（可选）
-  通过参数控制部署哪些资源
+  手动触发Lambda架构
 
 Parameters:
   # ============ 通用参数 ============
@@ -59,26 +59,6 @@ Parameters:
     Default: https://ark.cn-beijing.volces.com/api/v3/responses
     Description: DeepSeek API URL
 
-  ScheduleExpression:
-    Type: String
-    Default: rate(1 day)
-    Description: EventBridge Scheduler 表达式
-
-  ScheduleState:
-    Type: String
-    Default: DISABLED
-    AllowedValues:
-      - ENABLED
-      - DISABLED
-    Description: 调度器状态
-
-  WorkerMaximumConcurrency:
-    Type: Number
-    Default: 2
-    MinValue: 1
-    MaxValue: 10
-    Description: Lambda 最大并发数（SQS 事件源映射控制）
-
   MaxCategoriesPerRun:
     Type: Number
     Default: 20
@@ -106,12 +86,6 @@ Parameters:
     MinValue: 1
     MaxValue: 3653
     Description: CloudWatch 日志保留天数
-
-  QueueAlarmThreshold:
-    Type: Number
-    Default: 100
-    MinValue: 1
-    Description: 队列深度告警阈值
 
 Conditions:
   DeploySecretCondition: !Equals [!Ref DeploySecret, "true"]
@@ -157,11 +131,24 @@ Resources:
           AttributeType: S
         - AttributeName: SK
           AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: S
       KeySchema:
         - AttributeName: PK
           KeyType: HASH
         - AttributeName: SK
           KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
       TimeToLiveSpecification:
@@ -175,44 +162,12 @@ Resources:
         - Key: Environment
           Value: !Ref Environment
 
-  # ---------- SQS 队列 ----------
-  ProductCatalogDLQ:
-    Type: AWS::SQS::Queue
-    Condition: DeployMainAppCondition
-    Properties:
-      QueueName: !Sub "ProductCatalog-DLQ-${Environment}"
-      MessageRetentionPeriod: 1209600
-      SqsManagedSseEnabled: true
-      Tags:
-        - Key: Application
-          Value: ProductCatalog
-        - Key: Environment
-          Value: !Ref Environment
-
-  ProductCatalogQueue:
-    Type: AWS::SQS::Queue
-    Condition: DeployMainAppCondition
-    Properties:
-      QueueName: !Sub "ProductCatalog-Queue-${Environment}"
-      VisibilityTimeout: 360
-      MessageRetentionPeriod: 345600
-      ReceiveMessageWaitTimeSeconds: 20
-      SqsManagedSseEnabled: true
-      RedrivePolicy:
-        deadLetterTargetArn: !GetAtt ProductCatalogDLQ.Arn
-        maxReceiveCount: 3
-      Tags:
-        - Key: Application
-          Value: ProductCatalog
-        - Key: Environment
-          Value: !Ref Environment
-
   # ---------- CloudWatch Logs ----------
   ProductCatalogLogGroup:
     Type: AWS::Logs::LogGroup
     Condition: DeployMainAppCondition
     Properties:
-      LogGroupName: !Sub "/aws/lambda/ProductCatalog-Worker-${Environment}"
+      LogGroupName: !Sub "/aws/lambda/ProductCatalog-Discovery-${Environment}"
       RetentionInDays: !Ref LogRetentionDays
 
   # ---------- Lambda 执行角色 ----------
@@ -231,7 +186,7 @@ Resources:
             Action:
               - sts:AssumeRole
       Policies:
-        - PolicyName: ProductCatalogWorkerPolicy
+        - PolicyName: ProductCatalogDiscoveryPolicy
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
@@ -244,15 +199,11 @@ Resources:
                   - dynamodb:Query
                   - dynamodb:BatchWriteItem
                 Resource: !GetAtt ProductCatalogTable.Arn
-              - Sid: ConsumeAndProduceQueueMessages
+              - Sid: DynamoDBGSIAccess
                 Effect: Allow
                 Action:
-                  - sqs:ReceiveMessage
-                  - sqs:DeleteMessage
-                  - sqs:GetQueueAttributes
-                  - sqs:ChangeMessageVisibility
-                  - sqs:SendMessage
-                Resource: !GetAtt ProductCatalogQueue.Arn
+                  - dynamodb:Query
+                Resource: !Sub "${ProductCatalogTable.Arn}/index/*"
               - Sid: ReadDeepSeekApiSecret
                 Effect: Allow
                 Action:
@@ -272,25 +223,24 @@ Resources:
                 Resource: !Sub "${ProductCatalogLogGroup.Arn}:*"
 
   # ---------- Lambda 函数 ----------
-  ProductCatalogWorker:
+  ProductCatalogDiscovery:
     Type: AWS::Lambda::Function
     Condition: DeployMainAppCondition
     DependsOn:
       - ProductCatalogLogGroup
     Properties:
-      FunctionName: !Sub "ProductCatalog-Worker-${Environment}"
-      Description: 通过 DeepSeek AI 发现电子产品品类、品牌和型号
+      FunctionName: !Sub "ProductCatalog-Discovery-${Environment}"
+      Description: 通过 DeepSeek AI 发现电子产品品类、品牌和型号（手动触发）
       Runtime: python3.12
       Architectures:
         - arm64
       Handler: index.lambda_handler
-      Timeout: 300
-      MemorySize: 256
+      Timeout: 900
+      MemorySize: 512
       Role: !GetAtt LambdaExecutionRole.Arn
       Environment:
         Variables:
           TABLE_NAME: !Ref ProductCatalogTable
-          QUEUE_URL: !Ref ProductCatalogQueue
           DEEPSEEK_SECRET_ARN: !If
             - UseExistingSecretArn
             - !Ref DeepSeekSecretArn
@@ -313,15 +263,15 @@ Resources:
           import time
           import urllib.error
           import urllib.request
+          from datetime import datetime, timezone
+          from boto3.dynamodb.conditions import Key
 
           import boto3
 
           dynamodb = boto3.resource("dynamodb")
           table = dynamodb.Table(os.environ["TABLE_NAME"])
-          sqs = boto3.client("sqs")
           secretsmanager = boto3.client("secretsmanager")
 
-          QUEUE_URL = os.environ["QUEUE_URL"]
           API_URL = os.environ["DEEPSEEK_API_URL"]
           MODEL = os.environ["DEEPSEEK_MODEL"]
           SECRET_ARN = os.environ["DEEPSEEK_SECRET_ARN"]
@@ -366,12 +316,21 @@ Resources:
 
           def normalize(value):
               value = str(value or "").strip()
+              # 全角英数字转换为半角
+              value = value.translate(str.maketrans(
+                  'ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ'
+                  'ａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ'
+                  '０１２３４５６７８９',
+                  'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+                  'abcdefghijklmnopqrstuvwxyz'
+                  '0123456789'
+              ))
               return re.sub(r"\s+", " ", value)
 
 
           def key_part(value):
               value = normalize(value).upper()
-              value = re.sub(r"[^A-Z0-9\u4e00-\u9fff]+", "-", value)
+              value = re.sub(r"[^A-Z0-9\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]+", "-", value)
               return value.strip("-")[:180]
 
 
@@ -405,30 +364,56 @@ Resources:
               return json.loads(text)
 
 
+          def get_latest_model_date(brand):
+              """从数据库获取该品牌最晚发布的型号发布日期"""
+              try:
+                  response = table.query(
+                      IndexName="GSI1",
+                      KeyConditionExpression=Key("GSI1PK").eq(f"BRAND#{key_part(brand)}"),
+                      ScanIndexForward=False,  # 降序排列，最新的在前
+                      Limit=1
+                  )
+                  items = response.get("Items", [])
+                  if items:
+                      latest_date = items[0].get("release_date", "")
+                      if latest_date:
+                          return latest_date
+                  return None
+              except Exception as e:
+                  log("WARN", "获取最新型号日期失败", brand=brand, error=str(e))
+                  return None
+
+
           def build_deepseek_prompt(task):
-              task_type = task["task_type"]
+              task_type = task.get("task_type")
               max_items = int(task.get("max_items", 20))
+              search_date = task.get("search_date", "")
 
               if task_type == "DISCOVER_CATEGORIES":
                   instruction = (
-                      "列出常见的电子产品品类。"
-                      "每个条目只需要包含 category 字段。"
-                      "不要包含品牌、配件、服务或重复的同义词。"
+                      "一般的な電子製品のカテゴリをリストアップしてください。"
+                      "各エントリにはcategoryフィールドのみを含めてください。"
+                      "ブランド、アクセサリ、サービス、重複する同義語は含めないでください。"
                   )
               elif task_type == "DISCOVER_BRANDS":
                   category = normalize(task.get("category"))
                   instruction = (
-                      f"列出电子产品品类 '{category}' 的真实品牌。"
-                      "每个条目需要包含 category 和 brand 字段。"
-                      "不要编造品牌。"
+                      f"電子製品カテゴリ「{category}」の実際のブランドをリストアップしてください。"
+                      "各エントリにはcategoryとbrandフィールドを含めてください。"
+                      "架空のブランドを作成しないでください。"
                   )
               elif task_type == "DISCOVER_MODELS":
                   category = normalize(task.get("category"))
                   brand = normalize(task.get("brand"))
+                  date_condition = ""
+                  if search_date:
+                      date_condition = f"{search_date}以降に発売された製品のみを含めてください。発売日の降順でリストしてください。"
+                  
                   instruction = (
-                      f"列出品牌 '{brand}' 在品类 '{category}' 中的具体产品型号。"
-                      "每个条目需要包含 category、brand、model 和 confidence 字段。"
-                      "型号必须是具体的产品型号，而不是产品系列。"
+                      f"ブランド「{brand}」のカテゴリ「{category}」における具体的な製品モデルをリストアップしてください。"
+                      f"{date_condition}"
+                      "各エントリにはcategory、brand、model、confidence、release_dateフィールドを含めてください。"
+                      "モデルは製品シリーズではなく、具体的な製品モデルである必要があります。"
                   )
               else:
                   raise ValueError(f"Unknown task_type: {task_type}")
@@ -436,20 +421,21 @@ Resources:
               prompt = f"""
               {instruction}
 
-              只返回一个包含 "items" 数组的 JSON 对象，最多 {max_items} 个条目。
-              每个条目应包含以下字段（可选字段使用空字符串）：
-              - category: 字符串
-              - brand: 字符串或空
-              - model: 字符串或空
-              - confidence: 0-1 的数字或 null
+              「items」配列を含むJSONオブジェクトのみを返してください。最大{max_items}エントリ。
+              各エントリには以下のフィールドを含めてください（オプションフィールドは空文字列）：
+              - category: 文字列
+              - brand: 文字列または空
+              - model: 文字列または空
+              - confidence: 0-1の数値またはnull
+              - release_date: YYYY-MM-DD形式の文字列または空（該当する場合）
 
-              规则：
-              - 只返回 JSON，不要 markdown，不要解释
-              - 只包含来自可靠来源的真实电子产品数据
-              - 不确定时降低 confidence，不要猜测
-              - 通过规范化大小写、空格和全角/半角字符来合并重复项
-              - 使用官方品牌名称和型号名称
-              - 如果需要网络搜索获取准确信息，请使用 web_search 工具
+              ルール：
+              - JSONのみを返し、マークダウンや説明は不要
+              - 信頼できるソースからの実際の電子製品データのみを含める
+              - 不確かな場合はconfidenceを下げ、推測しない
+              - 大文字小文字、スペース、全角/半角文字を正規化して重複をマージ
+              - 公式ブランド名とモデル名を使用
+              - 正確な情報を得るために必要であればweb_searchツールを使用
               """
 
               return prompt
@@ -613,7 +599,7 @@ Resources:
               )
 
 
-          def upsert_product(category, brand, model, confidence=None):
+          def upsert_product(category, brand, model, confidence=None, release_date=None):
               category = normalize(category)
               brand = normalize(brand)
               model = normalize(model)
@@ -645,11 +631,17 @@ Resources:
 
               if confidence is not None:
                   try:
-                      confidence_text = str(max(0.0, min(1.0, float(confidence))))
+                      confidence_value = str(max(0.0, min(1.0, float(confidence))))
                       expression += ", confidence = :confidence"
-                      values[":confidence"] = confidence_text
+                      values[":confidence"] = confidence_value
                   except (TypeError, ValueError):
                       pass
+
+              if release_date:
+                  release_date = normalize(release_date)
+                  if re.match(r"^\d{4}-\d{2}-\d{2}", release_date):
+                      expression += ", release_date = :release_date"
+                      values[":release_date"] = release_date
 
               table.update_item(
                   Key={"PK": product_pk, "SK": "META"},
@@ -661,211 +653,181 @@ Resources:
                   ExpressionAttributeValues=values,
               )
 
-              table.update_item(
-                  Key={
-                      "PK": f"BRAND#{key_part(brand)}",
-                      "SK": f"MODEL#{key_part(model)}",
-                  },
-                  UpdateExpression=(
-                      "SET entity_type = :type, category = :category, brand = :brand, "
-                      "model = :model, product_pk = :product_pk, last_seen_at = :now"
-                  ),
-                  ExpressionAttributeValues={
-                      ":type": "BRAND_MODEL",
-                      ":category": category,
-                      ":brand": brand,
-                      ":model": model,
-                      ":product_pk": product_pk,
-                      ":now": now,
-                  },
-              )
+              # 创建GSI1索引项，用于按品牌查询并按发布日期排序
+              gsi1_item = {
+                  "PK": f"BRAND#{key_part(brand)}",
+                  "SK": f"MODEL#{key_part(model)}",
+                  "GSI1PK": f"BRAND#{key_part(brand)}",
+                  "GSI1SK": release_date if release_date else "0000-00-00",
+                  "entity_type": "BRAND_MODEL",
+                  "category": category,
+                  "brand": brand,
+                  "model": model,
+                  "product_pk": product_pk,
+                  "last_seen_at": now
+              }
+              
+              if release_date:
+                  gsi1_item["release_date"] = release_date
+              
+              table.put_item(Item=gsi1_item)
 
 
-          def enqueue(task):
-              sqs.send_message(
-                  QueueUrl=QUEUE_URL,
-                  MessageBody=json.dumps(task, ensure_ascii=False),
-              )
-
-
-          def unique_items(items, fields):
-              seen = set()
-              for item in items:
-                  if not isinstance(item, dict):
-                      continue
-                  signature = tuple(normalize(item.get(field)).casefold() for field in fields)
-                  if not all(signature) or signature in seen:
-                      continue
-                  seen.add(signature)
-                  yield item
-
-
-          def process_task(task):
-              task_type = task.get("task_type")
-              items = call_deepseek(task)
-
+          def process_discovery(event):
+              """主发现处理逻辑（手动触发入口）"""
+              task_type = event.get("task_type", "DISCOVER_CATEGORIES")
+              
+              log("INFO", "开始发现处理", task_type=task_type)
+              
               if task_type == "DISCOVER_CATEGORIES":
-                  for item in unique_items(items, ["category"]):
-                      category = normalize(item.get("category"))
-                      upsert_category(category)
-                      enqueue({
+                  # 发现品类
+                  task = {
+                      "task_type": "DISCOVER_CATEGORIES",
+                      "max_items": MAX_CATEGORIES
+                  }
+                  items = call_deepseek(task)
+                  
+                  categories = []
+                  for item in items:
+                      if isinstance(item, dict) and "category" in item:
+                          category = normalize(item["category"])
+                          if category:
+                              upsert_category(category)
+                              categories.append(category)
+                  
+                  log("INFO", "品类发现完成", count=len(categories))
+                  
+                  # 从发现的品类中发现品牌
+                  for category in categories[:5]:  # 限制处理前5个品类
+                      time.sleep(1)  # 速率限制保护
+                      brand_task = {
                           "task_type": "DISCOVER_BRANDS",
                           "category": category,
-                          "max_items": MAX_BRANDS,
-                      })
-
-              elif task_type == "DISCOVER_BRANDS":
-                  category = normalize(task.get("category"))
-                  for item in unique_items(items, ["brand"]):
-                      brand = normalize(item.get("brand"))
-                      upsert_brand(category, brand)
-                      enqueue({
-                          "task_type": "DISCOVER_MODELS",
-                          "category": category,
-                          "brand": brand,
-                          "max_items": MAX_MODELS,
-                      })
-
+                          "max_items": MAX_BRANDS
+                      }
+                      brand_items = call_deepseek(brand_task)
+                      
+                      brands = []
+                      for item in brand_items:
+                          if isinstance(item, dict) and "brand" in item:
+                              brand = normalize(item["brand"])
+                              if brand and category:
+                                  upsert_brand(category, brand)
+                                  brands.append((category, brand))
+                      
+                      log("INFO", "品牌发现完成", category=category, count=len(brands))
+                      
+                      # 从发现的品牌中发现型号
+                      for cat, brand in brands[:3]:  # 限制处理前3个品牌
+                          time.sleep(1)  # 速率限制保护
+                          
+                          # 从数据库获取该品牌最晚发布的型号日期
+                          latest_date = get_latest_model_date(brand)
+                          
+                          model_task = {
+                              "task_type": "DISCOVER_MODELS",
+                              "category": cat,
+                              "brand": brand,
+                              "max_items": MAX_MODELS,
+                              "search_date": latest_date  # 附带时间参数，搜索该日期之后的新型号
+                          }
+                          model_items = call_deepseek(model_task)
+                          
+                          model_count = 0
+                          for item in model_items:
+                              if isinstance(item, dict) and "model" in item:
+                                  upsert_product(
+                                      category=cat,
+                                      brand=brand,
+                                      model=item.get("model"),
+                                      confidence=item.get("confidence"),
+                                      release_date=item.get("release_date")
+                                  )
+                                  model_count += 1
+                          
+                          log("INFO", "型号发现完成", category=cat, brand=brand, count=model_count)
+                  
+                  return {
+                      "statusCode": 200,
+                      "body": json.dumps({
+                          "message": "发现处理完成",
+                          "categories_discovered": len(categories)
+                      }, ensure_ascii=False)
+                  }
+              
               elif task_type == "DISCOVER_MODELS":
-                  category = normalize(task.get("category"))
-                  brand = normalize(task.get("brand"))
-                  for item in unique_items(items, ["model"]):
-                      upsert_product(
-                          category=category,
-                          brand=brand,
-                          model=item.get("model"),
-                          confidence=item.get("confidence"),
-                      )
-
+                  # 直接发现指定品牌的型号
+                  category = event.get("category", "")
+                  brand = event.get("brand", "")
+                  
+                  if not category or not brand:
+                      return {
+                          "statusCode": 400,
+                          "body": json.dumps({"error": "需要提供 category 和 brand 参数"}, ensure_ascii=False)
+                      }
+                  
+                  # 从数据库获取该品牌最晚发布的型号日期
+                  latest_date = get_latest_model_date(brand)
+                  
+                  task = {
+                      "task_type": "DISCOVER_MODELS",
+                      "category": category,
+                      "brand": brand,
+                      "max_items": MAX_MODELS,
+                      "search_date": latest_date  # 附带时间参数
+                  }
+                  items = call_deepseek(task)
+                  
+                  model_count = 0
+                  for item in items:
+                      if isinstance(item, dict) and "model" in item:
+                          upsert_product(
+                              category=category,
+                              brand=brand,
+                              model=item.get("model"),
+                              confidence=item.get("confidence"),
+                              release_date=item.get("release_date")
+                          )
+                          model_count += 1
+                  
+                  return {
+                      "statusCode": 200,
+                      "body": json.dumps({
+                          "message": "型号发现完成",
+                          "models_discovered": model_count,
+                          "search_date": latest_date
+                      }, ensure_ascii=False)
+                  }
+              
               else:
-                  raise ValueError(f"Unknown task_type: {task_type}")
-
-              log("INFO", "Task completed", task_type=task_type, received_items=len(items))
+                  return {
+                      "statusCode": 400,
+                      "body": json.dumps({"error": f"未知的 task_type: {task_type}"}, ensure_ascii=False)
+                  }
 
 
           def lambda_handler(event, context):
-              failures = []
-
-              for record in event.get("Records", []):
-                  message_id = record.get("messageId", "unknown")
-                  try:
-                      task = json.loads(record["body"])
-                      log("INFO", "Processing task", message_id=message_id, task=task)
-                      process_task(task)
-                  except Exception as error:
-                      log(
-                          "ERROR",
-                          "Task failed",
-                          message_id=message_id,
-                          error_type=type(error).__name__,
-                          error=str(error),
-                      )
-                      failures.append({"itemIdentifier": message_id})
-
-              return {"batchItemFailures": failures}
-
-  # ---------- Lambda 事件源映射 ----------
-  ProductCatalogEventSourceMapping:
-    Type: AWS::Lambda::EventSourceMapping
-    Condition: DeployMainAppCondition
-    Properties:
-      EventSourceArn: !GetAtt ProductCatalogQueue.Arn
-      FunctionName: !Ref ProductCatalogWorker
-      Enabled: true
-      BatchSize: 5
-      MaximumBatchingWindowInSeconds: 10
-      FunctionResponseTypes:
-        - ReportBatchItemFailures
-      ScalingConfig:
-        MaximumConcurrency: !Ref WorkerMaximumConcurrency
-
-  # ---------- Scheduler 角色 ----------
-  SchedulerRole:
-    Type: AWS::IAM::Role
-    Condition: DeployMainAppCondition
-    Properties:
-      RoleName: !Sub "ProductCatalog-SchedulerRole-${Environment}"
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service:
-                - scheduler.amazonaws.com
-            Action:
-              - sts:AssumeRole
-      Policies:
-        - PolicyName: SendCatalogDiscoveryTask
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action:
-                  - sqs:SendMessage
-                Resource:
-                  - !GetAtt ProductCatalogQueue.Arn
-                  - !GetAtt ProductCatalogDLQ.Arn
-
-  # ---------- EventBridge Scheduler ----------
-  ProductCatalogSchedule:
-    Type: AWS::Scheduler::Schedule
-    Condition: DeployMainAppCondition
-    Properties:
-      Name: !Sub "ProductCatalog-Discovery-${Environment}"
-      Description: 启动品类、品牌和型号发现任务
-      State: !Ref ScheduleState
-      ScheduleExpression: !Ref ScheduleExpression
-      FlexibleTimeWindow:
-        Mode: FLEXIBLE
-        MaximumWindowInMinutes: 30
-      Target:
-        Arn: !GetAtt ProductCatalogQueue.Arn
-        RoleArn: !GetAtt SchedulerRole.Arn
-        Input: !Sub |
-          {
-            "task_type": "DISCOVER_CATEGORIES",
-            "max_items": ${MaxCategoriesPerRun}
-          }
-        RetryPolicy:
-          MaximumEventAgeInSeconds: 3600
-          MaximumRetryAttempts: 2
-        DeadLetterConfig:
-          Arn: !GetAtt ProductCatalogDLQ.Arn
-
-  # ---------- CloudWatch 告警 ----------
-  QueueDepthAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Condition: DeployMainAppCondition
-    Properties:
-      AlarmDescription: 产品目录队列积压消息
-      Namespace: AWS/SQS
-      MetricName: ApproximateNumberOfMessagesVisible
-      Dimensions:
-        - Name: QueueName
-          Value: !GetAtt ProductCatalogQueue.QueueName
-      Statistic: Maximum
-      Period: 300
-      EvaluationPeriods: 3
-      Threshold: !Ref QueueAlarmThreshold
-      ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
-
-  DeadLetterQueueAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Condition: DeployMainAppCondition
-    Properties:
-      AlarmDescription: 产品目录死信队列包含失败任务
-      Namespace: AWS/SQS
-      MetricName: ApproximateNumberOfMessagesVisible
-      Dimensions:
-        - Name: QueueName
-          Value: !GetAtt ProductCatalogDLQ.QueueName
-      Statistic: Maximum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 0
-      ComparisonOperator: GreaterThanThreshold
-      TreatMissingData: notBreaching
+              """Lambda入口函数，支持手动触发"""
+              try:
+                  log("INFO", "Lambda执行开始", event=event)
+                  
+                  # 手动触发执行（通过控制台、CLI、API Gateway等）
+                  return process_discovery(event)
+                  
+              except Exception as error:
+                  log(
+                      "ERROR",
+                      "处理失败",
+                      error_type=type(error).__name__,
+                      error=str(error),
+                  )
+                  return {
+                      "statusCode": 500,
+                      "body": json.dumps({
+                          "error": "内部错误",
+                          "details": str(error)
+                      }, ensure_ascii=False)
+                  }
 
 Outputs:
   # ============ Secret 输出 ============
@@ -898,44 +860,16 @@ Outputs:
     Export:
       Name: !Sub "${AWS::StackName}-TableArn"
 
-  WorkerLambdaName:
-    Description: Lambda Worker 函数名称
+  DiscoveryLambdaName:
+    Description: Lambda 发现函数名称
     Condition: DeployMainAppCondition
-    Value: !Ref ProductCatalogWorker
+    Value: !Ref ProductCatalogDiscovery
     Export:
       Name: !Sub "${AWS::StackName}-LambdaName"
 
-  WorkerLambdaArn:
-    Description: Lambda Worker 函数 ARN
+  DiscoveryLambdaArn:
+    Description: Lambda 发现函数 ARN
     Condition: DeployMainAppCondition
-    Value: !GetAtt ProductCatalogWorker.Arn
+    Value: !GetAtt ProductCatalogDiscovery.Arn
     Export:
       Name: !Sub "${AWS::StackName}-LambdaArn"
-
-  WorkerQueueUrl:
-    Description: SQS Worker 队列 URL
-    Condition: DeployMainAppCondition
-    Value: !Ref ProductCatalogQueue
-    Export:
-      Name: !Sub "${AWS::StackName}-QueueUrl"
-
-  WorkerQueueArn:
-    Description: SQS Worker 队列 ARN
-    Condition: DeployMainAppCondition
-    Value: !GetAtt ProductCatalogQueue.Arn
-    Export:
-      Name: !Sub "${AWS::StackName}-QueueArn"
-
-  DeadLetterQueueUrl:
-    Description: SQS 死信队列 URL
-    Condition: DeployMainAppCondition
-    Value: !Ref ProductCatalogDLQ
-    Export:
-      Name: !Sub "${AWS::StackName}-DLQUrl"
-
-  SchedulerName:
-    Description: EventBridge Scheduler 名称
-    Condition: DeployMainAppCondition
-    Value: !Ref ProductCatalogSchedule
-    Export:
-      Name: !Sub "${AWS::StackName}-SchedulerName"
