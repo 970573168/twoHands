@@ -1,0 +1,100 @@
+name: Deploy Yahoo Scraper
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - test
+          - prod
+      
+      s3_bucket:
+        description: 'S3 bucket for Lambda code'
+        required: true
+        type: string
+        default: 'productcatalog-lambda-code-767076981380'
+      
+      deploy_stack:
+        description: 'Deploy CloudFormation stack'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build Lambda Package
+        run: |
+          echo "🔨 Building Lambda package..."
+          mkdir -p build
+          pip install beautifulsoup4 boto3 -t build/ --platform manylinux2014_aarch64 --only-binary=:all: --python-version 3.12
+          cp src/yahoo_scraper.py build/
+          cd build
+          zip -r9 ../lambda.zip .
+          cd ..
+          echo "✅ Build complete: lambda.zip"
+
+      - name: Configure AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::767076981380:role/twoHands-GitHubActions-Role
+          aws-region: ap-northeast-1
+
+      - name: Upload to S3
+        run: |
+          TIMESTAMP=$(date +%Y%m%d%H%M%S)
+          S3_KEY="yahoo-scraper/lambda-$TIMESTAMP.zip"
+          
+          echo "📤 Uploading to S3..."
+          aws s3 cp lambda.zip "s3://${{ github.event.inputs.s3_bucket }}/$S3_KEY"
+          echo "s3_key=$S3_KEY" >> $GITHUB_ENV
+
+      - name: Deploy CloudFormation Stack
+        if: github.event.inputs.deploy_stack == 'true'
+        run: |
+          STACK_NAME="yahoo-scraper-${{ github.event.inputs.environment }}"
+          
+          aws cloudformation deploy \
+            --stack-name "$STACK_NAME" \
+            --template-file yahoo-scraper.yaml \
+            --parameter-overrides \
+              Environment=${{ github.event.inputs.environment }} \
+              LambdaCodeS3Bucket="${{ github.event.inputs.s3_bucket }}" \
+              LambdaCodeS3Key="${{ env.s3_key }}" \
+              SearchKeyword="スズキバイオリン540" \
+              ItemsPerPage="50" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset
+
+      - name: Show Deployment Info
+        if: success()
+        run: |
+          echo "=========================================="
+          echo "✅ Deployment completed successfully!"
+          echo "📦 Package: s3://${{ github.event.inputs.s3_bucket }}/${{ env.s3_key }}"
+          echo "⚡ Function: YahooScraper-${{ github.event.inputs.environment }}"
+          echo "🏗️ Stack: yahoo-scraper-${{ github.event.inputs.environment }}"
+          echo "=========================================="
