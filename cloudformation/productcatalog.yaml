@@ -56,7 +56,7 @@ Parameters:
 
   AiModel:
     Type: String
-    Default: "doubao-seed-2-1-pro-260628"
+    Default: "doubao-seed-2-0-mini-260428"
     Description: AI 模型名称
 
   ApiUrl:
