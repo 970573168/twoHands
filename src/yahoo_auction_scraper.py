@@ -19,6 +19,7 @@ MAX_PAGES = int(os.getenv("MAX_PAGES", "1"))
 TABLE_NAME = os.getenv("TABLE_NAME", "YahooAuctionItems")
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 USER_AGENT = os.getenv("USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+DEBUG_LOG_HTML = os.getenv("DEBUG_LOG_HTML", "true").lower() == "true"  # 是否打印 li 的 HTML
 
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table(TABLE_NAME)
@@ -106,9 +107,14 @@ def parse_html(html):
 
     for li in ul.find_all("li", recursive=False):
         try:
+            # 调试输出：打印整个 <li> 的 HTML 结构（前 1000 字符）
+            if DEBUG_LOG_HTML:
+                logger.info(f"Parsing LI: {str(li)[:1000]}...")
             item = parse_item(li)
             if item:
                 items.append(item)
+            else:
+                logger.warning("Failed to parse item, skipping.")
         except Exception as e:
             logger.warning(f"Failed to parse item: {e}")
             continue
@@ -118,16 +124,8 @@ def parse_html(html):
 
 def parse_item(li):
     """
-    基于 HTML 结构树的稳定解析逻辑：
-    - 标题：取 p > a[href*="/auction/"] 的文本，fallback 到任意 a 的 title
-    - 价格：查找“落札価格”文本区域，提取整数
-    - 入札数：a[href*="bid_hist"] 的文本数字
-    - 结束时间：包含“終了”的 span 中的日期时间
-    - 卖家ID：a[href*="/seller/"] 最后一段
-    - 好评率：卖家链接后紧跟的百分数 span
-    - 发货地：包含“から発送”的 p 的文本
+    稳定解析单个商品，失败时打印详细日志
     """
-
     # ---- 1. 商品链接 & 标题 ----
     auction_link = None
     title = None
@@ -138,10 +136,10 @@ def parse_item(li):
         if a:
             auction_link = a
             break
-    # 如果没找到，取第一个匹配的 a
     if not auction_link:
         auction_link = li.find("a", href=re.compile(r"/auction/"))
     if not auction_link:
+        logger.warning("No auction link found in li")
         return None
 
     href = auction_link.get("href")
@@ -151,35 +149,33 @@ def parse_item(li):
         if m:
             auction_id = m.group(1)
 
-    # 标题优先取链接的完整文本，其次取 title 属性
     title_text = auction_link.get_text(strip=True)
     if title_text:
         title = title_text
     else:
         title = auction_link.get("title", "").strip()
 
+    if not title:
+        logger.warning(f"Title missing for auction {auction_id}")
+
     # ---- 2. 价格 ----
     price = 0
-    # 找包含“落札価格”的文本节点
     price_container = li.find(string=re.compile("落札価格"))
     if price_container:
-        # 向上追溯到可能包含数字的父级
         parent = price_container.parent
-        # 在父级内寻找数字（円）
         whole_text = parent.get_text(separator=" ", strip=True)
-        # 提取数字
         nums = re.findall(r"[\d,]+", whole_text)
         if nums:
-            # 通常最后一个数字是落札価格（紧接着的）
-            price_str = nums[-1]
-            price = int(price_str.replace(",", ""))
+            price = int(nums[-1].replace(",", ""))
     else:
-        # 兜底：遍历所有 span 匹配数字（旧逻辑，但限定在价格区域更安全）
+        # 兜底：找所有 span 里的数字
         for span in li.find_all("span"):
             txt = span.get_text(strip=True)
             if re.match(r"^\d[\d,]*円?$", txt):
                 price = int(txt.replace(",", "").replace("円", ""))
                 break
+    if price == 0:
+        logger.warning(f"Price not found for auction {auction_id}")
 
     # ---- 3. 入札数 ----
     bid_count = 0
@@ -192,31 +188,38 @@ def parse_item(li):
             pass
 
     # ---- 4. 结束时间 ----
+    end_time = None
     time_text = None
-    # 寻找包含“終了”的元素
-    ended_elem = li.find(string=re.compile("終了"))
+
+    # 策略1：找文本中包含「終了」的元素
+    ended_elem = li.find(lambda tag: tag.name in ["span", "p"] and "終了" in tag.get_text())
     if ended_elem:
-        # 该元素可能是 span，直接取其文本
-        time_text = ended_elem.strip()
+        time_text = ended_elem.get_text(strip=True)
+        logger.info(f"Found end time element text: {time_text}")
     else:
-        # 尝试在 span 中匹配时间格式
-        for span in li.find_all("span"):
-            txt = span.get_text(strip=True)
-            if re.search(r"\d{1,2}/\d{1,2}\s+\d{1,2}:\d{2}", txt):
-                time_text = txt
-                break
-    end_time = parse_end_time(time_text) if time_text else None
+        # 策略2：用正则全局搜索时间格式
+        all_text = li.get_text(separator=" ", strip=True)
+        m = re.search(r"\d{1,2}/\d{1,2}\s+\d{1,2}:\d{2}", all_text)
+        if m:
+            time_text = m.group()
+            logger.info(f"Extracted time by regex: {time_text}")
+
+    if time_text:
+        end_time = parse_end_time(time_text)
+    else:
+        logger.warning(f"Could not extract end time for auction {auction_id}. Full li text: {li.get_text(separator=' ', strip=True)[:300]}")
 
     # ---- 5. 卖家 ----
     seller_link = li.find("a", href=re.compile(r"/seller/"))
     seller_id = None
     if seller_link:
         seller_id = seller_link["href"].split("/")[-1]
+    else:
+        logger.warning(f"Seller not found for auction {auction_id}")
 
     # ---- 6. 好评率 ----
     rating = None
     if seller_link:
-        # 在卖家链接的同一容器内找后续的 span 包含 %
         parent = seller_link.parent
         if parent:
             spans = parent.find_all("span")
@@ -226,10 +229,14 @@ def parse_item(li):
                     rating = txt
                     break
     if not rating:
-        # 兜底：在整个 li 中找百分数（但要排除其他可能）
-        for txt_elem in li.find_all(string=re.compile(r"^\d{1,3}\.\d%$")):
-            rating = txt_elem.strip()
-            break
+        # 全局兜底
+        for sp in li.find_all("span"):
+            txt = sp.get_text(strip=True)
+            if re.match(r"^\d{1,3}\.\d%$", txt):
+                rating = txt
+                break
+    if not rating:
+        logger.warning(f"Rating not found for auction {auction_id}")
 
     # ---- 7. 发货地 ----
     prefecture = None
@@ -238,6 +245,8 @@ def parse_item(li):
         if "から発送" in txt:
             prefecture = txt.replace("から発送", "").strip()
             break
+    if not prefecture:
+        logger.warning(f"Prefecture not found for auction {auction_id}")
 
     if not auction_id:
         return None
@@ -258,19 +267,33 @@ def parse_item(li):
 
 def parse_end_time(text):
     """
-    提取结束时间文本中的日期和时间，格式如：
-    "7/15 23:03終了" 或 "7/15 23:03"
-    返回 ISO 8601 字符串（JST 时区）
+    从结束时间文本中提取日期时间，支持多种格式，返回 ISO 字符串（JST）
     """
     if not text:
         return None
-    m = re.search(r"(\d{1,2})/(\d{1,2})\s+(\d{1,2}):(\d{2})", text)
+    # 匹配 2026/7/15 23:03 或 7/15 23:03
+    m = re.search(r"(\d{1,4})?[\/-]?(\d{1,2})[\/-](\d{1,2})\s+(\d{1,2}):(\d{2})", text)
     if not m:
+        logger.warning(f"parse_end_time: could not parse '{text}'")
         return None
-    month, day, hour, minute = map(int, m.groups())
-    year = datetime.now().year
-    dt = datetime(year, month, day, hour, minute, tzinfo=timezone(timedelta(hours=9)))
-    return dt.isoformat()
+    # 如果有年份则用，否则用当前年份
+    if m.group(1) and len(m.group(1)) == 4:
+        year = int(m.group(1))
+        month = int(m.group(2))
+        day = int(m.group(3))
+    else:
+        month = int(m.group(2))
+        day = int(m.group(3))
+        year = datetime.now().year
+
+    hour = int(m.group(4))
+    minute = int(m.group(5))
+    try:
+        dt = datetime(year, month, day, hour, minute, tzinfo=timezone(timedelta(hours=9)))
+        return dt.isoformat()
+    except Exception as e:
+        logger.warning(f"Invalid date/time: {text} - {e}")
+        return None
 
 
 def save_items(items):
