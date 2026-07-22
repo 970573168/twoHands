@@ -25,7 +25,6 @@ table = dynamodb.Table(TABLE_NAME)
 
 
 def get_items_per_page():
-    """从 DEFAULT_PARAMS 中解析每页件数 n，默认 50"""
     for p in DEFAULT_PARAMS.replace("&amp;", "&").split("&"):
         if p.startswith("n="):
             try:
@@ -36,21 +35,18 @@ def get_items_per_page():
 
 
 def build_url(keyword, page):
-    """构建请求 URL，正确计算分页参数 b"""
     params = {}
     for p in DEFAULT_PARAMS.replace("&amp;", "&").split("&"):
         if "=" in p:
             k, v = p.split("=", 1)
             params[k] = v
-
     n = int(params.get("n", "50"))
     params["p"] = keyword
-    params["b"] = str((page - 1) * n + 1)   # Yahoo 分页起始偏移
+    params["b"] = str((page - 1) * n + 1)
     return f"{BASE_URL}?{urlencode(params, quote_via=quote)}"
 
 
 def lambda_handler(event, context):
-    """主入口"""
     keyword = event.get("keyword")
     if not keyword:
         logger.error("Missing 'keyword' in event")
@@ -66,12 +62,11 @@ def lambda_handler(event, context):
     saved = save_items(items)
     return {
         "statusCode": 200,
-        "body": json.dumps({"scraped": len(items), "saved": saved})
+        "body": json.dumps({"scraped": len(items), "saved": saved}, ensure_ascii=False)
     }
 
 
 def scrape_auctions(keyword):
-    """多页抓取"""
     all_items = []
     per_page = get_items_per_page()
 
@@ -90,7 +85,6 @@ def scrape_auctions(keyword):
             break
         all_items.extend(items)
 
-        # 如果本页数量少于每页数量，说明没有下一页
         if len(items) < per_page:
             break
 
@@ -98,23 +92,18 @@ def scrape_auctions(keyword):
 
 
 def parse_html(html):
-    """解析 HTML，使用稳定选择器"""
     soup = BeautifulSoup(html, "html.parser")
     items = []
-
-    # 定位商品列表容器（id 稳定）
     container = soup.select_one("#closedSearchItems")
     if not container:
         logger.warning("No #closedSearchItems found")
         return items
 
-    # 找到 ul 列表（通常只有一层）
     ul = container.find("ul")
     if not ul:
         logger.warning("No ul inside #closedSearchItems")
         return items
 
-    # 遍历直接子 li（每个商品）
     for li in ul.find_all("li", recursive=False):
         try:
             item = parse_item(li)
@@ -128,62 +117,121 @@ def parse_html(html):
 
 
 def parse_item(li):
-    """解析单个商品，全部使用稳定选择器"""
-    # ---- 标题 & 拍卖ID ----
-    link = li.find("a", href=re.compile(r"/auction/"))
-    if not link:
+    """
+    基于 HTML 结构树的稳定解析逻辑：
+    - 标题：取 p > a[href*="/auction/"] 的文本，fallback 到任意 a 的 title
+    - 价格：查找“落札価格”文本区域，提取整数
+    - 入札数：a[href*="bid_hist"] 的文本数字
+    - 结束时间：包含“終了”的 span 中的日期时间
+    - 卖家ID：a[href*="/seller/"] 最后一段
+    - 好评率：卖家链接后紧跟的百分数 span
+    - 发货地：包含“から発送”的 p 的文本
+    """
+
+    # ---- 1. 商品链接 & 标题 ----
+    auction_link = None
+    title = None
+
+    # 优先选择 p 标签内的商品链接（标题链接）
+    for p in li.find_all("p"):
+        a = p.find("a", href=re.compile(r"/auction/"))
+        if a:
+            auction_link = a
+            break
+    # 如果没找到，取第一个匹配的 a
+    if not auction_link:
+        auction_link = li.find("a", href=re.compile(r"/auction/"))
+    if not auction_link:
         return None
-    href = link.get("href")
+
+    href = auction_link.get("href")
     auction_id = None
     if href:
         m = re.search(r"/auction/([a-z0-9]+)", href)
         if m:
             auction_id = m.group(1)
 
-    title = link.get("title") or link.get_text(strip=True)
+    # 标题优先取链接的完整文本，其次取 title 属性
+    title_text = auction_link.get_text(strip=True)
+    if title_text:
+        title = title_text
+    else:
+        title = auction_link.get("title", "").strip()
 
-    # ---- 价格 ----
+    # ---- 2. 价格 ----
     price = 0
-    for span in li.find_all("span"):
-        txt = span.get_text(strip=True)
-        # 匹配数字（可能含逗号和円）
-        if re.match(r"^\d[\d,]*円?$", txt):
-            price = int(txt.replace(",", "").replace("円", ""))
-            break
+    # 找包含“落札価格”的文本节点
+    price_container = li.find(string=re.compile("落札価格"))
+    if price_container:
+        # 向上追溯到可能包含数字的父级
+        parent = price_container.parent
+        # 在父级内寻找数字（円）
+        whole_text = parent.get_text(separator=" ", strip=True)
+        # 提取数字
+        nums = re.findall(r"[\d,]+", whole_text)
+        if nums:
+            # 通常最后一个数字是落札価格（紧接着的）
+            price_str = nums[-1]
+            price = int(price_str.replace(",", ""))
+    else:
+        # 兜底：遍历所有 span 匹配数字（旧逻辑，但限定在价格区域更安全）
+        for span in li.find_all("span"):
+            txt = span.get_text(strip=True)
+            if re.match(r"^\d[\d,]*円?$", txt):
+                price = int(txt.replace(",", "").replace("円", ""))
+                break
 
-    # ---- 入札数 ----
-    bid_elem = li.find("a", href=re.compile(r"bid_hist"))
+    # ---- 3. 入札数 ----
     bid_count = 0
-    if bid_elem:
+    bid_link = li.find("a", href=re.compile(r"bid_hist"))
+    if bid_link:
+        bid_text = bid_link.get_text(strip=True)
         try:
-            bid_count = int(bid_elem.get_text(strip=True))
+            bid_count = int(re.sub(r"\D", "", bid_text))
         except ValueError:
             pass
 
-    # ---- 结束时间 ----
+    # ---- 4. 结束时间 ----
     time_text = None
-    for elem in li.find_all(["span", "p"]):
-        txt = elem.get_text(strip=True)
-        if re.search(r"\d{1,2}/\d{1,2}\s+\d{1,2}:\d{2}", txt):
-            time_text = txt
-            break
+    # 寻找包含“終了”的元素
+    ended_elem = li.find(string=re.compile("終了"))
+    if ended_elem:
+        # 该元素可能是 span，直接取其文本
+        time_text = ended_elem.strip()
+    else:
+        # 尝试在 span 中匹配时间格式
+        for span in li.find_all("span"):
+            txt = span.get_text(strip=True)
+            if re.search(r"\d{1,2}/\d{1,2}\s+\d{1,2}:\d{2}", txt):
+                time_text = txt
+                break
     end_time = parse_end_time(time_text) if time_text else None
 
-    # ---- 卖家 ----
+    # ---- 5. 卖家 ----
     seller_link = li.find("a", href=re.compile(r"/seller/"))
     seller_id = None
     if seller_link:
         seller_id = seller_link["href"].split("/")[-1]
 
-    # ---- 好评率 ----
+    # ---- 6. 好评率 ----
     rating = None
-    for elem in li.find_all(["span", "p"]):
-        txt = elem.get_text(strip=True)
-        if re.match(r"^\d{1,3}\.\d%$", txt):   # 匹配 99.4% 等
-            rating = txt
+    if seller_link:
+        # 在卖家链接的同一容器内找后续的 span 包含 %
+        parent = seller_link.parent
+        if parent:
+            spans = parent.find_all("span")
+            for sp in spans:
+                txt = sp.get_text(strip=True)
+                if re.match(r"^\d{1,3}\.\d%$", txt):
+                    rating = txt
+                    break
+    if not rating:
+        # 兜底：在整个 li 中找百分数（但要排除其他可能）
+        for txt_elem in li.find_all(string=re.compile(r"^\d{1,3}\.\d%$")):
+            rating = txt_elem.strip()
             break
 
-    # ---- 发货地 ----
+    # ---- 7. 发货地 ----
     prefecture = None
     for p in li.find_all("p"):
         txt = p.get_text(strip=True)
@@ -209,21 +257,23 @@ def parse_item(li):
 
 
 def parse_end_time(text):
-    """从文本中提取结束时间（JST），转为 ISO 格式"""
+    """
+    提取结束时间文本中的日期和时间，格式如：
+    "7/15 23:03終了" 或 "7/15 23:03"
+    返回 ISO 8601 字符串（JST 时区）
+    """
+    if not text:
+        return None
     m = re.search(r"(\d{1,2})/(\d{1,2})\s+(\d{1,2}):(\d{2})", text)
     if not m:
         return None
-
     month, day, hour, minute = map(int, m.groups())
     year = datetime.now().year
-
-    # 假设为 JST（UTC+9）
     dt = datetime(year, month, day, hour, minute, tzinfo=timezone(timedelta(hours=9)))
     return dt.isoformat()
 
 
 def save_items(items):
-    """批量写入 DynamoDB，设置 TTL 为 180 天后"""
     saved = 0
     with table.batch_writer() as batch:
         for item in items:
