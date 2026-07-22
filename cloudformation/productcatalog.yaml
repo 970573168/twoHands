@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: "2010-09-09"
 
 Description: >
-  电子产品目录采集器 + AI API Secret（可选）
+  电子产品目录采集器 + AI API Secret + Yahoo Auction 抓取器
   Lambda 代码通过已有 S3 Bucket 部署
 
 Parameters:
@@ -131,34 +131,6 @@ Parameters:
     Description: CloudWatch 日志保留天数
 
   # ============ Yahoo Auction 抓取器参数 ============
-
-
-    # ============ Yahoo Auction 抓取器补充参数 ============
-  YahooAuctionActiveBaseUrl:
-    Type: String
-    Default: "https://auctions.yahoo.co.jp/search/search"
-    Description: Yahoo 活跃拍卖搜索基础 URL
-
-  YahooAuctionActiveTableName:
-    Type: String
-    Default: "YahooAuctionActiveItems"
-    Description: 活跃拍卖 DynamoDB 表名称前缀
-
-  YahooAuctionDebugLogHtml:
-    Type: String
-    Default: "false"
-    AllowedValues:
-      - "true"
-      - "false"
-    Description: 是否记录调试 HTML 日志
-
-  YahooAuctionItemsPerPage:
-    Type: Number
-    Default: 50
-    MinValue: 10
-    MaxValue: 100
-    Description: 每页显示的商品数量
-  
   DeployScraper:
     Type: String
     Default: "true"
@@ -167,10 +139,15 @@ Parameters:
       - "false"
     Description: 是否部署 Yahoo Auction 抓取器
 
-  YahooAuctionBaseUrl:
+  YahooAuctionClosedBaseUrl:
     Type: String
     Default: "https://auctions.yahoo.co.jp/closedsearch/closedsearch"
     Description: Yahoo 闭拍搜索基础 URL
+
+  YahooAuctionActiveBaseUrl:
+    Type: String
+    Default: "https://auctions.yahoo.co.jp/search/search"
+    Description: Yahoo 活跃拍卖搜索基础 URL
 
   YahooAuctionDefaultParams:
     Type: String
@@ -196,10 +173,30 @@ Parameters:
     Default: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     Description: 请求时使用的 User-Agent
 
-  YahooAuctionTableName:
+  YahooAuctionClosedTableName:
     Type: String
     Default: "YahooAuctionItems"
-    Description: DynamoDB 表名称前缀
+    Description: 闭拍 DynamoDB 表名称前缀
+
+  YahooAuctionActiveTableName:
+    Type: String
+    Default: "YahooAuctionActiveItems"
+    Description: 活跃拍卖 DynamoDB 表名称前缀
+
+  YahooAuctionDebugLogHtml:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: 是否记录调试 HTML 日志
+
+  YahooAuctionItemsPerPage:
+    Type: Number
+    Default: 50
+    MinValue: 10
+    MaxValue: 100
+    Description: 每页显示的商品数量
 
   # ============ Yahoo Auction 自定义搜索参数（可留空）============
   AuctionParamNew:
@@ -235,7 +232,7 @@ Parameters:
   AuctionParamSelect:
     Type: String
     Default: ""
-    Description: "select 参数（通常已在 DEFAULT_PARAMS 中）"
+    Description: "select 参数"
 
   AuctionParamSpec:
     Type: String
@@ -554,23 +551,22 @@ Resources:
   # Yahoo Auction 抓取器资源
   # =============================================
 
-  # ---------- DynamoDB 表 ----------
-  # =============================================
-# Yahoo Auction 抓取器资源（更新版）
-# =============================================
-
   # ---------- DynamoDB 表：闭拍数据 ----------
   YahooAuctionClosedTable:
     Type: AWS::DynamoDB::Table
     Condition: DeployScraperCondition
     Properties:
-      TableName: !Sub "${YahooAuctionTableName}-${Environment}"
+      TableName: !Sub "${YahooAuctionClosedTableName}-${Environment}"
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: auctionId
           AttributeType: S
         - AttributeName: endTime
           AttributeType: S
+        - AttributeName: sellerId
+          AttributeType: S
+        - AttributeName: price
+          AttributeType: N
       KeySchema:
         - AttributeName: auctionId
           KeyType: HASH
@@ -579,6 +575,22 @@ Resources:
           KeySchema:
             - AttributeName: endTime
               KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: SellerIndex
+          KeySchema:
+            - AttributeName: sellerId
+              KeyType: HASH
+            - AttributeName: endTime
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: PriceIndex
+          KeySchema:
+            - AttributeName: sellerId
+              KeyType: HASH
+            - AttributeName: price
+              KeyType: RANGE
           Projection:
             ProjectionType: ALL
       TimeToLiveSpecification:
@@ -661,7 +673,7 @@ Resources:
       LogGroupName: !Sub "/aws/lambda/YahooAuctionScraper-${Environment}"
       RetentionInDays: !Ref LogRetentionDays
 
-  # ---------- Lambda 执行角色（更新权限）----------
+  # ---------- Lambda 执行角色 ----------
   YahooAuctionScraperRole:
     Type: AWS::IAM::Role
     Condition: DeployScraperCondition
@@ -689,6 +701,7 @@ Resources:
                   - dynamodb:GetItem
                   - dynamodb:Query
                   - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
                 Resource:
                   - !GetAtt YahooAuctionClosedTable.Arn
                   - !Sub "${YahooAuctionClosedTable.Arn}/index/*"
@@ -701,7 +714,7 @@ Resources:
                   - logs:PutLogEvents
                 Resource: !Sub "${YahooAuctionScraperLogGroup.Arn}:*"
 
-  # ---------- Lambda 函数（更新环境变量）----------
+  # ---------- Lambda 函数 ----------
   YahooAuctionScraper:
     Type: AWS::Lambda::Function
     Condition: DeployScraperCondition
@@ -724,11 +737,11 @@ Resources:
       Environment:
         Variables:
           # 基础配置
-          CLOSED_BASE_URL: !Ref YahooAuctionBaseUrl
+          CLOSED_BASE_URL: !Ref YahooAuctionClosedBaseUrl
           ACTIVE_BASE_URL: !Ref YahooAuctionActiveBaseUrl
           DEFAULT_PARAMS: !Ref YahooAuctionDefaultParams
           MAX_PAGES: !Ref YahooAuctionMaxPages
-          TABLE_NAME_CLOSED: !Sub "${YahooAuctionTableName}-${Environment}"
+          TABLE_NAME_CLOSED: !Sub "${YahooAuctionClosedTableName}-${Environment}"
           TABLE_NAME_ACTIVE: !Sub "${YahooAuctionActiveTableName}-${Environment}"
           REQUEST_TIMEOUT: !Ref YahooAuctionRequestTimeout
           USER_AGENT: !Ref YahooAuctionUserAgent
@@ -773,127 +786,16 @@ Resources:
         - Key: Environment
           Value: !Ref Environment
 
-  # ---------- CloudWatch Logs ----------
-  YahooAuctionScraperLogGroup:
-    Type: AWS::Logs::LogGroup
-    Condition: DeployScraperCondition
-    Properties:
-      LogGroupName: !Sub "/aws/lambda/YahooAuctionScraper-${Environment}"
-      RetentionInDays: !Ref LogRetentionDays
-
-  # ---------- Lambda 执行角色 ----------
-  YahooAuctionScraperRole:
-    Type: AWS::IAM::Role
-    Condition: DeployScraperCondition
-    Properties:
-      RoleName: !Sub "YahooAuctionScraper-Role-${Environment}"
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service:
-                - lambda.amazonaws.com
-            Action:
-              - sts:AssumeRole
-      Policies:
-        - PolicyName: YahooAuctionScraperPolicy
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Sid: DynamoDBAccess
-                Effect: Allow
-                Action:
-                  - dynamodb:PutItem
-                  - dynamodb:BatchWriteItem
-                Resource: !GetAtt YahooAuctionItemsTable.Arn
-              - Sid: WriteLogs
-                Effect: Allow
-                Action:
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource: !Sub "${YahooAuctionScraperLogGroup.Arn}:*"
-
-  # ---------- Lambda 函数 ----------
-  YahooAuctionScraper:
-    Type: AWS::Lambda::Function
-    Condition: DeployScraperCondition
-    DependsOn:
-      - YahooAuctionScraperLogGroup
-      - YahooAuctionScraperRole
-    Properties:
-      FunctionName: !Sub "YahooAuctionScraper-${Environment}"
-      Description: "Yahoo Auction closed search scraper"
-      Runtime: python3.12
-      Architectures:
-        - arm64
-      Handler: yahoo_auction_scraper.lambda_handler
-      Timeout: 60
-      MemorySize: 256
-      Role: !GetAtt YahooAuctionScraperRole.Arn
-      Code:
-        S3Bucket: !Ref LambdaCodeS3Bucket
-        S3Key: !Ref LambdaCodeS3Key
-      Environment:
-        Variables:
-          # 基础配置
-          BASE_URL: !Ref YahooAuctionBaseUrl
-          DEFAULT_PARAMS: !Ref YahooAuctionDefaultParams
-          MAX_PAGES: !Ref YahooAuctionMaxPages
-          TABLE_NAME: !Sub "${YahooAuctionTableName}-${Environment}"
-          REQUEST_TIMEOUT: !Ref YahooAuctionRequestTimeout
-          USER_AGENT: !Ref YahooAuctionUserAgent
-          
-          # 自定义搜索参数（所有参数都会传递给 Lambda）
-          AUCTION_PARAM_NEW: !Ref AuctionParamNew
-          AUCTION_PARAM_OFFER: !Ref AuctionParamOffer
-          AUCTION_PARAM_SHIPPING: !Ref AuctionParamShipping
-          AUCTION_PARAM_ISTATUS: !Ref AuctionParamIstatus
-          AUCTION_PARAM_ABATCH: !Ref AuctionParamAbatch
-          AUCTION_PARAM_LOC_CD: !Ref AuctionParamLocCd
-          AUCTION_PARAM_SELECT: !Ref AuctionParamSelect
-          AUCTION_PARAM_SPEC: !Ref AuctionParamSpec
-          AUCTION_PARAM_PRICE_TYPE: !Ref AuctionParamPriceType
-          AUCTION_PARAM_MIN: !Ref AuctionParamMin
-          AUCTION_PARAM_MAX: !Ref AuctionParamMax
-          AUCTION_PARAM_CAR_INSPECTION: !Ref AuctionParamCarInspection
-          AUCTION_PARAM_FIXED: !Ref AuctionParamFixed
-          AUCTION_PARAM_AUCMINPRICE: !Ref AuctionParamAucminprice
-          AUCTION_PARAM_AUCMAXPRICE: !Ref AuctionParamAucmaxprice
-          AUCTION_PARAM_AUCMIN_BIDORBUY_PRICE: !Ref AuctionParamAucminBidorbuyPrice
-          AUCTION_PARAM_AUCMAX_BIDORBUY_PRICE: !Ref AuctionParamAucmaxBidorbuyPrice
-          AUCTION_PARAM_LC1: !Ref AuctionParamLc1
-          AUCTION_PARAM_JPYPAYMENT: !Ref AuctionParamJpypayment
-          AUCTION_PARAM_POINT: !Ref AuctionParamPoint
-          AUCTION_PARAM_THUMB: !Ref AuctionParamThumb
-          AUCTION_PARAM_WRAPPINGICON: !Ref AuctionParamWrappingicon
-          AUCTION_PARAM_PRIVACY_DELIVERY: !Ref AuctionParamPrivacyDelivery
-          AUCTION_PARAM_GIFT_ICON: !Ref AuctionParamGiftIcon
-          AUCTION_PARAM_CHARITY: !Ref AuctionParamCharity
-          AUCTION_PARAM_MODE: !Ref AuctionParamMode
-          AUCTION_PARAM_N: !Ref AuctionParamN
-          AUCTION_PARAM_S1: !Ref AuctionParamS1
-          AUCTION_PARAM_O1: !Ref AuctionParamO1
-          AUCTION_PARAM_MAX_SPRICE: !Ref AuctionParamMaxSprice
-          AUCTION_PARAM_TYPE: !Ref AuctionParamType
-      Tags:
-        - Key: Application
-          Value: YahooAuctionScraper
-        - Key: Environment
-          Value: !Ref Environment
-
 Outputs:
   # ============ S3 输出 ============
   LambdaCodeBucketName:
     Description: S3 存储 Lambda 代码的存储桶名称
-    Condition: DeployMainAppCondition
     Value: !Ref LambdaCodeS3Bucket
     Export:
       Name: !Sub "${AWS::StackName}-CodeBucket"
 
   LambdaCodeObjectKey:
     Description: S3 中 Lambda 代码对象键
-    Condition: DeployMainAppCondition
     Value: !Ref LambdaCodeS3Key
     Export:
       Name: !Sub "${AWS::StackName}-CodeKey"
@@ -943,12 +845,33 @@ Outputs:
       Name: !Sub "${AWS::StackName}-LambdaArn"
 
   # ============ Yahoo Auction 抓取器输出 ============
-  YahooAuctionTableName:
-    Description: Yahoo Auction items DynamoDB table name
+  YahooAuctionClosedTableName:
+    Description: Yahoo Auction closed items DynamoDB table name
     Condition: DeployScraperCondition
-    Value: !Ref YahooAuctionItemsTable
+    Value: !Ref YahooAuctionClosedTable
     Export:
-      Name: !Sub "${AWS::StackName}-YahooAuctionTable"
+      Name: !Sub "${AWS::StackName}-YahooAuctionClosedTable"
+
+  YahooAuctionClosedTableArn:
+    Description: Yahoo Auction closed items DynamoDB table ARN
+    Condition: DeployScraperCondition
+    Value: !GetAtt YahooAuctionClosedTable.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-YahooAuctionClosedTableArn"
+
+  YahooAuctionActiveTableName:
+    Description: Yahoo Auction active items DynamoDB table name
+    Condition: DeployScraperCondition
+    Value: !Ref YahooAuctionActiveTable
+    Export:
+      Name: !Sub "${AWS::StackName}-YahooAuctionActiveTable"
+
+  YahooAuctionActiveTableArn:
+    Description: Yahoo Auction active items DynamoDB table ARN
+    Condition: DeployScraperCondition
+    Value: !GetAtt YahooAuctionActiveTable.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-YahooAuctionActiveTableArn"
 
   YahooAuctionScraperFunctionName:
     Description: Yahoo Auction scraper Lambda function name
@@ -957,41 +880,9 @@ Outputs:
     Export:
       Name: !Sub "${AWS::StackName}-YahooAuctionScraper"
 
-  # ============ Yahoo Auction 自定义参数输出 ============
-  YahooAuctionCustomParams:
-    Description: JSON string of all custom auction parameters
+  YahooAuctionScraperFunctionArn:
+    Description: Yahoo Auction scraper Lambda function ARN
     Condition: DeployScraperCondition
-    Value: !Sub |
-      {
-        "new": "${AuctionParamNew}",
-        "offer": "${AuctionParamOffer}",
-        "shipping": "${AuctionParamShipping}",
-        "istatus": "${AuctionParamIstatus}",
-        "abatch": "${AuctionParamAbatch}",
-        "loc_cd": "${AuctionParamLocCd}",
-        "select": "${AuctionParamSelect}",
-        "spec": "${AuctionParamSpec}",
-        "price_type": "${AuctionParamPriceType}",
-        "min": "${AuctionParamMin}",
-        "max": "${AuctionParamMax}",
-        "car_inspection": "${AuctionParamCarInspection}",
-        "fixed": "${AuctionParamFixed}",
-        "aucminprice": "${AuctionParamAucminprice}",
-        "aucmaxprice": "${AuctionParamAucmaxprice}",
-        "aucmin_bidorbuy_price": "${AuctionParamAucminBidorbuyPrice}",
-        "aucmax_bidorbuy_price": "${AuctionParamAucmaxBidorbuyPrice}",
-        "lc1": "${AuctionParamLc1}",
-        "jpypayment": "${AuctionParamJpypayment}",
-        "point": "${AuctionParamPoint}",
-        "thumb": "${AuctionParamThumb}",
-        "wrappingicon": "${AuctionParamWrappingicon}",
-        "privacy_delivery": "${AuctionParamPrivacyDelivery}",
-        "gift_icon": "${AuctionParamGiftIcon}",
-        "charity": "${AuctionParamCharity}",
-        "mode": "${AuctionParamMode}",
-        "n": "${AuctionParamN}",
-        "s1": "${AuctionParamS1}",
-        "o1": "${AuctionParamO1}",
-        "max_sprice": "${AuctionParamMaxSprice}",
-        "type": "${AuctionParamType}"
-      }
+    Value: !GetAtt YahooAuctionScraper.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-YahooAuctionScraperArn"
