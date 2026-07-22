@@ -51,6 +51,18 @@ on:
         default: "productcatalog-lambda-code"
         type: string
 
+      ai_model:
+        description: "AI Model name"
+        required: false
+        default: "doubao-seed-2-0-mini-260428"
+        type: string
+
+      api_url:
+        description: "AI API URL"
+        required: false
+        default: "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+        type: string
+
       max_categories:
         description: "Max categories per run"
         required: false
@@ -99,11 +111,29 @@ on:
         default: "3"
         type: string
 
-      # ---- 新增抓取器参数 ----
-      yahoo_base_url:
-        description: "Yahoo Auction base URL"
+      log_retention_days:
+        description: "CloudWatch log retention days"
+        required: false
+        default: "14"
+        type: string
+
+      secret_name:
+        description: "Secrets Manager secret name prefix"
+        required: false
+        default: "ProductCatalog/ApiSecret"
+        type: string
+
+      # ---- Yahoo Auction 抓取器参数 ----
+      yahoo_closed_base_url:
+        description: "Yahoo Auction closed search base URL"
         required: false
         default: "https://auctions.yahoo.co.jp/closedsearch/closedsearch"
+        type: string
+
+      yahoo_active_base_url:
+        description: "Yahoo Auction active search base URL"
+        required: false
+        default: "https://auctions.yahoo.co.jp/search/search"
         type: string
 
       yahoo_default_params:
@@ -118,10 +148,230 @@ on:
         default: "1"
         type: string
 
-      yahoo_table_name:
-        description: "DynamoDB table name for auction items"
+      yahoo_request_timeout:
+        description: "HTTP request timeout seconds"
+        required: false
+        default: "30"
+        type: string
+
+      yahoo_user_agent:
+        description: "User-Agent for requests"
+        required: false
+        default: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        type: string
+
+      yahoo_closed_table_name:
+        description: "DynamoDB table name for closed auction items"
         required: false
         default: "YahooAuctionItems"
+        type: string
+
+      yahoo_active_table_name:
+        description: "DynamoDB table name for active auction items"
+        required: false
+        default: "YahooAuctionActiveItems"
+        type: string
+
+      yahoo_debug_log_html:
+        description: "Enable debug HTML logging"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+      yahoo_items_per_page:
+        description: "Items per page"
+        required: false
+        default: "50"
+        type: string
+
+      # ---- Yahoo Auction 自定义搜索参数 ----
+      auction_param_new:
+        description: "New item filter (empty or 1)"
+        required: false
+        default: ""
+        type: string
+
+      auction_param_offer:
+        description: "Negotiable filter (empty or 1)"
+        required: false
+        default: ""
+        type: string
+
+      auction_param_shipping:
+        description: "Shipping method"
+        required: false
+        default: ""
+        type: string
+
+      auction_param_istatus:
+        description: "Item status"
+        required: false
+        default: ""
+        type: string
+
+      auction_param_abatch:
+        description: "Batch parameter"
+        required: false
+        default: ""
+        type: string
+
+      auction_param_loc_cd:
+        description: "Location code"
+        required: false
+        default: ""
+        type: string
+
+      auction_param_select:
+        description: "Select parameter"
+        required: false
+        default: ""
+        type: string
+
+      auction_param_spec:
+        description: "Specification parameter"
+        required: false
+        default: ""
+        type: string
+
+      auction_param_price_type:
+        description: "Price type"
+        required: false
+        default: ""
+        type: string
+
+      auction_param_min:
+        description: "Minimum price"
+        required: false
+        default: ""
+        type: string
+
+      auction_param_max:
+        description: "Maximum price"
+        required: false
+        default: ""
+        type: string
+
+      auction_param_fixed:
+        description: "Fixed price filter"
+        required: false
+        default: ""
+        type: string
+
+      auction_param_aucminprice:
+        description: "Auction minimum price"
+        required: false
+        default: ""
+        type: string
+
+      auction_param_aucmaxprice:
+        description: "Auction maximum price"
+        required: false
+        default: ""
+        type: string
+
+      auction_param_aucmin_bidorbuy_price:
+        description: "Buyout minimum price"
+        required: false
+        default: ""
+        type: string
+
+      auction_param_aucmax_bidorbuy_price:
+        description: "Buyout maximum price"
+        required: false
+        default: ""
+        type: string
+
+      auction_param_jpypayment:
+        description: "PayPay payment filter"
+        required: false
+        default: ""
+        type: string
+
+      auction_param_point:
+        description: "Point parameter"
+        required: false
+        default: ""
+        type: string
+
+      auction_param_n:
+        description: "Results per page"
+        required: false
+        default: "50"
+        type: string
+
+      auction_param_s1:
+        description: "Sort field"
+        required: false
+        default: ""
+        type: string
+
+      auction_param_o1:
+        description: "Sort direction (a/d)"
+        required: false
+        default: ""
+        type: string
+
+      auction_param_type:
+        description: "Auction type (auction/fixed/all)"
+        required: false
+        default: ""
+        type: string
+
+      auction_param_mode:
+        description: "Mode parameter"
+        required: false
+        default: ""
+        type: string
+
+      auction_param_lc1:
+        description: "LC1 parameter"
+        required: false
+        default: ""
+        type: string
+
+      auction_param_car_inspection:
+        description: "Car inspection parameter"
+        required: false
+        default: ""
+        type: string
+
+      auction_param_thumb:
+        description: "Thumbnail parameter"
+        required: false
+        default: ""
+        type: string
+
+      auction_param_wrappingicon:
+        description: "Wrapping icon parameter"
+        required: false
+        default: ""
+        type: string
+
+      auction_param_privacy_delivery:
+        description: "Privacy delivery parameter"
+        required: false
+        default: ""
+        type: string
+
+      auction_param_gift_icon:
+        description: "Gift icon parameter"
+        required: false
+        default: ""
+        type: string
+
+      auction_param_charity:
+        description: "Charity parameter"
+        required: false
+        default: ""
+        type: string
+
+      auction_param_max_sprice:
+        description: "Maximum selling price"
+        required: false
+        default: ""
         type: string
 
 permissions:
@@ -146,79 +396,205 @@ jobs:
       - name: Verify AWS Identity
         run: |
           aws sts get-caller-identity
-
-      - name: Prepare Deployment Variables
-        run: |
-          AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-          S3_BUCKET_BASE="${{ github.event.inputs.s3_bucket }}"
-          S3_BUCKET="${S3_BUCKET_BASE}-${AWS_ACCOUNT_ID}"
-
-          echo "AWS_ACCOUNT_ID=$AWS_ACCOUNT_ID" >> "$GITHUB_ENV"
+          echo "AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)" >> "$GITHUB_ENV"
           echo "AWS_REGION=ap-northeast-1" >> "$GITHUB_ENV"
+
+      - name: Prepare S3 Bucket Name
+        run: |
+          S3_BUCKET="${{ github.event.inputs.s3_bucket }}-${AWS_ACCOUNT_ID}"
           echo "S3_BUCKET=$S3_BUCKET" >> "$GITHUB_ENV"
+          echo "Using S3 bucket: $S3_BUCKET"
 
       - name: Create S3 Bucket if not exists
         if: ${{ github.event.inputs.deploy_main_app == 'true' || github.event.inputs.deploy_scraper == 'true' }}
         run: |
-          if ! aws s3api head-bucket --bucket "$S3_BUCKET" 2>/dev/null; then
+          if aws s3api head-bucket --bucket "$S3_BUCKET" 2>/dev/null; then
+            echo "Bucket $S3_BUCKET already exists"
+          else
+            echo "Creating bucket $S3_BUCKET"
             aws s3api create-bucket \
               --bucket "$S3_BUCKET" \
               --region "$AWS_REGION" \
               --create-bucket-configuration LocationConstraint="$AWS_REGION"
           fi
-          aws s3api put-bucket-versioning --bucket "$S3_BUCKET" --versioning-configuration Status=Enabled
-          aws s3api put-bucket-encryption --bucket "$S3_BUCKET" --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
-          aws s3api put-public-access-block --bucket "$S3_BUCKET" --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+          
+          echo "Configuring bucket settings..."
+          aws s3api put-bucket-versioning \
+            --bucket "$S3_BUCKET" \
+            --versioning-configuration Status=Enabled
+          
+          aws s3api put-bucket-encryption \
+            --bucket "$S3_BUCKET" \
+            --server-side-encryption-configuration '{
+              "Rules": [{
+                "ApplyServerSideEncryptionByDefault": {
+                  "SSEAlgorithm": "AES256"
+                }
+              }]
+            }'
+          
+          aws s3api put-public-access-block \
+            --bucket "$S3_BUCKET" \
+            --public-access-block-configuration \
+              BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+
+      - name: Check Python files exist
+        if: ${{ github.event.inputs.deploy_main_app == 'true' || github.event.inputs.deploy_scraper == 'true' }}
+        run: |
+          echo "Checking source files..."
+          ls -la src/ || echo "src/ directory not found"
+          ls -la lambda/ || echo "lambda/ directory not found"
+          
+          # 确定源文件位置
+          if [ -d "src" ] && [ -n "$(ls -A src/*.py 2>/dev/null)" ]; then
+            echo "SOURCE_DIR=src" >> "$GITHUB_ENV"
+          elif [ -d "lambda" ] && [ -n "$(ls -A lambda/*.py 2>/dev/null)" ]; then
+            echo "SOURCE_DIR=lambda" >> "$GITHUB_ENV"
+          else
+            echo "Warning: No Python source files found in src/ or lambda/"
+            echo "SOURCE_DIR=src" >> "$GITHUB_ENV"
+          fi
 
       - name: Build and Upload Lambda Code
         if: ${{ github.event.inputs.deploy_main_app == 'true' || github.event.inputs.deploy_scraper == 'true' }}
         run: |
           BUILD_DIR="build"
-          rm -rf "$BUILD_DIR"
+          rm -rf "$BUILD_DIR" lambda.zip
           mkdir -p "$BUILD_DIR"
-          pip3 install -r requirements.txt -t "$BUILD_DIR" --platform manylinux2014_aarch64 --only-binary=:all: --python-version 3.12 --quiet
-          cp src/*.py "$BUILD_DIR/"
+          
+          # 安装依赖
+          if [ -f requirements.txt ]; then
+            echo "Installing dependencies from requirements.txt..."
+            pip3 install -r requirements.txt -t "$BUILD_DIR" \
+              --platform manylinux2014_aarch64 \
+              --only-binary=:all: \
+              --python-version 3.12 \
+              --quiet
+          else
+            echo "No requirements.txt found, installing default dependencies..."
+            pip3 install requests beautifulsoup4 boto3 -t "$BUILD_DIR" \
+              --platform manylinux2014_aarch64 \
+              --only-binary=:all: \
+              --python-version 3.12 \
+              --quiet
+          fi
+          
+          # 复制源代码
+          if [ -d "${SOURCE_DIR}" ] && [ -n "$(ls -A ${SOURCE_DIR}/*.py 2>/dev/null)" ]; then
+            echo "Copying source files from ${SOURCE_DIR}/"
+            cp ${SOURCE_DIR}/*.py "$BUILD_DIR/" 2>/dev/null || true
+          else
+            echo "Error: No source files found in ${SOURCE_DIR}/"
+            exit 1
+          fi
+          
+          # 列出打包文件
+          echo "Files in build directory:"
+          ls -la "$BUILD_DIR/"
+          
+          # 创建 zip
           cd "$BUILD_DIR"
           zip -r9 ../lambda.zip . -q
           cd ..
+          
+          # 上传到 S3
           TIMESTAMP=$(date +%Y%m%d%H%M%S)
           S3_KEY="productcatalog/lambda-${TIMESTAMP}.zip"
+          echo "Uploading to s3://$S3_BUCKET/$S3_KEY"
           aws s3 cp lambda.zip "s3://$S3_BUCKET/$S3_KEY"
           echo "S3_KEY=$S3_KEY" >> "$GITHUB_ENV"
 
-      - name: Validate Template
+      - name: Validate CloudFormation Template
         run: |
-          aws cloudformation validate-template --template-body file://cloudformation/productcatalog.yaml
+          echo "Validating CloudFormation template..."
+          aws cloudformation validate-template \
+            --template-body file://cloudformation/productcatalog.yaml
 
-      - name: Deploy Stack
+      - name: Deploy CloudFormation Stack
         run: |
           STACK_NAME="productcatalog-app-${{ github.event.inputs.environment }}"
-
+          echo "Deploying stack: $STACK_NAME"
+          
+          # 构建参数数组
           PARAMS=(
-            "Environment=${{ github.event.inputs.environment }}"
-            "DeploySecret=${{ github.event.inputs.deploy_secret }}"
-            "DeployMainApp=${{ github.event.inputs.deploy_main_app }}"
-            "DeployScraper=${{ github.event.inputs.deploy_scraper }}"
-            "MaxCategoriesPerRun=${{ github.event.inputs.max_categories }}"
-            "MaxBrandsPerCategory=${{ github.event.inputs.max_brands }}"
-            "MaxModelsPerBrand=${{ github.event.inputs.max_models }}"
-            "MaxTotalTokens=${{ github.event.inputs.max_total_tokens }}"
-            "LambdaTimeoutBuffer=${{ github.event.inputs.lambda_timeout_buffer }}"
-            "ApiCallDelay=${{ github.event.inputs.api_call_delay }}"
-            "CategoryLimit=${{ github.event.inputs.category_limit }}"
-            "BrandLimit=${{ github.event.inputs.brand_limit }}"
-            "LambdaCodeS3Bucket=$S3_BUCKET"
-            "LambdaCodeS3Key=${S3_KEY:-productcatalog/lambda-placeholder.zip}"
-            "YahooAuctionBaseUrl=${{ github.event.inputs.yahoo_base_url }}"
-            "YahooAuctionDefaultParams=${{ github.event.inputs.yahoo_default_params }}"
-            "YahooAuctionMaxPages=${{ github.event.inputs.yahoo_max_pages }}"
-            "YahooAuctionTableName=${{ github.event.inputs.yahoo_table_name }}"
+            "ParameterKey=Environment,ParameterValue=${{ github.event.inputs.environment }}"
+            "ParameterKey=DeploySecret,ParameterValue=${{ github.event.inputs.deploy_secret }}"
+            "ParameterKey=DeployMainApp,ParameterValue=${{ github.event.inputs.deploy_main_app }}"
+            "ParameterKey=DeployScraper,ParameterValue=${{ github.event.inputs.deploy_scraper }}"
+            "ParameterKey=LambdaCodeS3Bucket,ParameterValue=$S3_BUCKET"
+            "ParameterKey=LambdaCodeS3Key,ParameterValue=${S3_KEY:-productcatalog/lambda-placeholder.zip}"
           )
-
-          if [ "${{ github.event.inputs.deploy_secret }}" = "true" ] && [ -n "${{ github.event.inputs.api_key }}" ]; then
-            PARAMS+=("DeepSeekApiKey=${{ github.event.inputs.api_key }}")
+          
+          # 主应用参数
+          if [ "${{ github.event.inputs.deploy_main_app }}" = "true" ]; then
+            PARAMS+=("ParameterKey=AiModel,ParameterValue=${{ github.event.inputs.ai_model }}")
+            PARAMS+=("ParameterKey=ApiUrl,ParameterValue=${{ github.event.inputs.api_url }}")
+            PARAMS+=("ParameterKey=MaxCategoriesPerRun,ParameterValue=${{ github.event.inputs.max_categories }}")
+            PARAMS+=("ParameterKey=MaxBrandsPerCategory,ParameterValue=${{ github.event.inputs.max_brands }}")
+            PARAMS+=("ParameterKey=MaxModelsPerBrand,ParameterValue=${{ github.event.inputs.max_models }}")
+            PARAMS+=("ParameterKey=MaxTotalTokens,ParameterValue=${{ github.event.inputs.max_total_tokens }}")
+            PARAMS+=("ParameterKey=LambdaTimeoutBuffer,ParameterValue=${{ github.event.inputs.lambda_timeout_buffer }}")
+            PARAMS+=("ParameterKey=ApiCallDelay,ParameterValue=${{ github.event.inputs.api_call_delay }}")
+            PARAMS+=("ParameterKey=CategoryLimit,ParameterValue=${{ github.event.inputs.category_limit }}")
+            PARAMS+=("ParameterKey=BrandLimit,ParameterValue=${{ github.event.inputs.brand_limit }}")
+            PARAMS+=("ParameterKey=LogRetentionDays,ParameterValue=${{ github.event.inputs.log_retention_days }}")
+            PARAMS+=("ParameterKey=SecretName,ParameterValue=${{ github.event.inputs.secret_name }}")
+            
+            # API Key
+            if [ "${{ github.event.inputs.deploy_secret }}" = "true" ] && [ -n "${{ github.event.inputs.api_key }}" ]; then
+              PARAMS+=("ParameterKey=ApiKey,ParameterValue=${{ github.event.inputs.api_key }}")
+            fi
           fi
-
+          
+          # Yahoo Auction 抓取器参数
+          if [ "${{ github.event.inputs.deploy_scraper }}" = "true" ]; then
+            PARAMS+=("ParameterKey=YahooAuctionClosedBaseUrl,ParameterValue=${{ github.event.inputs.yahoo_closed_base_url }}")
+            PARAMS+=("ParameterKey=YahooAuctionActiveBaseUrl,ParameterValue=${{ github.event.inputs.yahoo_active_base_url }}")
+            PARAMS+=("ParameterKey=YahooAuctionDefaultParams,ParameterValue=${{ github.event.inputs.yahoo_default_params }}")
+            PARAMS+=("ParameterKey=YahooAuctionMaxPages,ParameterValue=${{ github.event.inputs.yahoo_max_pages }}")
+            PARAMS+=("ParameterKey=YahooAuctionRequestTimeout,ParameterValue=${{ github.event.inputs.yahoo_request_timeout }}")
+            PARAMS+=("ParameterKey=YahooAuctionUserAgent,ParameterValue=${{ github.event.inputs.yahoo_user_agent }}")
+            PARAMS+=("ParameterKey=YahooAuctionClosedTableName,ParameterValue=${{ github.event.inputs.yahoo_closed_table_name }}")
+            PARAMS+=("ParameterKey=YahooAuctionActiveTableName,ParameterValue=${{ github.event.inputs.yahoo_active_table_name }}")
+            PARAMS+=("ParameterKey=YahooAuctionDebugLogHtml,ParameterValue=${{ github.event.inputs.yahoo_debug_log_html }}")
+            PARAMS+=("ParameterKey=YahooAuctionItemsPerPage,ParameterValue=${{ github.event.inputs.yahoo_items_per_page }}")
+            
+            # 自定义搜索参数
+            PARAMS+=("ParameterKey=AuctionParamNew,ParameterValue=${{ github.event.inputs.auction_param_new }}")
+            PARAMS+=("ParameterKey=AuctionParamOffer,ParameterValue=${{ github.event.inputs.auction_param_offer }}")
+            PARAMS+=("ParameterKey=AuctionParamShipping,ParameterValue=${{ github.event.inputs.auction_param_shipping }}")
+            PARAMS+=("ParameterKey=AuctionParamIstatus,ParameterValue=${{ github.event.inputs.auction_param_istatus }}")
+            PARAMS+=("ParameterKey=AuctionParamAbatch,ParameterValue=${{ github.event.inputs.auction_param_abatch }}")
+            PARAMS+=("ParameterKey=AuctionParamLocCd,ParameterValue=${{ github.event.inputs.auction_param_loc_cd }}")
+            PARAMS+=("ParameterKey=AuctionParamSelect,ParameterValue=${{ github.event.inputs.auction_param_select }}")
+            PARAMS+=("ParameterKey=AuctionParamSpec,ParameterValue=${{ github.event.inputs.auction_param_spec }}")
+            PARAMS+=("ParameterKey=AuctionParamPriceType,ParameterValue=${{ github.event.inputs.auction_param_price_type }}")
+            PARAMS+=("ParameterKey=AuctionParamMin,ParameterValue=${{ github.event.inputs.auction_param_min }}")
+            PARAMS+=("ParameterKey=AuctionParamMax,ParameterValue=${{ github.event.inputs.auction_param_max }}")
+            PARAMS+=("ParameterKey=AuctionParamFixed,ParameterValue=${{ github.event.inputs.auction_param_fixed }}")
+            PARAMS+=("ParameterKey=AuctionParamAucminprice,ParameterValue=${{ github.event.inputs.auction_param_aucminprice }}")
+            PARAMS+=("ParameterKey=AuctionParamAucmaxprice,ParameterValue=${{ github.event.inputs.auction_param_aucmaxprice }}")
+            PARAMS+=("ParameterKey=AuctionParamAucminBidorbuyPrice,ParameterValue=${{ github.event.inputs.auction_param_aucmin_bidorbuy_price }}")
+            PARAMS+=("ParameterKey=AuctionParamAucmaxBidorbuyPrice,ParameterValue=${{ github.event.inputs.auction_param_aucmax_bidorbuy_price }}")
+            PARAMS+=("ParameterKey=AuctionParamJpypayment,ParameterValue=${{ github.event.inputs.auction_param_jpypayment }}")
+            PARAMS+=("ParameterKey=AuctionParamPoint,ParameterValue=${{ github.event.inputs.auction_param_point }}")
+            PARAMS+=("ParameterKey=AuctionParamN,ParameterValue=${{ github.event.inputs.auction_param_n }}")
+            PARAMS+=("ParameterKey=AuctionParamS1,ParameterValue=${{ github.event.inputs.auction_param_s1 }}")
+            PARAMS+=("ParameterKey=AuctionParamO1,ParameterValue=${{ github.event.inputs.auction_param_o1 }}")
+            PARAMS+=("ParameterKey=AuctionParamType,ParameterValue=${{ github.event.inputs.auction_param_type }}")
+            PARAMS+=("ParameterKey=AuctionParamMode,ParameterValue=${{ github.event.inputs.auction_param_mode }}")
+            PARAMS+=("ParameterKey=AuctionParamLc1,ParameterValue=${{ github.event.inputs.auction_param_lc1 }}")
+            PARAMS+=("ParameterKey=AuctionParamCarInspection,ParameterValue=${{ github.event.inputs.auction_param_car_inspection }}")
+            PARAMS+=("ParameterKey=AuctionParamThumb,ParameterValue=${{ github.event.inputs.auction_param_thumb }}")
+            PARAMS+=("ParameterKey=AuctionParamWrappingicon,ParameterValue=${{ github.event.inputs.auction_param_wrappingicon }}")
+            PARAMS+=("ParameterKey=AuctionParamPrivacyDelivery,ParameterValue=${{ github.event.inputs.auction_param_privacy_delivery }}")
+            PARAMS+=("ParameterKey=AuctionParamGiftIcon,ParameterValue=${{ github.event.inputs.auction_param_gift_icon }}")
+            PARAMS+=("ParameterKey=AuctionParamCharity,ParameterValue=${{ github.event.inputs.auction_param_charity }}")
+            PARAMS+=("ParameterKey=AuctionParamMaxSprice,ParameterValue=${{ github.event.inputs.auction_param_max_sprice }}")
+          fi
+          
+          echo "Deploying with ${#PARAMS[@]} parameters..."
+          
           aws cloudformation deploy \
             --template-file cloudformation/productcatalog.yaml \
             --stack-name "$STACK_NAME" \
@@ -230,10 +606,26 @@ jobs:
         if: success()
         run: |
           STACK_NAME="productcatalog-app-${{ github.event.inputs.environment }}"
-          aws cloudformation describe-stacks --stack-name "$STACK_NAME" --query 'Stacks[0].Outputs' --output table
+          echo "=== Stack Outputs ==="
+          aws cloudformation describe-stacks \
+            --stack-name "$STACK_NAME" \
+            --query 'Stacks[0].Outputs[*].[OutputKey,OutputValue]' \
+            --output table
 
       - name: Show Failed Resources
         if: failure()
         run: |
           STACK_NAME="productcatalog-app-${{ github.event.inputs.environment }}"
-          aws cloudformation describe-stack-events --stack-name "$STACK_NAME" --query "StackEvents[?contains(ResourceStatus,'FAILED')].[LogicalResourceId,ResourceStatus,ResourceStatusReason,Timestamp]" --output table
+          echo "=== Failed Stack Events ==="
+          aws cloudformation describe-stack-events \
+            --stack-name "$STACK_NAME" \
+            --query "StackEvents[?contains(ResourceStatus,'FAILED')].[LogicalResourceId,ResourceStatus,ResourceStatusReason,Timestamp]" \
+            --output table
+          
+          echo ""
+          echo "=== All Stack Events (Last 20) ==="
+          aws cloudformation describe-stack-events \
+            --stack-name "$STACK_NAME" \
+            --max-items 20 \
+            --query "StackEvents[*].[LogicalResourceId,ResourceType,ResourceStatus,Timestamp]" \
+            --output table
