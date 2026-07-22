@@ -41,6 +41,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: List files for debugging
+        run: |
+          echo "📁 Current directory contents:"
+          ls -la
+          echo "📁 Looking for yahoo-scraper.yaml..."
+          find . -name "*.yaml" -type f | head -20
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -50,8 +57,25 @@ jobs:
         run: |
           echo "🔨 Building Lambda package..."
           mkdir -p build
+          
+          # 安装依赖
           pip install beautifulsoup4 boto3 -t build/ --platform manylinux2014_aarch64 --only-binary=:all: --python-version 3.12
-          cp src/yahoo_scraper.py build/
+          
+          # 复制代码文件 (在 twoHands/src/ 目录下)
+          if [ -f "twoHands/src/yahoo_scraper.py" ]; then
+            cp twoHands/src/yahoo_scraper.py build/
+          elif [ -f "src/yahoo_scraper.py" ]; then
+            cp src/yahoo_scraper.py build/
+          elif [ -f "yahoo_scraper.py" ]; then
+            cp yahoo_scraper.py build/
+          else
+            echo "❌ Error: yahoo_scraper.py not found!"
+            echo "Searching for yahoo_scraper.py..."
+            find . -name "yahoo_scraper.py" -type f
+            exit 1
+          fi
+          
+          # 创建ZIP包
           cd build
           zip -r9 ../lambda.zip .
           cd ..
@@ -77,9 +101,26 @@ jobs:
         run: |
           STACK_NAME="yahoo-scraper-${{ github.event.inputs.environment }}"
           
+          # 模板文件在 twoHands/cloudformation/ 目录下
+          if [ -f "twoHands/cloudformation/yahoo-scraper.yaml" ]; then
+            TEMPLATE_FILE="twoHands/cloudformation/yahoo-scraper.yaml"
+          elif [ -f "cloudformation/yahoo-scraper.yaml" ]; then
+            TEMPLATE_FILE="cloudformation/yahoo-scraper.yaml"
+          elif [ -f "yahoo-scraper.yaml" ]; then
+            TEMPLATE_FILE="yahoo-scraper.yaml"
+          else
+            echo "❌ Error: Cannot find yahoo-scraper.yaml"
+            echo "📁 Searching for yaml files:"
+            find . -name "*.yaml" -type f
+            exit 1
+          fi
+          
+          echo "📄 Using template: $TEMPLATE_FILE"
+          echo "🏗️ Deploying stack: $STACK_NAME"
+          
           aws cloudformation deploy \
             --stack-name "$STACK_NAME" \
-            --template-file yahoo-scraper.yaml \
+            --template-file "$TEMPLATE_FILE" \
             --parameter-overrides \
               Environment=${{ github.event.inputs.environment }} \
               LambdaCodeS3Bucket="${{ github.event.inputs.s3_bucket }}" \
