@@ -31,6 +31,15 @@ on:
           - "true"
           - "false"
 
+      deploy_scraper:
+        description: "Deploy Yahoo Auction Scraper?"
+        required: true
+        default: "true"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
       api_key:
         description: "API Key (required if deploy_secret=true)"
         required: false
@@ -90,6 +99,31 @@ on:
         default: "3"
         type: string
 
+      # ---- 新增抓取器参数 ----
+      yahoo_base_url:
+        description: "Yahoo Auction base URL"
+        required: false
+        default: "https://auctions.yahoo.co.jp/closedsearch/closedsearch"
+        type: string
+
+      yahoo_default_params:
+        description: "Yahoo Auction default query params"
+        required: false
+        default: "n=50&select=6&mode=3&dest_pref_code=23"
+        type: string
+
+      yahoo_max_pages:
+        description: "Max pages to scrape per keyword"
+        required: false
+        default: "1"
+        type: string
+
+      yahoo_table_name:
+        description: "DynamoDB table name for auction items"
+        required: false
+        default: "YahooAuctionItems"
+        type: string
+
 permissions:
   id-token: write
   contents: read
@@ -124,7 +158,7 @@ jobs:
           echo "S3_BUCKET=$S3_BUCKET" >> "$GITHUB_ENV"
 
       - name: Create S3 Bucket if not exists
-        if: ${{ github.event.inputs.deploy_main_app == 'true' }}
+        if: ${{ github.event.inputs.deploy_main_app == 'true' || github.event.inputs.deploy_scraper == 'true' }}
         run: |
           if ! aws s3api head-bucket --bucket "$S3_BUCKET" 2>/dev/null; then
             aws s3api create-bucket \
@@ -137,13 +171,13 @@ jobs:
           aws s3api put-public-access-block --bucket "$S3_BUCKET" --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
 
       - name: Build and Upload Lambda Code
-        if: ${{ github.event.inputs.deploy_main_app == 'true' }}
+        if: ${{ github.event.inputs.deploy_main_app == 'true' || github.event.inputs.deploy_scraper == 'true' }}
         run: |
           BUILD_DIR="build"
           rm -rf "$BUILD_DIR"
           mkdir -p "$BUILD_DIR"
           pip3 install -r requirements.txt -t "$BUILD_DIR" --platform manylinux2014_aarch64 --only-binary=:all: --python-version 3.12 --quiet
-          cp src/lambda_function.py "$BUILD_DIR/"
+          cp src/*.py "$BUILD_DIR/"
           cd "$BUILD_DIR"
           zip -r9 ../lambda.zip . -q
           cd ..
@@ -164,6 +198,7 @@ jobs:
             "Environment=${{ github.event.inputs.environment }}"
             "DeploySecret=${{ github.event.inputs.deploy_secret }}"
             "DeployMainApp=${{ github.event.inputs.deploy_main_app }}"
+            "DeployScraper=${{ github.event.inputs.deploy_scraper }}"
             "MaxCategoriesPerRun=${{ github.event.inputs.max_categories }}"
             "MaxBrandsPerCategory=${{ github.event.inputs.max_brands }}"
             "MaxModelsPerBrand=${{ github.event.inputs.max_models }}"
@@ -174,6 +209,10 @@ jobs:
             "BrandLimit=${{ github.event.inputs.brand_limit }}"
             "LambdaCodeS3Bucket=$S3_BUCKET"
             "LambdaCodeS3Key=${S3_KEY:-productcatalog/lambda-placeholder.zip}"
+            "YahooAuctionBaseUrl=${{ github.event.inputs.yahoo_base_url }}"
+            "YahooAuctionDefaultParams=${{ github.event.inputs.yahoo_default_params }}"
+            "YahooAuctionMaxPages=${{ github.event.inputs.yahoo_max_pages }}"
+            "YahooAuctionTableName=${{ github.event.inputs.yahoo_table_name }}"
           )
 
           if [ "${{ github.event.inputs.deploy_secret }}" = "true" ] && [ -n "${{ github.event.inputs.api_key }}" ]; then
