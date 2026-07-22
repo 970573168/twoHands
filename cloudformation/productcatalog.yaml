@@ -130,7 +130,7 @@ Parameters:
     MaxValue: 3653
     Description: CloudWatch 日志保留天数
 
-  # ===== NEW: Yahoo Auction 抓取器参数 =====
+  # ============ Yahoo Auction 抓取器参数 ============
   DeployScraper:
     Type: String
     Default: "true"
@@ -173,11 +173,166 @@ Parameters:
     Default: "YahooAuctionItems"
     Description: DynamoDB 表名称前缀
 
+  # ============ Yahoo Auction 自定义搜索参数（可留空）============
+  AuctionParamNew:
+    Type: String
+    Default: ""
+    Description: "新品筛选 (空或1)"
+
+  AuctionParamOffer:
+    Type: String
+    Default: ""
+    Description: "可议价 (空或1)"
+
+  AuctionParamShipping:
+    Type: String
+    Default: ""
+    Description: "配送方式"
+
+  AuctionParamIstatus:
+    Type: String
+    Default: ""
+    Description: "商品状态"
+
+  AuctionParamAbatch:
+    Type: String
+    Default: ""
+    Description: "批次参数"
+
+  AuctionParamLocCd:
+    Type: String
+    Default: ""
+    Description: "地区代码"
+
+  AuctionParamSelect:
+    Type: String
+    Default: ""
+    Description: "select 参数（通常已在 DEFAULT_PARAMS 中）"
+
+  AuctionParamSpec:
+    Type: String
+    Default: ""
+    Description: "规格参数"
+
+  AuctionParamPriceType:
+    Type: String
+    Default: ""
+    Description: "价格类型"
+
+  AuctionParamMin:
+    Type: String
+    Default: ""
+    Description: "最低价格"
+
+  AuctionParamMax:
+    Type: String
+    Default: ""
+    Description: "最高价格"
+
+  AuctionParamCarInspection:
+    Type: String
+    Default: ""
+    Description: "车检参数"
+
+  AuctionParamFixed:
+    Type: String
+    Default: ""
+    Description: "一口价筛选"
+
+  AuctionParamAucminprice:
+    Type: String
+    Default: ""
+    Description: "拍卖最低价格"
+
+  AuctionParamAucmaxprice:
+    Type: String
+    Default: ""
+    Description: "拍卖最高价格"
+
+  AuctionParamAucminBidorbuyPrice:
+    Type: String
+    Default: ""
+    Description: "即决最低价格"
+
+  AuctionParamAucmaxBidorbuyPrice:
+    Type: String
+    Default: ""
+    Description: "即决最高价格"
+
+  AuctionParamLc1:
+    Type: String
+    Default: ""
+    Description: "LC1参数"
+
+  AuctionParamJpypayment:
+    Type: String
+    Default: ""
+    Description: "PayPay等支付方式"
+
+  AuctionParamPoint:
+    Type: String
+    Default: ""
+    Description: "积分参数"
+
+  AuctionParamThumb:
+    Type: String
+    Default: ""
+    Description: "缩略图参数"
+
+  AuctionParamWrappingicon:
+    Type: String
+    Default: ""
+    Description: "包装图标"
+
+  AuctionParamPrivacyDelivery:
+    Type: String
+    Default: ""
+    Description: "隐私配送"
+
+  AuctionParamGiftIcon:
+    Type: String
+    Default: ""
+    Description: "礼品图标"
+
+  AuctionParamCharity:
+    Type: String
+    Default: ""
+    Description: "慈善参数"
+
+  AuctionParamMode:
+    Type: String
+    Default: ""
+    Description: "模式参数"
+
+  AuctionParamN:
+    Type: String
+    Default: "50"
+    Description: "每页数量"
+
+  AuctionParamS1:
+    Type: String
+    Default: ""
+    Description: "排序字段"
+
+  AuctionParamO1:
+    Type: String
+    Default: ""
+    Description: "排序方向 (a/d)"
+
+  AuctionParamMaxSprice:
+    Type: String
+    Default: ""
+    Description: "最高售价"
+
+  AuctionParamType:
+    Type: String
+    Default: ""
+    Description: "类型 (auction/fixed/all)"
+
 Conditions:
   DeploySecretCondition: !Equals [!Ref DeploySecret, "true"]
   DeployMainAppCondition: !Equals [!Ref DeployMainApp, "true"]
   HasApiKey: !Not [!Equals [!Ref ApiKey, ""]]
-  # ===== NEW =====
   DeployScraperCondition: !Equals [!Ref DeployScraper, "true"]
 
 Resources:
@@ -368,7 +523,7 @@ Resources:
           Value: !Ref Environment
 
   # =============================================
-  # ===== NEW: Yahoo Auction 抓取器资源 =====
+  # Yahoo Auction 抓取器资源
   # =============================================
 
   # ---------- DynamoDB 表 ----------
@@ -458,12 +613,46 @@ Resources:
         S3Key: !Ref LambdaCodeS3Key
       Environment:
         Variables:
+          # 基础配置
           BASE_URL: !Ref YahooAuctionBaseUrl
           DEFAULT_PARAMS: !Ref YahooAuctionDefaultParams
           MAX_PAGES: !Ref YahooAuctionMaxPages
           TABLE_NAME: !Sub "${YahooAuctionTableName}-${Environment}"
           REQUEST_TIMEOUT: !Ref YahooAuctionRequestTimeout
           USER_AGENT: !Ref YahooAuctionUserAgent
+          
+          # 自定义搜索参数（所有参数都会传递给 Lambda）
+          AUCTION_PARAM_NEW: !Ref AuctionParamNew
+          AUCTION_PARAM_OFFER: !Ref AuctionParamOffer
+          AUCTION_PARAM_SHIPPING: !Ref AuctionParamShipping
+          AUCTION_PARAM_ISTATUS: !Ref AuctionParamIstatus
+          AUCTION_PARAM_ABATCH: !Ref AuctionParamAbatch
+          AUCTION_PARAM_LOC_CD: !Ref AuctionParamLocCd
+          AUCTION_PARAM_SELECT: !Ref AuctionParamSelect
+          AUCTION_PARAM_SPEC: !Ref AuctionParamSpec
+          AUCTION_PARAM_PRICE_TYPE: !Ref AuctionParamPriceType
+          AUCTION_PARAM_MIN: !Ref AuctionParamMin
+          AUCTION_PARAM_MAX: !Ref AuctionParamMax
+          AUCTION_PARAM_CAR_INSPECTION: !Ref AuctionParamCarInspection
+          AUCTION_PARAM_FIXED: !Ref AuctionParamFixed
+          AUCTION_PARAM_AUCMINPRICE: !Ref AuctionParamAucminprice
+          AUCTION_PARAM_AUCMAXPRICE: !Ref AuctionParamAucmaxprice
+          AUCTION_PARAM_AUCMIN_BIDORBUY_PRICE: !Ref AuctionParamAucminBidorbuyPrice
+          AUCTION_PARAM_AUCMAX_BIDORBUY_PRICE: !Ref AuctionParamAucmaxBidorbuyPrice
+          AUCTION_PARAM_LC1: !Ref AuctionParamLc1
+          AUCTION_PARAM_JPYPAYMENT: !Ref AuctionParamJpypayment
+          AUCTION_PARAM_POINT: !Ref AuctionParamPoint
+          AUCTION_PARAM_THUMB: !Ref AuctionParamThumb
+          AUCTION_PARAM_WRAPPINGICON: !Ref AuctionParamWrappingicon
+          AUCTION_PARAM_PRIVACY_DELIVERY: !Ref AuctionParamPrivacyDelivery
+          AUCTION_PARAM_GIFT_ICON: !Ref AuctionParamGiftIcon
+          AUCTION_PARAM_CHARITY: !Ref AuctionParamCharity
+          AUCTION_PARAM_MODE: !Ref AuctionParamMode
+          AUCTION_PARAM_N: !Ref AuctionParamN
+          AUCTION_PARAM_S1: !Ref AuctionParamS1
+          AUCTION_PARAM_O1: !Ref AuctionParamO1
+          AUCTION_PARAM_MAX_SPRICE: !Ref AuctionParamMaxSprice
+          AUCTION_PARAM_TYPE: !Ref AuctionParamType
       Tags:
         - Key: Application
           Value: YahooAuctionScraper
@@ -530,7 +719,7 @@ Outputs:
     Export:
       Name: !Sub "${AWS::StackName}-LambdaArn"
 
-  # ===== NEW: Yahoo Auction 抓取器输出 =====
+  # ============ Yahoo Auction 抓取器输出 ============
   YahooAuctionTableName:
     Description: Yahoo Auction items DynamoDB table name
     Condition: DeployScraperCondition
@@ -544,3 +733,42 @@ Outputs:
     Value: !Ref YahooAuctionScraper
     Export:
       Name: !Sub "${AWS::StackName}-YahooAuctionScraper"
+
+  # ============ Yahoo Auction 自定义参数输出 ============
+  YahooAuctionCustomParams:
+    Description: JSON string of all custom auction parameters
+    Condition: DeployScraperCondition
+    Value: !Sub |
+      {
+        "new": "${AuctionParamNew}",
+        "offer": "${AuctionParamOffer}",
+        "shipping": "${AuctionParamShipping}",
+        "istatus": "${AuctionParamIstatus}",
+        "abatch": "${AuctionParamAbatch}",
+        "loc_cd": "${AuctionParamLocCd}",
+        "select": "${AuctionParamSelect}",
+        "spec": "${AuctionParamSpec}",
+        "price_type": "${AuctionParamPriceType}",
+        "min": "${AuctionParamMin}",
+        "max": "${AuctionParamMax}",
+        "car_inspection": "${AuctionParamCarInspection}",
+        "fixed": "${AuctionParamFixed}",
+        "aucminprice": "${AuctionParamAucminprice}",
+        "aucmaxprice": "${AuctionParamAucmaxprice}",
+        "aucmin_bidorbuy_price": "${AuctionParamAucminBidorbuyPrice}",
+        "aucmax_bidorbuy_price": "${AuctionParamAucmaxBidorbuyPrice}",
+        "lc1": "${AuctionParamLc1}",
+        "jpypayment": "${AuctionParamJpypayment}",
+        "point": "${AuctionParamPoint}",
+        "thumb": "${AuctionParamThumb}",
+        "wrappingicon": "${AuctionParamWrappingicon}",
+        "privacy_delivery": "${AuctionParamPrivacyDelivery}",
+        "gift_icon": "${AuctionParamGiftIcon}",
+        "charity": "${AuctionParamCharity}",
+        "mode": "${AuctionParamMode}",
+        "n": "${AuctionParamN}",
+        "s1": "${AuctionParamS1}",
+        "o1": "${AuctionParamO1}",
+        "max_sprice": "${AuctionParamMaxSprice}",
+        "type": "${AuctionParamType}"
+      }
