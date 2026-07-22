@@ -1,25 +1,27 @@
-#!/bin/bash
-set -e
+ #!/bin/bash
+ set -e
 
-# 构建 Lambda 部署包
-BUILD_DIR="build"
-LAMBDA_DIR="src"
-PACKAGE_FILE="lambda.zip"
+ # 构建 Lambda 部署包
+ BUILD_DIR="build"
+ LAMBDA_DIR="src"
+ PACKAGE_FILE="lambda.zip"
 
-echo "🧹 Cleaning build directory..."
-rm -rf "$BUILD_DIR"
-mkdir -p "$BUILD_DIR"
+ echo "🧹 Cleaning build directory..."
+ rm -rf "$BUILD_DIR"
+ mkdir -p "$BUILD_DIR"
 
-echo "📦 Installing dependencies..."
-pip install -r requirements.txt -t "$BUILD_DIR" --platform manylinux2014_aarch64 --only-binary=:all: --python-version 3.12
+ echo "📦 Installing dependencies..."
+ pip install -r requirements.txt -t "$BUILD_DIR" --platform manylinux2014_aarch64 --only-binary=:all: --python-version 3.12
 
-echo "📋 Copying Lambda function..."
-cp "$LAMBDA_DIR/lambda_function.py" "$BUILD_DIR/"
+ echo "📋 Copying Lambda functions..."
+-cp "$LAMBDA_DIR/lambda_function.py" "$BUILD_DIR/"
++# 复制所有 .py 文件
++cp "$LAMBDA_DIR"/*.py "$BUILD_DIR/"
 
-echo "🗜️ Creating deployment package..."
-cd "$BUILD_DIR"
-zip -r9 "../$PACKAGE_FILE" .
-cd ..
+ echo "🗜️ Creating deployment package..."
+ cd "$BUILD_DIR"
+ zip -r9 "../$PACKAGE_FILE" .
+ cd ..
 
-echo "✅ Build complete: $PACKAGE_FILE"
-echo "📊 Package size: $(du -h $PACKAGE_FILE | cut -f1)"
+ echo "✅ Build complete: $PACKAGE_FILE"
+ echo "📊 Package size: $(du -h $PACKAGE_FILE | cut -f1)"
