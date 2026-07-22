@@ -14,9 +14,9 @@
  pip install -r requirements.txt -t "$BUILD_DIR" --platform manylinux2014_aarch64 --only-binary=:all: --python-version 3.12
 
  echo "📋 Copying Lambda functions..."
--cp "$LAMBDA_DIR/lambda_function.py" "$BUILD_DIR/"
-+# 复制所有 .py 文件
-+cp "$LAMBDA_DIR"/*.py "$BUILD_DIR/"
+ cp "$LAMBDA_DIR/lambda_function.py" "$BUILD_DIR/"
+ # 复制所有 .py 文件
+ cp "$LAMBDA_DIR"/*.py "$BUILD_DIR/"
 
  echo "🗜️ Creating deployment package..."
  cd "$BUILD_DIR"
