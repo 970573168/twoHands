@@ -130,10 +130,55 @@ Parameters:
     MaxValue: 3653
     Description: CloudWatch 日志保留天数
 
+  # ===== NEW: Yahoo Auction 抓取器参数 =====
+  DeployScraper:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: 是否部署 Yahoo Auction 抓取器
+
+  YahooAuctionBaseUrl:
+    Type: String
+    Default: "https://auctions.yahoo.co.jp/closedsearch/closedsearch"
+    Description: Yahoo 闭拍搜索基础 URL
+
+  YahooAuctionDefaultParams:
+    Type: String
+    Default: "n=50&select=6&mode=3&dest_pref_code=23"
+    Description: 默认查询参数（不含 p 和 b）
+
+  YahooAuctionMaxPages:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+    Description: 每次抓取的最大页数
+
+  YahooAuctionRequestTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 5
+    MaxValue: 120
+    Description: HTTP 请求超时（秒）
+
+  YahooAuctionUserAgent:
+    Type: String
+    Default: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    Description: 请求时使用的 User-Agent
+
+  YahooAuctionTableName:
+    Type: String
+    Default: "YahooAuctionItems"
+    Description: DynamoDB 表名称前缀
+
 Conditions:
   DeploySecretCondition: !Equals [!Ref DeploySecret, "true"]
   DeployMainAppCondition: !Equals [!Ref DeployMainApp, "true"]
   HasApiKey: !Not [!Equals [!Ref ApiKey, ""]]
+  # ===== NEW =====
+  DeployScraperCondition: !Equals [!Ref DeployScraper, "true"]
 
 Resources:
   # ============================================
@@ -322,6 +367,109 @@ Resources:
         - Key: Environment
           Value: !Ref Environment
 
+  # =============================================
+  # ===== NEW: Yahoo Auction 抓取器资源 =====
+  # =============================================
+
+  # ---------- DynamoDB 表 ----------
+  YahooAuctionItemsTable:
+    Type: AWS::DynamoDB::Table
+    Condition: DeployScraperCondition
+    Properties:
+      TableName: !Sub "${YahooAuctionTableName}-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: auctionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: auctionId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Application
+          Value: YahooAuctionScraper
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ---------- CloudWatch Logs ----------
+  YahooAuctionScraperLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: DeployScraperCondition
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/YahooAuctionScraper-${Environment}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ---------- Lambda 执行角色 ----------
+  YahooAuctionScraperRole:
+    Type: AWS::IAM::Role
+    Condition: DeployScraperCondition
+    Properties:
+      RoleName: !Sub "YahooAuctionScraper-Role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: YahooAuctionScraperPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: DynamoDBAccess
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:BatchWriteItem
+                Resource: !GetAtt YahooAuctionItemsTable.Arn
+              - Sid: WriteLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${YahooAuctionScraperLogGroup.Arn}:*"
+
+  # ---------- Lambda 函数 ----------
+  YahooAuctionScraper:
+    Type: AWS::Lambda::Function
+    Condition: DeployScraperCondition
+    DependsOn:
+      - YahooAuctionScraperLogGroup
+      - YahooAuctionScraperRole
+    Properties:
+      FunctionName: !Sub "YahooAuctionScraper-${Environment}"
+      Description: "Yahoo Auction closed search scraper"
+      Runtime: python3.12
+      Architectures:
+        - arm64
+      Handler: yahoo_auction_scraper.lambda_handler
+      Timeout: 60
+      MemorySize: 256
+      Role: !GetAtt YahooAuctionScraperRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: !Ref LambdaCodeS3Key
+      Environment:
+        Variables:
+          BASE_URL: !Ref YahooAuctionBaseUrl
+          DEFAULT_PARAMS: !Ref YahooAuctionDefaultParams
+          MAX_PAGES: !Ref YahooAuctionMaxPages
+          TABLE_NAME: !Sub "${YahooAuctionTableName}-${Environment}"
+          REQUEST_TIMEOUT: !Ref YahooAuctionRequestTimeout
+          USER_AGENT: !Ref YahooAuctionUserAgent
+      Tags:
+        - Key: Application
+          Value: YahooAuctionScraper
+        - Key: Environment
+          Value: !Ref Environment
+
 Outputs:
   # ============ S3 输出 ============
   LambdaCodeBucketName:
@@ -381,3 +529,18 @@ Outputs:
     Value: !GetAtt ProductCatalogDiscovery.Arn
     Export:
       Name: !Sub "${AWS::StackName}-LambdaArn"
+
+  # ===== NEW: Yahoo Auction 抓取器输出 =====
+  YahooAuctionTableName:
+    Description: Yahoo Auction items DynamoDB table name
+    Condition: DeployScraperCondition
+    Value: !Ref YahooAuctionItemsTable
+    Export:
+      Name: !Sub "${AWS::StackName}-YahooAuctionTable"
+
+  YahooAuctionScraperFunctionName:
+    Description: Yahoo Auction scraper Lambda function name
+    Condition: DeployScraperCondition
+    Value: !Ref YahooAuctionScraper
+    Export:
+      Name: !Sub "${AWS::StackName}-YahooAuctionScraper"
