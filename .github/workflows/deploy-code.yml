@@ -63,30 +63,36 @@ jobs:
           
           echo "s3_key=$S3_KEY" >> $GITHUB_ENV
 
-      - name: Update Lambda Function
+      - name: Update ProductCatalog Discovery Function
         run: |
-          STACK_NAME="productcatalog-app-${{ github.event.inputs.environment }}"
           FUNCTION_NAME="ProductCatalog-Discovery-${{ github.event.inputs.environment }}"
           S3_BUCKET="${{ github.event.inputs.s3_bucket }}"
           S3_KEY="${{ env.s3_key }}"
           
-          echo "🔄 Updating Lambda function code..."
-          echo "Function: $FUNCTION_NAME"
-          echo "S3: s3://$S3_BUCKET/$S3_KEY"
-          
+          echo "🔄 Updating ProductCatalog Lambda function..."
           aws lambda update-function-code \
             --function-name "$FUNCTION_NAME" \
             --s3-bucket "$S3_BUCKET" \
             --s3-key "$S3_KEY"
           
-          echo "✅ Lambda function updated successfully"
+          aws lambda wait function-updated --function-name "$FUNCTION_NAME"
+
+      - name: Update Yahoo Auction Scraper Function
+        run: |
+          FUNCTION_NAME="YahooAuctionScraper-${{ github.event.inputs.environment }}"
+          S3_BUCKET="${{ github.event.inputs.s3_bucket }}"
+          S3_KEY="${{ env.s3_key }}"
           
-          # 等待 Lambda 更新完成
-          echo "⏳ Waiting for Lambda update to complete..."
-          aws lambda wait function-updated \
-            --function-name "$FUNCTION_NAME"
+          echo "🔄 Updating YahooAuctionScraper Lambda function..."
+          aws lambda update-function-code \
+            --function-name "$FUNCTION_NAME" \
+            --s3-bucket "$S3_BUCKET" \
+            --s3-key "$S3_KEY" || echo "⚠️ Function may not exist yet; skipping update."
           
-          echo "✅ Lambda update confirmed"
+          # 若函数存在则等待更新完成
+          if aws lambda get-function --function-name "$FUNCTION_NAME" >/dev/null 2>&1; then
+            aws lambda wait function-updated --function-name "$FUNCTION_NAME"
+          fi
 
       - name: Show Deployment Info
         if: success()
@@ -94,6 +100,7 @@ jobs:
           echo "=========================================="
           echo "✅ Deployment completed successfully!"
           echo "📦 Package: s3://${{ github.event.inputs.s3_bucket }}/${{ env.s3_key }}"
-          echo "⚡ Function: ProductCatalog-Discovery-${{ github.event.inputs.environment }}"
-          echo "🏗️ Stack: productcatalog-app-${{ github.event.inputs.environment }}"
+          echo "⚡ Functions:"
+          echo "   - ProductCatalog-Discovery-${{ github.event.inputs.environment }}"
+          echo "   - YahooAuctionScraper-${{ github.event.inputs.environment }}"
           echo "=========================================="
