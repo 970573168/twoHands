@@ -151,7 +151,7 @@ Parameters:
 
   YahooAuctionDefaultParams:
     Type: String
-    Default: "n=50&select=6&mode=3&dest_pref_code=23"
+    Default: "n=50&select=6&mode=3&dest_pref_code=23&s1=end&o1=a"
     Description: 默认查询参数（不含 p 和 b）
 
   YahooAuctionMaxPages:
