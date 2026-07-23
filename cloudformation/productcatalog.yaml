@@ -674,6 +674,46 @@ Resources:
         - Key: Environment
           Value: !Ref Environment
 
+
+  # ============ 商品分析工作流 Lambda ============
+  AuctionAnalyzerFunction:
+    Type: AWS::Lambda::Function
+    Condition: DeployScraperCondition
+    DependsOn:
+      - YahooAuctionScraperLogGroup
+      - YahooAuctionScraperRole
+    Properties:
+      FunctionName: !Sub "YahooAuctionAnalyzer-${Environment}"
+      Description: "Yahoo Auction商品分析工作流"
+      Runtime: python3.12
+      Architectures:
+        - arm64
+      Handler: auction_analyzer.lambda_handler
+      Timeout: 900
+      MemorySize: 1024
+      Role: !GetAtt YahooAuctionScraperRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: !Ref LambdaCodeS3Key
+      Environment:
+        Variables:
+          TABLE_NAME_ACTIVE: !Sub "${YahooAuctionActiveTableName}-${Environment}"
+          TABLE_NAME_CLOSED: !Sub "${YahooAuctionClosedTableName}-${Environment}"
+          AI_API_URL: !Ref ApiUrl
+          AI_MODEL: !Ref AiModel
+          DEFAULT_SEARCH_COUNT: "3"
+          MAX_CLOSED_PER_MODEL: "50"
+          REQUEST_INTERVAL: "1.0"
+          INCLUDE_PAYPAY: "false"
+          EXPECTED_SELLING_FEE_RATE: "0.10"
+          DEFAULT_SHIPPING_COST: "1500"
+          MIN_COMPARABLE_COUNT: "3"
+      Tags:
+        - Key: Application
+          Value: YahooAuctionAnalyzer
+        - Key: Environment
+          Value: !Ref Environment
+
 Outputs:
   # ============ S3 输出 ============
   LambdaCodeBucketName:
