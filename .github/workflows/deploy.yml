@@ -146,14 +146,14 @@ jobs:
           STACK_NAME="productcatalog-app-${{ github.event.inputs.environment }}"
           
           PARAMS=(
-            "ParameterKey=Environment,ParameterValue=${{ github.event.inputs.environment }}"
-            "ParameterKey=DeploySecret,ParameterValue=${{ github.event.inputs.deploy_secret }}"
-            "ParameterKey=DeployMainApp,ParameterValue=${{ github.event.inputs.deploy_main_app }}"
-            "ParameterKey=DeployScraper,ParameterValue=${{ github.event.inputs.deploy_scraper }}"
-            "ParameterKey=LambdaCodeS3Bucket,ParameterValue=$S3_BUCKET"
-            "ParameterKey=LambdaCodeS3Key,ParameterValue=${S3_KEY:-productcatalog/lambda.zip}"
-            "ParameterKey=YahooAuctionMaxPages,ParameterValue=${{ github.event.inputs.max_pages }}"
-            "ParameterKey=LogRetentionDays,ParameterValue=${{ github.event.inputs.log_retention }}"
+            "Environment=${{ github.event.inputs.environment }}"
+            "DeploySecret=${{ github.event.inputs.deploy_secret }}"
+            "DeployMainApp=${{ github.event.inputs.deploy_main_app }}"
+            "DeployScraper=${{ github.event.inputs.deploy_scraper }}"
+            "LambdaCodeS3Bucket=$S3_BUCKET"
+            "LambdaCodeS3Key=${S3_KEY:-productcatalog/lambda.zip}"
+            "YahooAuctionMaxPages=${{ github.event.inputs.max_pages }}"
+            "LogRetentionDays=${{ github.event.inputs.log_retention }}"
           )
           
           [ "${{ github.event.inputs.deploy_secret }}" = "true" ] && [ -n "${{ github.event.inputs.api_key }}" ] && \
