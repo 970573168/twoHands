@@ -336,9 +336,6 @@ def parse_item(li, include_paypay=True):
         logger.warning("Empty href in auction link")
         return None
     
-    # 打印实际URL用于调试
-    logger.info(f"Item URL: {href}")
-    
     # 提取商品 ID 和类型
     # 优先从 data-auction-id 属性获取
     data_id = auction_link.get('data-auction-id', '')
@@ -441,70 +438,112 @@ def parse_item(li, include_paypay=True):
             except ValueError:
                 pass
 
-    # ---- 4. 结束时间 ----
+    # ---- 4. 结束时间（修改重点）----
     end_time = None
-    time_text = None
-
-    # 策略1：查找包含"終了"的元素
-    ended_elem = li.find(lambda tag: tag.name in ["span", "p"] and "終了" in tag.get_text())
-    if ended_elem:
-        time_text = ended_elem.get_text(strip=True)
-        logger.info(f"Found end time from element: {time_text}")
-    else:
-        # 策略2：全局正则搜索时间格式
+    
+    # 策略1：从 data-auction-endtime 属性获取（Unix 时间戳格式）
+    # 需要在 Product 容器上查找
+    product_div = li.find_parent('div', class_='Product')
+    if not product_div:
+        # 如果是 li 元素本身或者父级
+        product_div = li
+    
+    endtime_elem = product_div.select_one('[data-auction-endtime]')
+    if endtime_elem:
+        endtime_value = endtime_elem.get('data-auction-endtime', '')
+        if endtime_value:
+            try:
+                # 转换为整数时间戳
+                timestamp = int(endtime_value)
+                # 转换为 datetime 对象
+                dt = datetime.fromtimestamp(timestamp, tz=timezone(timedelta(hours=9)))
+                end_time = dt.isoformat()
+                logger.info(f"End time from data-auction-endtime: {end_time} (timestamp: {timestamp})")
+            except (ValueError, OSError) as e:
+                logger.warning(f"Failed to parse data-auction-endtime value: {endtime_value} - {e}")
+    
+    # 策略2：如果上面没找到，尝试查找包含"終了"的元素
+    if not end_time:
+        ended_elem = li.find(lambda tag: tag.name in ["span", "p"] and "終了" in tag.get_text())
+        if ended_elem:
+            time_text = ended_elem.get_text(strip=True)
+            end_time = parse_end_time(time_text)
+            if end_time:
+                logger.info(f"End time from ended element: {end_time}")
+    
+    # 策略3：全局正则搜索时间格式
+    if not end_time:
         all_text = li.get_text(separator=" ", strip=True)
         m = re.search(r"\d{1,2}/\d{1,2}\s+\d{1,2}:\d{2}", all_text)
         if m:
             time_text = m.group()
-            logger.info(f"Extracted time by regex: {time_text}")
-
-    if time_text:
-        end_time = parse_end_time(time_text)
-        if end_time:
-            logger.info(f"Parsed end time: {end_time}")
-        else:
-            logger.info(f"Failed to parse end time from: {time_text}")
-    else:
+            end_time = parse_end_time(time_text)
+            if end_time:
+                logger.info(f"End time from regex: {end_time}")
+    
+    # 策略4：从 data-timeleft 计算结束时间（不如直接用 data-auction-endtime）
+    if not end_time:
+        timeleft_elem = li.select_one('[data-timeleft]')
+        if timeleft_elem:
+            timeleft = timeleft_elem.get('data-timeleft', '')
+            if timeleft:
+                try:
+                    seconds_left = int(timeleft)
+                    now = datetime.now(timezone(timedelta(hours=9)))
+                    end_time = (now + timedelta(seconds=seconds_left)).isoformat()
+                    logger.info(f"End time calculated from data-timeleft: {end_time}")
+                except ValueError:
+                    pass
+    
+    if not end_time:
         logger.info(f"No end time found for item {item_id} (type: {item_type})")
 
     # ---- 5. 卖家 ID ----
     seller_id = None
     
-    seller_patterns = [
-        re.compile(r"/user/"),
-        re.compile(r"/seller/"),
-        re.compile(r"userID=", re.IGNORECASE),
-        re.compile(r"/show/rating", re.IGNORECASE)
-    ]
+    # 优先从 data-auction-auc-seller-id 获取
+    seller_id_elem = product_div.select_one('[data-auction-auc-seller-id]')
+    if seller_id_elem:
+        seller_id = seller_id_elem.get('data-auction-auc-seller-id', '')
+        if seller_id:
+            logger.info(f"Seller ID from data-auction-auc-seller-id: {seller_id}")
     
-    seller_link = None
-    
-    for pattern in seller_patterns:
-        seller_link = li.find("a", href=pattern)
-        if seller_link:
-            break
-    
-    if seller_link:
-        seller_href = seller_link.get("href", "")
-        
-        patterns = [
-            r"/user/([^/?#]+)",
-            r"/seller/([^/?#]+)",
-            r"[?&]userID=([^&#]+)"
+    if not seller_id:
+        seller_patterns = [
+            re.compile(r"/user/"),
+            re.compile(r"/seller/"),
+            re.compile(r"userID=", re.IGNORECASE),
+            re.compile(r"/show/rating", re.IGNORECASE)
         ]
         
-        for pattern in patterns:
-            match = re.search(pattern, seller_href, re.IGNORECASE)
-            if match:
-                seller_id = match.group(1)
+        seller_link = None
+        
+        for pattern in seller_patterns:
+            seller_link = li.find("a", href=pattern)
+            if seller_link:
                 break
         
-        if seller_id:
-            logger.info(f"Seller ID: {seller_id}")
+        if seller_link:
+            seller_href = seller_link.get("href", "")
+            
+            patterns = [
+                r"/user/([^/?#]+)",
+                r"/seller/([^/?#]+)",
+                r"[?&]userID=([^&#]+)"
+            ]
+            
+            for pattern in patterns:
+                match = re.search(pattern, seller_href, re.IGNORECASE)
+                if match:
+                    seller_id = match.group(1)
+                    break
+            
+            if seller_id:
+                logger.info(f"Seller ID from link: {seller_id}")
+            else:
+                logger.info(f"Seller link found but ID could not be parsed: {seller_href}")
         else:
-            logger.info(f"Seller link found but ID could not be parsed: {seller_href}")
-    else:
-        logger.info(f"Seller not found for item {item_id} (type: {item_type})")
+            logger.info(f"Seller not found for item {item_id} (type: {item_type})")
 
     # ---- 6. 好评率 ----
     rating = None
