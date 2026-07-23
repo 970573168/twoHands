@@ -15,9 +15,8 @@ logger.setLevel(logging.INFO)
 # ============ 环境变量 ============
 CLOSED_BASE_URL = os.getenv("CLOSED_BASE_URL", "https://auctions.yahoo.co.jp/closedsearch/closedsearch")
 ACTIVE_BASE_URL = os.getenv("ACTIVE_BASE_URL", "https://auctions.yahoo.co.jp/search/search")
-# 修改：根据搜索类型使用不同的默认参数
-DEFAULT_PARAMS_CLOSED = os.getenv("DEFAULT_PARAMS_CLOSED", "is_postage_mode=1&dest_pref_code=23&n=60&s1=end&o1=d&mode=3&isdr=0")  # o1=d 降序
-DEFAULT_PARAMS_ACTIVE = os.getenv("DEFAULT_PARAMS_ACTIVE", "is_postage_mode=1&dest_pref_code=23&n=60&s1=end&o1=a&mode=3&isdr=0")   # o1=a 升序
+DEFAULT_PARAMS_CLOSED = os.getenv("DEFAULT_PARAMS_CLOSED", "is_postage_mode=1&dest_pref_code=23&n=60&s1=end&o1=d&mode=3&isdr=0")
+DEFAULT_PARAMS_ACTIVE = os.getenv("DEFAULT_PARAMS_ACTIVE", "is_postage_mode=1&dest_pref_code=23&n=60&s1=end&o1=a&mode=3&isdr=0")
 MAX_PAGES = int(os.getenv("MAX_PAGES", "1"))
 TABLE_NAME_CLOSED = os.getenv("TABLE_NAME_CLOSED", "YahooAuctionItems")
 TABLE_NAME_ACTIVE = os.getenv("TABLE_NAME_ACTIVE", "YahooAuctionActiveItems")
@@ -286,6 +285,44 @@ def find_product_items_in_container(container, search_type, include_paypay):
     return product_items
 
 
+def parse_shipping_info(li):
+    """
+    解析运费信息
+    返回格式：{"shippingFee": 190, "shippingText": "＋送料190円"}
+    """
+    shipping = {
+        "shippingFee": None,  # 运费金额（数字），None表示未知
+        "shippingText": None  # 运费原始文本
+    }
+    
+    # 查找 Product__postage 元素
+    postage_elem = li.select_one('.Product__postage')
+    if postage_elem:
+        shipping_text = postage_elem.get_text(strip=True)
+        shipping["shippingText"] = shipping_text
+        logger.info(f"Found shipping text: {shipping_text}")
+        
+        # 尝试提取数字金额
+        # 格式1: "＋送料190円"
+        match = re.search(r'送料(\d[\d,]*)円', shipping_text)
+        if match:
+            try:
+                shipping["shippingFee"] = int(match.group(1).replace(',', ''))
+                logger.info(f"Shipping fee: {shipping['shippingFee']}円")
+            except ValueError:
+                pass
+        elif '無料' in shipping_text or '送料無料' in shipping_text:
+            shipping["shippingFee"] = 0
+            logger.info("Free shipping")
+        elif '未定' in shipping_text:
+            shipping["shippingFee"] = None
+            logger.info("Shipping fee undetermined")
+    else:
+        logger.info("No shipping info element found")
+    
+    return shipping
+
+
 def parse_item(li, include_paypay=True):
     """解析单个商品列表项，提取所有信息"""
     # ---- 1. 商品链接 & 标题 & ID ----
@@ -433,7 +470,10 @@ def parse_item(li, include_paypay=True):
     if not price_found:
         logger.info(f"Price not found for item {item_id} (type: {item_type})")
 
-    # ---- 3. 入札数（仅拍卖） ----
+    # ---- 3. 运费信息 ----
+    shipping = parse_shipping_info(li)
+
+    # ---- 4. 入札数（仅拍卖） ----
     bid_count = 0
     if item_type == "auction":
         bid_link = li.find("a", href=re.compile(r"bid_hist"))
@@ -445,7 +485,7 @@ def parse_item(li, include_paypay=True):
             except ValueError:
                 pass
 
-    # ---- 4. 结束时间（修改重点）----
+    # ---- 5. 结束时间 ----
     end_time = None
     
     # 策略1：从 data-auction-endtime 属性获取（Unix 时间戳格式）
@@ -488,7 +528,7 @@ def parse_item(li, include_paypay=True):
             if end_time:
                 logger.info(f"End time from regex: {end_time}")
     
-    # 策略4：从 data-timeleft 计算结束时间（不如直接用 data-auction-endtime）
+    # 策略4：从 data-timeleft 计算结束时间
     if not end_time:
         timeleft_elem = li.select_one('[data-timeleft]')
         if timeleft_elem:
@@ -505,7 +545,7 @@ def parse_item(li, include_paypay=True):
     if not end_time:
         logger.info(f"No end time found for item {item_id} (type: {item_type})")
 
-    # ---- 5. 卖家 ID ----
+    # ---- 6. 卖家 ID ----
     seller_id = None
     
     # 优先从 data-auction-auc-seller-id 获取
@@ -552,7 +592,7 @@ def parse_item(li, include_paypay=True):
         else:
             logger.info(f"Seller not found for item {item_id} (type: {item_type})")
 
-    # ---- 6. 好评率 ----
+    # ---- 7. 好评率 ----
     rating = None
     
     # 优先查找 Product__ratingValue
@@ -589,7 +629,7 @@ def parse_item(li, include_paypay=True):
     if not rating:
         logger.info(f"Rating not found for item {item_id} (type: {item_type})")
 
-    # ---- 7. 发货地 ----
+    # ---- 8. 发货地 ----
     prefecture = None
     for p in li.find_all("p"):
         txt = p.get_text(strip=True)
@@ -601,7 +641,7 @@ def parse_item(li, include_paypay=True):
     if not prefecture:
         logger.info(f"Prefecture not found for item {item_id} (type: {item_type})")
 
-    # ---- 8. 缩略图 URL（可选）----
+    # ---- 9. 缩略图 URL（可选）----
     thumbnail_url = None
     
     # 优先从 data-auction-img 属性获取
@@ -617,12 +657,14 @@ def parse_item(li, include_paypay=True):
             if thumbnail_url:
                 logger.info(f"Thumbnail URL found from img tag")
 
-    # ---- 9. 构建返回对象 ----
+    # ---- 10. 构建返回对象 ----
     item = {
         "itemId": item_id,
         "itemType": item_type,
         "title": title,
         "price": price,
+        "shippingFee": shipping["shippingFee"],
+        "shippingText": shipping["shippingText"],
         "bidCount": bid_count,
         "endTime": end_time,
         "sellerId": seller_id,
@@ -701,6 +743,8 @@ def save_items(items, table):
                     "itemType": item.get("itemType", "unknown"),
                     "title": item.get("title", ""),
                     "price": item.get("price", 0),
+                    "shippingFee": item.get("shippingFee"),
+                    "shippingText": item.get("shippingText", ""),
                     "bidCount": item.get("bidCount", 0),
                     "endTime": item.get("endTime") or "unknown",
                     "sellerId": item.get("sellerId") or "unknown",
