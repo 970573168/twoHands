@@ -293,16 +293,32 @@ def parse_item(li, include_paypay=True):
     else:
         link_pattern = re.compile(r"/auction/")
 
-    # 优先选择 p 标签内的商品链接
-    for p in li.find_all("p"):
-        a = p.find("a", href=link_pattern)
-        if a:
-            auction_link = a
-            if DEBUG_LOG_HTML:
-                logger.info(f"Found auction link in p tag: {a.get('href', '')}")
-            break
+    # 优先使用CSS选择器精确定位标题链接
+    title_link = li.select_one('.Product__titleLink')
+    if title_link:
+        auction_link = title_link
+        href = title_link.get('href', '')
+        if DEBUG_LOG_HTML:
+            logger.info(f"Found title link via Product__titleLink: {href}")
+    else:
+        # 回退：尝试找 h3 中的链接
+        h3 = li.find('h3', class_='Product__title')
+        if h3:
+            auction_link = h3.find('a', href=link_pattern)
+            if auction_link and DEBUG_LOG_HTML:
+                logger.info(f"Found title link via h3.Product__title: {auction_link.get('href', '')}")
+        
+        # 再回退：原有的 p 标签查找逻辑
+        if not auction_link:
+            for p in li.find_all("p"):
+                a = p.find("a", href=link_pattern)
+                if a:
+                    auction_link = a
+                    if DEBUG_LOG_HTML:
+                        logger.info(f"Found auction link in p tag: {a.get('href', '')}")
+                    break
 
-    # 回退：查找任何 a 标签
+    # 最终回退：查找任何 a 标签
     if not auction_link:
         auction_link = li.find("a", href=link_pattern)
         if auction_link and DEBUG_LOG_HTML:
@@ -320,28 +336,45 @@ def parse_item(li, include_paypay=True):
         logger.warning("Empty href in auction link")
         return None
     
+    # 打印实际URL用于调试
+    logger.info(f"Item URL: {href}")
+    
     # 提取商品 ID 和类型
-    m = re.search(r"/auction/([a-z0-9]+)", href)
-    if m:
-        item_id = m.group(1)
-        item_type = "auction"
-        logger.info(f"Found auction item: {item_id}")
+    # 优先从 data-auction-id 属性获取
+    data_id = auction_link.get('data-auction-id', '')
+    if data_id:
+        item_id = data_id
+        # 根据ID前缀判断类型（PayPay商品ID以z开头）
+        if item_id.startswith('z'):
+            item_type = "paypay"
+        else:
+            item_type = "auction"
+        logger.info(f"Found item via data-auction-id: {item_id} (type: {item_type})")
     else:
-        m = re.search(r"/item/([a-z0-9]+)", href)
+        # 回退：从URL中提取
+        m = re.search(r"/auction/([a-z0-9]+)", href)
         if m:
             item_id = m.group(1)
-            item_type = "paypay"
-            logger.info(f"Found PayPay item: {item_id}")
+            item_type = "auction"
+            logger.info(f"Found auction item: {item_id}")
+        else:
+            m = re.search(r"/item/([a-z0-9]+)", href)
+            if m:
+                item_id = m.group(1)
+                item_type = "paypay"
+                logger.info(f"Found PayPay item: {item_id}")
     
     if not item_id:
         logger.warning(f"Could not extract item ID from href: {href}")
         return None
 
-    # 提取标题
-    title_text = auction_link.get_text(strip=True)
-    if title_text:
-        title = title_text
-    else:
+    # 提取标题 - 优先使用 data-auction-title 属性
+    title = auction_link.get('data-auction-title', '').strip()
+    if not title:
+        # 回退：使用链接文本
+        title = auction_link.get_text(strip=True)
+    if not title:
+        # 最后回退：使用 title 属性
         title = auction_link.get("title", "").strip()
 
     if not title:
@@ -353,20 +386,31 @@ def parse_item(li, include_paypay=True):
     price = 0
     price_found = False
     
-    # 尝试找"落札価格"或"現在価格"或"価格"
-    price_container = li.find(string=re.compile(r"落札価格|現在価格|価格"))
-    if price_container:
-        parent = price_container.parent
-        if parent:
-            whole_text = parent.get_text(separator=" ", strip=True)
-            nums = re.findall(r"[\d,]+", whole_text)
-            if nums:
-                try:
-                    price = int(nums[-1].replace(",", ""))
-                    price_found = True
-                    logger.info(f"Price found from label: {price}")
-                except ValueError:
-                    pass
+    # 优先从 data-auction-price 属性获取
+    data_price = auction_link.get('data-auction-price', '')
+    if data_price:
+        try:
+            price = int(data_price)
+            price_found = True
+            logger.info(f"Price found from data-auction-price: {price}")
+        except ValueError:
+            pass
+    
+    # 回退：尝试找"落札価格"或"現在価格"或"価格"标签
+    if not price_found:
+        price_container = li.find(string=re.compile(r"落札価格|現在価格|価格"))
+        if price_container:
+            parent = price_container.parent
+            if parent:
+                whole_text = parent.get_text(separator=" ", strip=True)
+                nums = re.findall(r"[\d,]+", whole_text)
+                if nums:
+                    try:
+                        price = int(nums[-1].replace(",", ""))
+                        price_found = True
+                        logger.info(f"Price found from label: {price}")
+                    except ValueError:
+                        pass
 
     # 兜底：查找所有 span 中的价格
     if not price_found:
@@ -425,16 +469,29 @@ def parse_item(li, include_paypay=True):
 
     # ---- 5. 卖家 ID ----
     seller_id = None
-    seller_link = li.find("a", href=re.compile(r"/seller/"))
+    seller_link = li.find("a", href=re.compile(r"/user/"))
     if seller_link:
-        seller_id = seller_link["href"].split("/")[-1]
+        href = seller_link["href"]
+        seller_id = href.split("/")[-1]
         logger.info(f"Seller ID: {seller_id}")
     else:
         logger.info(f"Seller not found for item {item_id} (type: {item_type})")
 
     # ---- 6. 好评率 ----
     rating = None
-    if seller_link:
+    
+    # 优先查找 Product__ratingValue
+    rating_elem = li.select_one('.Product__ratingValue')
+    if rating_elem:
+        rating_text = rating_elem.get_text(strip=True)
+        if rating_text and rating_text != "新規":
+            rating = rating_text
+            logger.info(f"Rating found via Product__ratingValue: {rating}")
+        elif rating_text == "新規":
+            logger.info(f"Seller is new (新規) for item {item_id}")
+    
+    # 回退：从卖家链接附近查找
+    if not rating and seller_link:
         parent = seller_link.parent
         if parent:
             spans = parent.find_all("span")
@@ -471,11 +528,19 @@ def parse_item(li, include_paypay=True):
 
     # ---- 8. 缩略图 URL（可选）----
     thumbnail_url = None
-    img = li.find("img")
-    if img:
-        thumbnail_url = img.get("src") or img.get("data-src")
-        if thumbnail_url:
-            logger.info(f"Thumbnail URL found")
+    
+    # 优先从 data-auction-img 属性获取
+    data_img = auction_link.get('data-auction-img', '')
+    if data_img:
+        thumbnail_url = data_img
+        logger.info(f"Thumbnail URL found from data-auction-img")
+    else:
+        # 回退：查找 img 标签
+        img = li.find("img")
+        if img:
+            thumbnail_url = img.get("src") or img.get("data-src")
+            if thumbnail_url:
+                logger.info(f"Thumbnail URL found from img tag")
 
     # ---- 9. 构建返回对象 ----
     item = {
