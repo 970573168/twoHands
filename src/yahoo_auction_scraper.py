@@ -636,8 +636,8 @@ def parse_end_time(text):
 
 def save_items(items, table):
     """
-    保存商品到 DynamoDB。
-    没有值的可选字段不写入，避免 GSI 键出现 NULL。
+    保存商品到 DynamoDB，使用 ConditionExpression 防止重复插入
+    返回成功保存的数量
     """
     saved = 0
     skipped_duplicates = 0
@@ -647,56 +647,34 @@ def save_items(items, table):
     
     for item in items:
         try:
-            item_key = item.get("itemId")
-            
-            if not item_key:
-                failed += 1
-                logger.error(f"Skipping item without itemId: {item}")
-                continue
-            
-            # 构建基础字段
-            db_item = {
-                "itemID": item_key,
-                "itemType": item.get("itemType", "unknown"),
-                "title": item.get("title") or "",
-                "price": item.get("price", 0),
-                "bidCount": item.get("bidCount", 0),
-                "scrapedAt": item.get("scrapedAt") or datetime.now(timezone.utc).isoformat(),
-                "ttl": int((datetime.now(timezone.utc) + timedelta(days=180)).timestamp())
-            }
-            
-            # 可选字段：只有存在有效值时才写入
-            optional_fields = {
-                "endTime": item.get("endTime"),
-                "sellerId": item.get("sellerId"),
-                "sellerRating": item.get("sellerRating"),
-                "prefecture": item.get("prefecture"),
-                "url": item.get("url"),
-                "thumbnailUrl": item.get("thumbnailUrl")
-            }
-            
-            for field_name, field_value in optional_fields.items():
-                if field_value is not None and field_value != "":
-                    db_item[field_name] = field_value
-            
-            # 调试日志
-            logger.info(f"Saving item {item_key}: sellerId={db_item.get('sellerId', '<missing>')}")
+            item_key = item["itemId"]
             
             table.put_item(
-                Item=db_item,
+                Item={
+                    "itemID": item_key,
+                    "itemType": item.get("itemType", "unknown"),
+                    "title": item.get("title", ""),
+                    "price": item.get("price", 0),
+                    "bidCount": item.get("bidCount", 0),
+                    "endTime": item.get("endTime") or "unknown",
+                    "sellerId": item.get("sellerId") or "unknown",
+                    "sellerRating": item.get("sellerRating") or "unknown",
+                    "prefecture": item.get("prefecture") or "unknown",
+                    "url": item.get("url") or "",
+                    "thumbnailUrl": item.get("thumbnailUrl") or "",
+                    "scrapedAt": item.get("scrapedAt") or datetime.now(timezone.utc).isoformat(),
+                    "ttl": int((datetime.now(timezone.utc) + timedelta(days=180)).timestamp())
+                },
                 ConditionExpression="attribute_not_exists(itemID)"
             )
-            
             saved += 1
             logger.info(f"Saved to DynamoDB: [{item.get('itemType')}] {item_key} - {item.get('title', 'N/A')[:50]}")
-            
         except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
             skipped_duplicates += 1
             logger.info(f"Skipped duplicate: {item_key}")
-            
         except Exception as e:
             failed += 1
-            logger.error(f"Failed to save {item_key}: {e}")
-    
+            logger.error(f"Failed to save {item.get('itemId')}: {e}")
+
     logger.info(f"DynamoDB save completed: {saved} saved, {skipped_duplicates} duplicates skipped, {failed} failed")
     return saved
