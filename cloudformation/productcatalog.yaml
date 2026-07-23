@@ -1,191 +1,888 @@
-name: Deploy Infrastructure
+AWSTemplateFormatVersion: "2010-09-09"
 
-on:
-  workflow_dispatch:
-    inputs:
-      environment:
-        description: "Deployment environment"
-        required: true
-        default: "dev"
-        type: choice
-        options:
-          - dev
-          - test
-          - prod
+Description: >
+  电子产品目录采集器 + AI API Secret + Yahoo Auction 抓取器
+  Lambda 代码通过已有 S3 Bucket 部署
 
-      deploy_secret:
-        description: "Deploy API Secret?"
-        required: true
-        default: "true"
-        type: choice
-        options:
-          - "true"
-          - "false"
+Parameters:
+  # ============ 通用参数 ============
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - prod
+    Description: 环境名称
 
-      deploy_main_app:
-        description: "Deploy Main Application?"
-        required: true
-        default: "true"
-        type: choice
-        options:
-          - "true"
-          - "false"
+  # ============ S3 代码部署参数 ============
+  LambdaCodeS3Bucket:
+    Type: String
+    Description: 已存在的 S3 Bucket 名称，用于存储 Lambda 代码
 
-      deploy_scraper:
-        description: "Deploy Yahoo Auction Scraper?"
-        required: true
-        default: "true"
-        type: choice
-        options:
-          - "true"
-          - "false"
+  LambdaCodeS3Key:
+    Type: String
+    Default: "productcatalog/lambda.zip"
+    Description: S3 中 Lambda 代码的对象键
 
-      api_key:
-        description: "API Key (required if deploy_secret=true)"
-        required: false
-        type: string
+  # ============ Secret 控制参数 ============
+  DeploySecret:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: 是否部署 AI API Secret
 
-      s3_bucket:
-        description: "S3 bucket name for Lambda code"
-        required: true
-        default: "productcatalog-lambda-code"
-        type: string
+  ApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: API Key（仅在 DeploySecret=true 时需要）
 
-      max_pages:
-        description: "Yahoo Auction max pages to scrape"
-        required: false
-        default: "1"
-        type: string
+  SecretName:
+    Type: String
+    Default: "ProductCatalog/ApiSecret"
+    Description: Secrets Manager 中的 Secret 名称前缀
 
-      log_retention:
-        description: "CloudWatch log retention days"
-        required: false
-        default: "14"
-        type: string
+  # ============ 主应用参数 ============
+  DeployMainApp:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: 是否部署主应用
 
-      stack_params:
-        description: "Additional CloudFormation params JSON (overrides defaults)"
-        required: false
-        default: "{}"
-        type: string
+  AiModel:
+    Type: String
+    Default: "doubao-seed-2-0-mini-260428"
+    Description: AI 模型名称
 
-permissions:
-  id-token: write
-  contents: read
+  ApiUrl:
+    Type: String
+    Default: "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+    Description: API URL
 
-jobs:
-  deploy-infrastructure:
-    runs-on: ubuntu-latest
-    environment: ${{ github.event.inputs.environment }}
+  MaxCategoriesPerRun:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    MaxValue: 100
+    Description: 每次运行发现的最大品类数
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+  MaxBrandsPerCategory:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    MaxValue: 100
+    Description: 每个品类发现的最大品牌数
 
-      - name: Configure AWS
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::767076981380:role/twoHands-GitHubActions-Role
-          aws-region: ap-northeast-1
+  MaxModelsPerBrand:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    MaxValue: 100
+    Description: 每个品牌发现的最大型号数
 
-      - name: Verify AWS Identity
-        run: |
-          aws sts get-caller-identity
-          echo "AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)" >> "$GITHUB_ENV"
-          echo "AWS_REGION=ap-northeast-1" >> "$GITHUB_ENV"
+  # ============ Token 和超时控制 ============
+  MaxTotalTokens:
+    Type: Number
+    Default: 100000
+    MinValue: 1000
+    MaxValue: 1000000
+    Description: 每次运行的最大 Token 用量
 
-      - name: Prepare S3 Bucket Name
-        run: |
-          S3_BUCKET="${{ github.event.inputs.s3_bucket }}-${AWS_ACCOUNT_ID}"
-          echo "S3_BUCKET=$S3_BUCKET" >> "$GITHUB_ENV"
+  LambdaTimeoutBuffer:
+    Type: Number
+    Default: 30
+    MinValue: 10
+    MaxValue: 300
+    Description: Lambda 超时缓冲时间（秒）
 
-      - name: Create S3 Bucket if not exists
-        if: ${{ github.event.inputs.deploy_main_app == 'true' || github.event.inputs.deploy_scraper == 'true' }}
-        run: |
-          if aws s3api head-bucket --bucket "$S3_BUCKET" 2>/dev/null; then
-            echo "Bucket exists: $S3_BUCKET"
-          else
-            aws s3api create-bucket \
-              --bucket "$S3_BUCKET" \
-              --region "$AWS_REGION" \
-              --create-bucket-configuration LocationConstraint="$AWS_REGION"
-          fi
-          aws s3api put-bucket-versioning --bucket "$S3_BUCKET" --versioning-configuration Status=Enabled
-          aws s3api put-bucket-encryption --bucket "$S3_BUCKET" --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
-          aws s3api put-public-access-block --bucket "$S3_BUCKET" --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+  # ============ 处理流程控制 ============
+  ApiCallDelay:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 10
+    Description: API 调用间隔（秒）
 
-      - name: Build and Upload Lambda Code
-        if: ${{ github.event.inputs.deploy_main_app == 'true' || github.event.inputs.deploy_scraper == 'true' }}
-        run: |
-          BUILD_DIR="build"
-          rm -rf "$BUILD_DIR" lambda.zip
-          mkdir -p "$BUILD_DIR"
+  CategoryLimit:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 20
+    Description: 每次处理的最大品类数
+
+  BrandLimit:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 10
+    Description: 每个品类处理的最大品牌数
+
+  # ============ 其他配置 ============
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    MinValue: 1
+    MaxValue: 3653
+    Description: CloudWatch 日志保留天数
+
+  # ============ Yahoo Auction 抓取器参数 ============
+  DeployScraper:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: 是否部署 Yahoo Auction 抓取器
+
+  YahooAuctionClosedBaseUrl:
+    Type: String
+    Default: "https://auctions.yahoo.co.jp/closedsearch/closedsearch"
+    Description: Yahoo 闭拍搜索基础 URL
+
+  YahooAuctionActiveBaseUrl:
+    Type: String
+    Default: "https://auctions.yahoo.co.jp/search/search"
+    Description: Yahoo 活跃拍卖搜索基础 URL
+
+  YahooAuctionDefaultParams:
+    Type: String
+    Default: "n=50&select=6&mode=3&dest_pref_code=23"
+    Description: 默认查询参数（不含 p 和 b）
+
+  YahooAuctionMaxPages:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+    Description: 每次抓取的最大页数
+
+  YahooAuctionRequestTimeout:
+    Type: Number
+    Default: 30
+    MinValue: 5
+    MaxValue: 120
+    Description: HTTP 请求超时（秒）
+
+  YahooAuctionUserAgent:
+    Type: String
+    Default: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    Description: 请求时使用的 User-Agent
+
+  YahooAuctionClosedTableName:
+    Type: String
+    Default: "YahooAuctionItems"
+    Description: 闭拍 DynamoDB 表名称前缀
+
+  YahooAuctionActiveTableName:
+    Type: String
+    Default: "YahooAuctionActiveItems"
+    Description: 活跃拍卖 DynamoDB 表名称前缀
+
+  YahooAuctionDebugLogHtml:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: 是否记录调试 HTML 日志
+
+  YahooAuctionItemsPerPage:
+    Type: Number
+    Default: 50
+    MinValue: 10
+    MaxValue: 100
+    Description: 每页显示的商品数量
+
+  # ============ Yahoo Auction 自定义搜索参数（可留空）============
+  AuctionParamNew:
+    Type: String
+    Default: ""
+    Description: "新品筛选 (空或1)"
+
+  AuctionParamOffer:
+    Type: String
+    Default: ""
+    Description: "可议价 (空或1)"
+
+  AuctionParamShipping:
+    Type: String
+    Default: ""
+    Description: "配送方式"
+
+  AuctionParamIstatus:
+    Type: String
+    Default: ""
+    Description: "商品状态"
+
+  AuctionParamAbatch:
+    Type: String
+    Default: ""
+    Description: "批次参数"
+
+  AuctionParamLocCd:
+    Type: String
+    Default: ""
+    Description: "地区代码"
+
+  AuctionParamSelect:
+    Type: String
+    Default: ""
+    Description: "select 参数"
+
+  AuctionParamSpec:
+    Type: String
+    Default: ""
+    Description: "规格参数"
+
+  AuctionParamPriceType:
+    Type: String
+    Default: ""
+    Description: "价格类型"
+
+  AuctionParamMin:
+    Type: String
+    Default: ""
+    Description: "最低价格"
+
+  AuctionParamMax:
+    Type: String
+    Default: ""
+    Description: "最高价格"
+
+  AuctionParamCarInspection:
+    Type: String
+    Default: ""
+    Description: "车检参数"
+
+  AuctionParamFixed:
+    Type: String
+    Default: ""
+    Description: "一口价筛选"
+
+  AuctionParamAucminprice:
+    Type: String
+    Default: ""
+    Description: "拍卖最低价格"
+
+  AuctionParamAucmaxprice:
+    Type: String
+    Default: ""
+    Description: "拍卖最高价格"
+
+  AuctionParamAucminBidorbuyPrice:
+    Type: String
+    Default: ""
+    Description: "即决最低价格"
+
+  AuctionParamAucmaxBidorbuyPrice:
+    Type: String
+    Default: ""
+    Description: "即决最高价格"
+
+  AuctionParamLc1:
+    Type: String
+    Default: ""
+    Description: "LC1参数"
+
+  AuctionParamJpypayment:
+    Type: String
+    Default: ""
+    Description: "PayPay等支付方式"
+
+  AuctionParamPoint:
+    Type: String
+    Default: ""
+    Description: "积分参数"
+
+  AuctionParamThumb:
+    Type: String
+    Default: ""
+    Description: "缩略图参数"
+
+  AuctionParamWrappingicon:
+    Type: String
+    Default: ""
+    Description: "包装图标"
+
+  AuctionParamPrivacyDelivery:
+    Type: String
+    Default: ""
+    Description: "隐私配送"
+
+  AuctionParamGiftIcon:
+    Type: String
+    Default: ""
+    Description: "礼品图标"
+
+  AuctionParamCharity:
+    Type: String
+    Default: ""
+    Description: "慈善参数"
+
+  AuctionParamMode:
+    Type: String
+    Default: ""
+    Description: "模式参数"
+
+  AuctionParamN:
+    Type: String
+    Default: "50"
+    Description: "每页数量"
+
+  AuctionParamS1:
+    Type: String
+    Default: ""
+    Description: "排序字段"
+
+  AuctionParamO1:
+    Type: String
+    Default: ""
+    Description: "排序方向 (a/d)"
+
+  AuctionParamMaxSprice:
+    Type: String
+    Default: ""
+    Description: "最高售价"
+
+  AuctionParamType:
+    Type: String
+    Default: ""
+    Description: "类型 (auction/fixed/all)"
+
+Conditions:
+  DeploySecretCondition: !Equals [!Ref DeploySecret, "true"]
+  DeployMainAppCondition: !Equals [!Ref DeployMainApp, "true"]
+  HasApiKey: !Not [!Equals [!Ref ApiKey, ""]]
+  DeployScraperCondition: !Equals [!Ref DeployScraper, "true"]
+
+Resources:
+  # ============================================
+  # AI API Secret（可选）
+  # ============================================
+  ApiSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: DeploySecretCondition
+    Properties:
+      Name: !Sub "${SecretName}/${Environment}"
+      Description: AI API key for product catalog discovery
+      SecretString: !If
+        - HasApiKey
+        - !Sub '{"apiKey":"${ApiKey}"}'
+        - '{"apiKey":"PLACEHOLDER-REPLACE-ME"}'
+      Tags:
+        - Key: Application
+          Value: ProductCatalog
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================
+  # 主应用（可选）
+  # ============================================
+
+  # ---------- DynamoDB 表 ----------
+  ProductCatalogTable:
+    Type: AWS::DynamoDB::Table
+    Condition: DeployMainAppCondition
+    Properties:
+      TableName: !Sub "ProductCatalog-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Application
+          Value: ProductCatalog
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ---------- CloudWatch Logs ----------
+  ProductCatalogLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: DeployMainAppCondition
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/ProductCatalog-Discovery-${Environment}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ---------- Lambda 执行角色 ----------
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: DeployMainAppCondition
+    Properties:
+      RoleName: !Sub "ProductCatalog-LambdaRole-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: ProductCatalogDiscoveryPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: DynamoDBCatalogAccess
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:BatchWriteItem
+                Resource: !GetAtt ProductCatalogTable.Arn
+
+              - Sid: DynamoDBGSIAccess
+                Effect: Allow
+                Action:
+                  - dynamodb:Query
+                Resource: !Sub "${ProductCatalogTable.Arn}/index/*"
+
+              - Sid: ReadApiSecret
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}/${Environment}-*"
+
+              - Sid: WriteLambdaLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${ProductCatalogLogGroup.Arn}:*"
+
+  # ---------- Lambda 函数 ----------
+  ProductCatalogDiscovery:
+    Type: AWS::Lambda::Function
+    Condition: DeployMainAppCondition
+    DependsOn:
+      - ProductCatalogLogGroup
+      - LambdaExecutionRole
+    Properties:
+      FunctionName: !Sub "ProductCatalog-Discovery-${Environment}"
+      Description: 通过 AI 发现电子产品品类、品牌和型号（手动触发）
+      Runtime: python3.12
+      Architectures:
+        - arm64
+      Handler: lambda_function.lambda_handler
+      Timeout: 900
+      MemorySize: 512
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: !Ref LambdaCodeS3Key
+      Environment:
+        Variables:
+          # DynamoDB 表名
+          TABLE_NAME: !Ref ProductCatalogTable
           
-          pip3 install requests beautifulsoup4 boto3 -t "$BUILD_DIR" \
-            --platform manylinux2014_aarch64 --only-binary=:all: --python-version 3.12 --quiet
+          # API 配置
+          SECRET_NAME: !Sub "${SecretName}/${Environment}"
+          AI_MODEL: !Ref AiModel
+          API_URL: !Ref ApiUrl
           
-          if [ -f requirements.txt ]; then
-            pip3 install -r requirements.txt -t "$BUILD_DIR" \
-              --platform manylinux2014_aarch64 --only-binary=:all: --python-version 3.12 --quiet
-          fi
+          # 发现任务配置
+          MAX_CATEGORIES: !Ref MaxCategoriesPerRun
+          MAX_BRANDS: !Ref MaxBrandsPerCategory
+          MAX_MODELS: !Ref MaxModelsPerBrand
           
-          for d in src lambda; do
-            if [ -d "$d" ] && [ -n "$(ls -A $d/*.py 2>/dev/null)" ]; then
-              cp $d/*.py "$BUILD_DIR/" && break
-            fi
-          done
+          # Token 和超时控制
+          MAX_TOTAL_TOKENS: !Ref MaxTotalTokens
+          LAMBDA_TIMEOUT_SECONDS: "900"
+          LAMBDA_TIMEOUT_BUFFER: !Ref LambdaTimeoutBuffer
           
-          cd "$BUILD_DIR" && zip -r9 ../lambda.zip . -q && cd ..
-          TIMESTAMP=$(date +%Y%m%d%H%M%S)
-          S3_KEY="productcatalog/lambda-${TIMESTAMP}.zip"
-          aws s3 cp lambda.zip "s3://$S3_BUCKET/$S3_KEY"
-          echo "S3_KEY=$S3_KEY" >> "$GITHUB_ENV"
+          # API 调用参数
+          TEMPERATURE: "0.7"
+          MAX_TOKENS: "4000"
+          TOP_P: "1.0"
+          REQUEST_TIMEOUT: "90"
+          MAX_RETRIES: "3"
+          
+          # 系统提示词
+          SYSTEM_PROMPT: "You are a helpful assistant that returns data in JSON format."
+          
+          # 处理流程控制
+          CATEGORY_LIMIT: !Ref CategoryLimit
+          BRAND_LIMIT: !Ref BrandLimit
+          API_CALL_DELAY: !Ref ApiCallDelay
+          
+          # 数据来源标识
+          DATA_SOURCE: "AI_DISCOVERY"
+      Tags:
+        - Key: Application
+          Value: ProductCatalog
+        - Key: Environment
+          Value: !Ref Environment
 
-      - name: Deploy Stack
-        run: |
-          STACK_NAME="productcatalog-app-${{ github.event.inputs.environment }}"
-          
-          PARAMS=(
-            "ParameterKey=Environment,ParameterValue=${{ github.event.inputs.environment }}"
-            "ParameterKey=DeploySecret,ParameterValue=${{ github.event.inputs.deploy_secret }}"
-            "ParameterKey=DeployMainApp,ParameterValue=${{ github.event.inputs.deploy_main_app }}"
-            "ParameterKey=DeployScraper,ParameterValue=${{ github.event.inputs.deploy_scraper }}"
-            "ParameterKey=LambdaCodeS3Bucket,ParameterValue=$S3_BUCKET"
-            "ParameterKey=LambdaCodeS3Key,ParameterValue=${S3_KEY:-productcatalog/lambda.zip}"
-            "ParameterKey=YahooAuctionMaxPages,ParameterValue=${{ github.event.inputs.max_pages }}"
-            "ParameterKey=LogRetentionDays,ParameterValue=${{ github.event.inputs.log_retention }}"
-          )
-          
-          [ "${{ github.event.inputs.deploy_secret }}" = "true" ] && [ -n "${{ github.event.inputs.api_key }}" ] && \
-            PARAMS+=("ParameterKey=ApiKey,ParameterValue=${{ github.event.inputs.api_key }}")
-          
-          # 合并额外的 stack_params JSON
-          EXTRA_PARAMS='${{ github.event.inputs.stack_params }}'
-          if [ "$EXTRA_PARAMS" != "{}" ]; then
-            while IFS="=" read -r k v; do
-              [ -n "$k" ] && PARAMS+=("ParameterKey=$k,ParameterValue=$v")
-            done < <(echo "$EXTRA_PARAMS" | jq -r 'to_entries[] | "\(.key)=\(.value)"')
-          fi
-          
-          aws cloudformation deploy \
-            --template-file cloudformation/productcatalog.yaml \
-            --stack-name "$STACK_NAME" \
-            --parameter-overrides "${PARAMS[@]}" \
-            --capabilities CAPABILITY_NAMED_IAM \
-            --no-fail-on-empty-changeset
+  # =============================================
+  # Yahoo Auction 抓取器资源
+  # =============================================
 
-      - name: Show Stack Outputs
-        if: success()
-        run: |
-          aws cloudformation describe-stacks \
-            --stack-name "productcatalog-app-${{ github.event.inputs.environment }}" \
-            --query 'Stacks[0].Outputs[*].[OutputKey,OutputValue]' \
-            --output table
+  # ---------- DynamoDB 表：闭拍数据 ----------
+  YahooAuctionClosedTable:
+    Type: AWS::DynamoDB::Table
+    Condition: DeployScraperCondition
+    Properties:
+      TableName: !Sub "${YahooAuctionClosedTableName}-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: auctionId
+          AttributeType: S
+        - AttributeName: endTime
+          AttributeType: S
+        - AttributeName: sellerId
+          AttributeType: S
+        - AttributeName: price
+          AttributeType: N
+      KeySchema:
+        - AttributeName: auctionId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: EndTimeIndex
+          KeySchema:
+            - AttributeName: endTime
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: SellerIndex
+          KeySchema:
+            - AttributeName: sellerId
+              KeyType: HASH
+            - AttributeName: endTime
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: PriceIndex
+          KeySchema:
+            - AttributeName: sellerId
+              KeyType: HASH
+            - AttributeName: price
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Application
+          Value: YahooAuctionScraper
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Type
+          Value: Closed
 
-      - name: Show Failed Resources
-        if: failure()
-        run: |
-          aws cloudformation describe-stack-events \
-            --stack-name "productcatalog-app-${{ github.event.inputs.environment }}" \
-            --query "StackEvents[?contains(ResourceStatus,'FAILED')].[LogicalResourceId,ResourceStatus,ResourceStatusReason,Timestamp]" \
-            --output table
+  # ---------- DynamoDB 表：活跃拍卖数据 ----------
+  YahooAuctionActiveTable:
+    Type: AWS::DynamoDB::Table
+    Condition: DeployScraperCondition
+    Properties:
+      TableName: !Sub "${YahooAuctionActiveTableName}-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: auctionId
+          AttributeType: S
+        - AttributeName: endTime
+          AttributeType: S
+        - AttributeName: sellerId
+          AttributeType: S
+        - AttributeName: price
+          AttributeType: N
+      KeySchema:
+        - AttributeName: auctionId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: EndTimeIndex
+          KeySchema:
+            - AttributeName: endTime
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: SellerIndex
+          KeySchema:
+            - AttributeName: sellerId
+              KeyType: HASH
+            - AttributeName: endTime
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: PriceIndex
+          KeySchema:
+            - AttributeName: sellerId
+              KeyType: HASH
+            - AttributeName: price
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Application
+          Value: YahooAuctionScraper
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Type
+          Value: Active
+
+  # ---------- CloudWatch Logs ----------
+  YahooAuctionScraperLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: DeployScraperCondition
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/YahooAuctionScraper-${Environment}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ---------- Lambda 执行角色 ----------
+  YahooAuctionScraperRole:
+    Type: AWS::IAM::Role
+    Condition: DeployScraperCondition
+    Properties:
+      RoleName: !Sub "YahooAuctionScraper-Role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: YahooAuctionScraperPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: DynamoDBAccess
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                Resource:
+                  - !GetAtt YahooAuctionClosedTable.Arn
+                  - !Sub "${YahooAuctionClosedTable.Arn}/index/*"
+                  - !GetAtt YahooAuctionActiveTable.Arn
+                  - !Sub "${YahooAuctionActiveTable.Arn}/index/*"
+              - Sid: WriteLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${YahooAuctionScraperLogGroup.Arn}:*"
+
+  # ---------- Lambda 函数 ----------
+  YahooAuctionScraper:
+    Type: AWS::Lambda::Function
+    Condition: DeployScraperCondition
+    DependsOn:
+      - YahooAuctionScraperLogGroup
+      - YahooAuctionScraperRole
+    Properties:
+      FunctionName: !Sub "YahooAuctionScraper-${Environment}"
+      Description: "Yahoo Auction closed & active search scraper"
+      Runtime: python3.12
+      Architectures:
+        - arm64
+      Handler: yahoo_auction_scraper.lambda_handler
+      Timeout: 300
+      MemorySize: 512
+      Role: !GetAtt YahooAuctionScraperRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: !Ref LambdaCodeS3Key
+      Environment:
+        Variables:
+          # 基础配置
+          CLOSED_BASE_URL: !Ref YahooAuctionClosedBaseUrl
+          ACTIVE_BASE_URL: !Ref YahooAuctionActiveBaseUrl
+          DEFAULT_PARAMS: !Ref YahooAuctionDefaultParams
+          MAX_PAGES: !Ref YahooAuctionMaxPages
+          TABLE_NAME_CLOSED: !Sub "${YahooAuctionClosedTableName}-${Environment}"
+          TABLE_NAME_ACTIVE: !Sub "${YahooAuctionActiveTableName}-${Environment}"
+          REQUEST_TIMEOUT: !Ref YahooAuctionRequestTimeout
+          USER_AGENT: !Ref YahooAuctionUserAgent
+          DEBUG_LOG_HTML: !Ref YahooAuctionDebugLogHtml
+          ITEMS_PER_PAGE: !Ref YahooAuctionItemsPerPage
+          
+          # 自定义搜索参数（匹配代码中的 AUCTION_PARAM_ 前缀）
+          AUCTION_PARAM_NEW: !Ref AuctionParamNew
+          AUCTION_PARAM_OFFER: !Ref AuctionParamOffer
+          AUCTION_PARAM_SHIPPING: !Ref AuctionParamShipping
+          AUCTION_PARAM_ISTATUS: !Ref AuctionParamIstatus
+          AUCTION_PARAM_ABATCH: !Ref AuctionParamAbatch
+          AUCTION_PARAM_LOC_CD: !Ref AuctionParamLocCd
+          AUCTION_PARAM_SELECT: !Ref AuctionParamSelect
+          AUCTION_PARAM_SPEC: !Ref AuctionParamSpec
+          AUCTION_PARAM_PRICE_TYPE: !Ref AuctionParamPriceType
+          AUCTION_PARAM_MIN: !Ref AuctionParamMin
+          AUCTION_PARAM_MAX: !Ref AuctionParamMax
+          AUCTION_PARAM_CAR_INSPECTION: !Ref AuctionParamCarInspection
+          AUCTION_PARAM_FIXED: !Ref AuctionParamFixed
+          AUCTION_PARAM_AUCMINPRICE: !Ref AuctionParamAucminprice
+          AUCTION_PARAM_AUCMAXPRICE: !Ref AuctionParamAucmaxprice
+          AUCTION_PARAM_AUCMIN_BIDORBUY_PRICE: !Ref AuctionParamAucminBidorbuyPrice
+          AUCTION_PARAM_AUCMAX_BIDORBUY_PRICE: !Ref AuctionParamAucmaxBidorbuyPrice
+          AUCTION_PARAM_LC1: !Ref AuctionParamLc1
+          AUCTION_PARAM_JPYPAYMENT: !Ref AuctionParamJpypayment
+          AUCTION_PARAM_POINT: !Ref AuctionParamPoint
+          AUCTION_PARAM_THUMB: !Ref AuctionParamThumb
+          AUCTION_PARAM_WRAPPINGICON: !Ref AuctionParamWrappingicon
+          AUCTION_PARAM_PRIVACY_DELIVERY: !Ref AuctionParamPrivacyDelivery
+          AUCTION_PARAM_GIFT_ICON: !Ref AuctionParamGiftIcon
+          AUCTION_PARAM_CHARITY: !Ref AuctionParamCharity
+          AUCTION_PARAM_MODE: !Ref AuctionParamMode
+          AUCTION_PARAM_N: !Ref AuctionParamN
+          AUCTION_PARAM_S1: !Ref AuctionParamS1
+          AUCTION_PARAM_O1: !Ref AuctionParamO1
+          AUCTION_PARAM_MAX_SPRICE: !Ref AuctionParamMaxSprice
+          AUCTION_PARAM_TYPE: !Ref AuctionParamType
+      Tags:
+        - Key: Application
+          Value: YahooAuctionScraper
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  # ============ S3 输出 ============
+  LambdaCodeBucketName:
+    Description: S3 存储 Lambda 代码的存储桶名称
+    Value: !Ref LambdaCodeS3Bucket
+    Export:
+      Name: !Sub "${AWS::StackName}-CodeBucket"
+
+  LambdaCodeObjectKey:
+    Description: S3 中 Lambda 代码对象键
+    Value: !Ref LambdaCodeS3Key
+    Export:
+      Name: !Sub "${AWS::StackName}-CodeKey"
+
+  # ============ Secret 输出 ============
+  ApiSecretArn:
+    Description: API Secret ARN
+    Condition: DeploySecretCondition
+    Value: !Ref ApiSecret
+    Export:
+      Name: !Sub "${AWS::StackName}-SecretArn"
+
+  ApiSecretName:
+    Description: API Secret 名称
+    Condition: DeploySecretCondition
+    Value: !Sub "${SecretName}/${Environment}"
+    Export:
+      Name: !Sub "${AWS::StackName}-SecretName"
+
+  # ============ 主应用输出 ============
+  ProductCatalogTableName:
+    Description: DynamoDB 产品目录表名称
+    Condition: DeployMainAppCondition
+    Value: !Ref ProductCatalogTable
+    Export:
+      Name: !Sub "${AWS::StackName}-TableName"
+
+  ProductCatalogTableArn:
+    Description: DynamoDB 产品目录表 ARN
+    Condition: DeployMainAppCondition
+    Value: !GetAtt ProductCatalogTable.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-TableArn"
+
+  DiscoveryLambdaName:
+    Description: Lambda 发现函数名称
+    Condition: DeployMainAppCondition
+    Value: !Ref ProductCatalogDiscovery
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaName"
+
+  DiscoveryLambdaArn:
+    Description: Lambda 发现函数 ARN
+    Condition: DeployMainAppCondition
+    Value: !GetAtt ProductCatalogDiscovery.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaArn"
+
+  # ============ Yahoo Auction 抓取器输出 ============
+  YahooAuctionClosedTableName:
+    Description: Yahoo Auction closed items DynamoDB table name
+    Condition: DeployScraperCondition
+    Value: !Ref YahooAuctionClosedTable
+    Export:
+      Name: !Sub "${AWS::StackName}-YahooAuctionClosedTable"
+
+  YahooAuctionClosedTableArn:
+    Description: Yahoo Auction closed items DynamoDB table ARN
+    Condition: DeployScraperCondition
+    Value: !GetAtt YahooAuctionClosedTable.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-YahooAuctionClosedTableArn"
+
+  YahooAuctionActiveTableName:
+    Description: Yahoo Auction active items DynamoDB table name
+    Condition: DeployScraperCondition
+    Value: !Ref YahooAuctionActiveTable
+    Export:
+      Name: !Sub "${AWS::StackName}-YahooAuctionActiveTable"
+
+  YahooAuctionActiveTableArn:
+    Description: Yahoo Auction active items DynamoDB table ARN
+    Condition: DeployScraperCondition
+    Value: !GetAtt YahooAuctionActiveTable.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-YahooAuctionActiveTableArn"
+
+  YahooAuctionScraperFunctionName:
+    Description: Yahoo Auction scraper Lambda function name
+    Condition: DeployScraperCondition
+    Value: !Ref YahooAuctionScraper
+    Export:
+      Name: !Sub "${AWS::StackName}-YahooAuctionScraper"
+
+  YahooAuctionScraperFunctionArn:
+    Description: Yahoo Auction scraper Lambda function ARN
+    Condition: DeployScraperCondition
+    Value: !GetAtt YahooAuctionScraper.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-YahooAuctionScraperArn"
