@@ -5,6 +5,8 @@ Yahoo Auction 商品分析工作流 Lambda
 2. 搜索对应闭拍商品
 3. AI 清洗闭拍商品型号
 4. AI 估价和利润分析
+
+依赖新版抓取器 (支持运费、即决价格、卖家类型、商品状态等字段)
 """
 
 import os
@@ -17,13 +19,16 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_HALF_UP
-from typing import List, Dict, Optional, Set, Any, Union
+from typing import List, Dict, Optional, Any
 
 import boto3
 from boto3.dynamodb.conditions import Key, Attr
 
 # 导入现有的抓取函数
-from yahoo_auction_scraper import scrape_auctions
+from yahoo_auction_scraper import (
+    scrape_auctions,
+    parse_end_time
+)
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -55,6 +60,8 @@ active_table = dynamodb.Table(TABLE_NAME_ACTIVE)
 closed_table = dynamodb.Table(TABLE_NAME_CLOSED)
 
 
+# ==================== 工具函数 ====================
+
 def to_decimal(value: Any) -> Any:
     """递归转换浮点数为 Decimal，确保 DynamoDB 兼容"""
     if isinstance(value, float):
@@ -65,6 +72,12 @@ def to_decimal(value: Any) -> Any:
         return [to_decimal(v) for v in value]
     elif isinstance(value, int):
         return Decimal(str(value))
+    elif isinstance(value, str):
+        # 尝试转换数字字符串
+        try:
+            return Decimal(value)
+        except:
+            return value
     return value
 
 
@@ -88,9 +101,7 @@ def normalize_model_key(brand: str, model: str) -> str:
     """生成标准化型号键，保留重要的特殊字符"""
     combined = f"{brand} {model}"
     normalized = normalize(combined).upper()
-    # 保留字母、数字、空格、加号、减号、斜杠
     normalized = re.sub(r"[^A-Z0-9\s+\-/]", " ", normalized)
-    # 合并多余空格
     normalized = re.sub(r"\s+", " ", normalized).strip()
     return normalized
 
@@ -104,24 +115,34 @@ def parse_bool(value: Any) -> bool:
     return bool(value)
 
 
-def parse_int(value: Any, default: int = 0) -> int:
-    """安全转换整数"""
+def safe_int(value: Any, default: int = 0) -> int:
+    """安全转换为整数"""
     try:
         return int(value)
     except (ValueError, TypeError):
         return default
 
 
+def safe_decimal(value: Any, default: Decimal = Decimal("0")) -> Decimal:
+    """安全转换为 Decimal"""
+    try:
+        if isinstance(value, Decimal):
+            return value
+        return Decimal(str(value))
+    except:
+        return default
+
+
+# ==================== Lambda 入口 ====================
+
 def lambda_handler(event, context):
     """主入口函数"""
     try:
-        # 安全获取并验证参数
         keyword = normalize(event.get("keyword", ""))
         
         if not keyword:
             return response(400, {"error": "keyword 不能为空"})
         
-        # 安全转换 count
         try:
             count = int(event.get("count", DEFAULT_SEARCH_COUNT))
         except (ValueError, TypeError):
@@ -130,9 +151,7 @@ def lambda_handler(event, context):
                 "received": str(event.get("count"))
             })
         
-        # 安全转换 force_reprocess
         force_reprocess = parse_bool(event.get("force_reprocess", False))
-        
         count = max(1, min(count, MAX_ACTIVE_ITEMS))
         
         logger.info(
@@ -140,11 +159,9 @@ def lambda_handler(event, context):
             f"count={count}, force_reprocess={force_reprocess}"
         )
         
-        # 验证 AI API 配置
         if not AI_API_KEY:
-            return response(500, {"error": "AI_API_KEY 环境变量未配置"})
+            logger.warning("AI_API_KEY 环境变量未配置，仅执行抓取")
         
-        # 执行工作流
         result = execute_workflow(keyword, count, force_reprocess)
         
         return response(200, result)
@@ -185,15 +202,17 @@ def execute_workflow(keyword: str, count: int, force_reprocess: bool) -> Dict:
         # 重新从 DynamoDB 读取完整的商品信息
         all_active = get_active_items_by_keyword(keyword)
         
+        if not AI_API_KEY:
+            logger.info("AI_API_KEY 未配置，跳过 AI 相关步骤")
+            return workflow_result
+        
         # 筛选需要解析型号的商品
         items_to_parse = [
             item for item in all_active
             if force_reprocess or item.get("modelStatus") == "PENDING"
         ]
         
-        if not items_to_parse:
-            logger.info("所有商品型号已解析，跳过型号解析步骤")
-        else:
+        if items_to_parse:
             # ========== 第二步：批量解析活跃商品型号 ==========
             logger.info(f"第二步：批量解析型号 ({len(items_to_parse)} 个商品)")
             parse_result = batch_parse_models(items_to_parse)
@@ -207,9 +226,7 @@ def execute_workflow(keyword: str, count: int, force_reprocess: bool) -> Dict:
         # ========== 第三步：搜索闭拍商品 ==========
         unique_models = get_unique_models(all_active)
         
-        if not unique_models:
-            logger.info("未识别到任何型号，跳过闭拍搜索")
-        else:
+        if unique_models:
             logger.info(f"第三步：搜索闭拍商品 ({len(unique_models)} 个型号)")
             total_closed = 0
             for i, model_info in enumerate(unique_models.values()):
@@ -228,9 +245,7 @@ def execute_workflow(keyword: str, count: int, force_reprocess: bool) -> Dict:
         # ========== 第四步：AI 清洗闭拍商品型号 ==========
         unparsed_closed = get_unparsed_closed_items()
         
-        if not unparsed_closed:
-            logger.info("所有闭拍商品型号已解析")
-        else:
+        if unparsed_closed:
             logger.info(f"第四步：清洗闭拍商品型号 ({len(unparsed_closed)} 个商品)")
             parsed_count = batch_parse_closed_models(unparsed_closed)
             workflow_result["closed_parsed"] = parsed_count
@@ -238,14 +253,11 @@ def execute_workflow(keyword: str, count: int, force_reprocess: bool) -> Dict:
         # ========== 第五步：估价分析 ==========
         unpriced_items = get_unpriced_active_items()
         
-        if not unpriced_items:
-            logger.info("所有商品已估价")
-        else:
+        if unpriced_items:
             logger.info(f"第五步：估价分析 ({len(unpriced_items)} 个商品)")
             priced_count = batch_price_analysis(unpriced_items)
             workflow_result["priced_items"] = priced_count
         
-        # 完成
         elapsed = time.time() - start_time
         workflow_result["elapsed_seconds"] = round(elapsed, 1)
         workflow_result["status"] = "COMPLETED"
@@ -264,11 +276,12 @@ def execute_workflow(keyword: str, count: int, force_reprocess: bool) -> Dict:
 
 def scrape_and_save_active(keyword: str, count: int) -> List[str]:
     """搜索活跃商品并保存，返回 itemID 列表"""
-    original_params = os.environ.get("DEFAULT_PARAMS", "")
+    original_params = os.environ.get("DEFAULT_PARAMS_ACTIVE", "")
     original_max_pages = os.environ.get("MAX_PAGES", "1")
     original_items_per_page = os.environ.get("ITEMS_PER_PAGE", "50")
     
-    os.environ["DEFAULT_PARAMS"] = f"n={count}&select=6&mode=3&s1=end&o1=a"
+    # 设置活跃搜索参数
+    os.environ["DEFAULT_PARAMS_ACTIVE"] = f"is_postage_mode=1&dest_pref_code=23&n={count}&s1=end&o1=a&mode=3&isdr=0"
     os.environ["MAX_PAGES"] = "1"
     os.environ["ITEMS_PER_PAGE"] = str(count)
     
@@ -286,57 +299,87 @@ def scrape_and_save_active(keyword: str, count: int) -> List[str]:
         return saved_ids
     finally:
         if original_params:
-            os.environ["DEFAULT_PARAMS"] = original_params
+            os.environ["DEFAULT_PARAMS_ACTIVE"] = original_params
         os.environ["MAX_PAGES"] = original_max_pages
         os.environ["ITEMS_PER_PAGE"] = original_items_per_page
 
 
 def upsert_active_item(item: Dict, keyword: str):
-    """更新或插入活跃商品"""
+    """更新或插入活跃商品（支持新版抓取器所有字段）"""
     now = datetime.now(timezone.utc)
+    
+    # 处理可能为 None 的字段
+    buynow_price = item.get("buynowPrice")
+    shipping_fee = item.get("shippingFee")
+    shipping_text = item.get("shippingText", "")
+    is_free_shipping = item.get("isFreeShipping", False)
+    seller_type = item.get("sellerType", "personal")
+    item_condition = item.get("itemCondition")
+    
+    # 构建更新表达式
+    update_expr = """
+        SET itemType = :item_type,
+            title = :title,
+            price = :price,
+            bidCount = :bid_count,
+            endTime = :end_time,
+            sellerId = :seller_id,
+            sellerRating = :seller_rating,
+            sellerType = :seller_type,
+            prefecture = :prefecture,
+            #url = :url,
+            thumbnailUrl = :thumbnail,
+            searchKeyword = :keyword,
+            lastScrapedAt = :now,
+            modelStatus = if_not_exists(modelStatus, :model_pending),
+            pricingStatus = if_not_exists(pricingStatus, :pricing_pending),
+            workflowStatus = :scraped,
+            #ttl = :ttl
+    """
+    
+    expr_values = {
+        ":item_type": item.get("itemType", "auction"),
+        ":title": item.get("title", ""),
+        ":price": item.get("price", 0),
+        ":bid_count": item.get("bidCount", 0),
+        ":end_time": item.get("endTime") or "unknown",
+        ":seller_id": item.get("sellerId") or "unknown",
+        ":seller_rating": item.get("sellerRating") or "unknown",
+        ":seller_type": seller_type,
+        ":prefecture": item.get("prefecture") or "unknown",
+        ":url": item.get("url", ""),
+        ":thumbnail": item.get("thumbnailUrl", ""),
+        ":keyword": keyword,
+        ":now": now.isoformat(),
+        ":model_pending": "PENDING",
+        ":pricing_pending": "PENDING",
+        ":scraped": "ACTIVE_SCRAPED",
+        ":ttl": int((now + timedelta(days=30)).timestamp())
+    }
+    
+    # 添加可选字段
+    if buynow_price is not None:
+        update_expr += ", buynowPrice = :buynow_price"
+        expr_values[":buynow_price"] = buynow_price
+    
+    if shipping_fee is not None:
+        update_expr += ", shippingFee = :shipping_fee, shippingText = :shipping_text, isFreeShipping = :is_free_shipping"
+        expr_values[":shipping_fee"] = shipping_fee
+        expr_values[":shipping_text"] = shipping_text
+        expr_values[":is_free_shipping"] = is_free_shipping
+    
+    if item_condition is not None:
+        update_expr += ", itemCondition = :item_condition"
+        expr_values[":item_condition"] = item_condition
     
     active_table.update_item(
         Key={"itemID": item["itemId"]},
-        UpdateExpression="""
-            SET itemType = :item_type,
-                title = :title,
-                price = :price,
-                bidCount = :bid_count,
-                endTime = :end_time,
-                sellerId = :seller_id,
-                sellerRating = :seller_rating,
-                prefecture = :prefecture,
-                #url = :url,
-                thumbnailUrl = :thumbnail,
-                searchKeyword = :keyword,
-                lastScrapedAt = :now,
-                modelStatus = if_not_exists(modelStatus, :model_pending),
-                pricingStatus = if_not_exists(pricingStatus, :pricing_pending),
-                workflowStatus = :scraped,
-                #ttl = :ttl
-        """,
+        UpdateExpression=update_expr,
         ExpressionAttributeNames={
             "#url": "url",
             "#ttl": "ttl"
         },
-        ExpressionAttributeValues={
-            ":item_type": item.get("itemType", "auction"),
-            ":title": item.get("title", ""),
-            ":price": item.get("price", 0),
-            ":bid_count": item.get("bidCount", 0),
-            ":end_time": item.get("endTime") or "unknown",
-            ":seller_id": item.get("sellerId") or "unknown",
-            ":seller_rating": item.get("sellerRating") or "unknown",
-            ":prefecture": item.get("prefecture") or "unknown",
-            ":url": item.get("url", ""),
-            ":thumbnail": item.get("thumbnailUrl", ""),
-            ":keyword": keyword,
-            ":now": now.isoformat(),
-            ":model_pending": "PENDING",
-            ":pricing_pending": "PENDING",
-            ":scraped": "ACTIVE_SCRAPED",
-            ":ttl": int((now + timedelta(days=30)).timestamp())
-        }
+        ExpressionAttributeValues=expr_values
     )
 
 
@@ -365,31 +408,30 @@ def get_active_items_by_keyword(keyword: str) -> List[Dict]:
 
 
 def batch_parse_models(items: List[Dict]) -> Dict:
-    """批量解析活跃商品型号，返回统计信息"""
+    """批量解析活跃商品型号"""
     if not items:
         return {"parsed": 0, "review_required": 0, "models_found": 0}
     
-    # 构建请求数据
     items_data = [
         {
             "itemId": item["itemID"],
-            "title": item.get("title", "")
+            "title": item.get("title", ""),
+            "price": safe_int(item.get("price", 0)),
+            "itemCondition": item.get("itemCondition", ""),
+            "sellerType": item.get("sellerType", "personal")
         }
         for item in items
     ]
     
-    # 调用 AI
     prompt = build_model_parsing_prompt(items_data)
     result = call_ai_with_retry(prompt)
     
     if not result:
         logger.error("AI 型号解析返回空结果")
-        # 标记所有商品为失败
         for item in items:
             mark_active_model_failed(item["itemID"], "AI_RESPONSE_EMPTY")
         return {"parsed": 0, "review_required": 0, "models_found": 0, "failed": len(items)}
     
-    # 解析结果并保存
     parsed_items = result.get("items", [])
     parsed_count = 0
     review_count = 0
@@ -409,7 +451,6 @@ def batch_parse_models(items: List[Dict]) -> Dict:
             elif saved_status == "REVIEW_REQUIRED":
                 review_count += 1
     
-    # 标记 AI 未返回的商品
     input_ids = {item["itemID"] for item in items}
     missing_ids = input_ids - returned_ids
     for missing_id in missing_ids:
@@ -451,7 +492,8 @@ def build_model_parsing_prompt(items: List[Dict]) -> str:
           "confidence": 0.95,
           "evidence": "タイトルからの証拠"
         }}
-      ]
+      ],
+      "isAccessory": false
     }}
   ]
 }}
@@ -459,7 +501,7 @@ def build_model_parsing_prompt(items: List[Dict]) -> str:
 ルール：
 1. 各商品IDに対して必ずエントリを作成してください
 2. 一つの商品に複数のモデルが含まれる可能性があります
-3. アクセサリや部品は除外してください
+3. アクセサリ（ケース、充電器、バッテリー等）の場合は isAccessory = true
 4. confidence は 0.0〜1.0 の範囲です
 5. 特定できない場合は models を空配列にしてください
 6. 必ず有効なJSON形式のみを返してください
@@ -564,18 +606,17 @@ def search_closed_for_model(keyword: str, model_info: Dict, max_items: int) -> L
     """搜索指定型号的闭拍商品"""
     logger.info(f"搜索闭拍商品: {keyword}")
     
+    original_params = os.environ.get("DEFAULT_PARAMS_CLOSED", "")
     original_max_pages = os.environ.get("MAX_PAGES", "1")
     original_items_per_page = os.environ.get("ITEMS_PER_PAGE", "50")
     
     try:
-        # 正确计算页数（向上取整）
         pages_needed = (max_items + 49) // 50
+        os.environ["DEFAULT_PARAMS_CLOSED"] = "is_postage_mode=1&dest_pref_code=23&n=50&s1=end&o1=d&mode=3&isdr=0"
         os.environ["MAX_PAGES"] = str(max(1, pages_needed))
         os.environ["ITEMS_PER_PAGE"] = "50"
         
         items = scrape_auctions(keyword, "closed", False)
-        
-        # 限制数量
         items = items[:max_items]
         
         saved_items = []
@@ -588,63 +629,92 @@ def search_closed_for_model(keyword: str, model_info: Dict, max_items: int) -> L
         
         return saved_items
     finally:
+        if original_params:
+            os.environ["DEFAULT_PARAMS_CLOSED"] = original_params
         os.environ["MAX_PAGES"] = original_max_pages
         os.environ["ITEMS_PER_PAGE"] = original_items_per_page
 
 
 def upsert_closed_item(item: Dict, model_info: Dict):
-    """更新或插入闭拍商品，避免重复追加 searchModels"""
+    """更新或插入闭拍商品（支持新版抓取器所有字段）"""
     now = datetime.now(timezone.utc)
     model_key = model_info.get("normalizedModel", "")
     
-    # 使用 SET 添加去重逻辑
+    # 处理可选字段
+    buynow_price = item.get("buynowPrice")
+    shipping_fee = item.get("shippingFee")
+    shipping_text = item.get("shippingText", "")
+    is_free_shipping = item.get("isFreeShipping", False)
+    seller_type = item.get("sellerType", "personal")
+    item_condition = item.get("itemCondition")
+    
+    update_expr = """
+        SET itemType = :item_type,
+            title = :title,
+            price = :price,
+            bidCount = :bid_count,
+            endTime = :end_time,
+            sellerId = :seller_id,
+            sellerRating = :seller_rating,
+            sellerType = :seller_type,
+            prefecture = :prefecture,
+            #url = :url,
+            thumbnailUrl = :thumbnail,
+            sourceModel = :source_model,
+            modelStatus = if_not_exists(modelStatus, :pending),
+            lastScrapedAt = :now,
+            #ttl = :ttl
+        ADD searchModelKeys :model_key_set
+    """
+    
+    expr_values = {
+        ":item_type": item.get("itemType", "auction"),
+        ":title": item.get("title", ""),
+        ":price": item.get("price", 0),
+        ":bid_count": item.get("bidCount", 0),
+        ":end_time": item.get("endTime") or "unknown",
+        ":seller_id": item.get("sellerId") or "unknown",
+        ":seller_rating": item.get("sellerRating") or "unknown",
+        ":seller_type": seller_type,
+        ":prefecture": item.get("prefecture") or "unknown",
+        ":url": item.get("url", ""),
+        ":thumbnail": item.get("thumbnailUrl", ""),
+        ":source_model": model_info,
+        ":pending": "PENDING",
+        ":now": now.isoformat(),
+        ":ttl": int((now + timedelta(days=180)).timestamp()),
+        ":model_key_set": {model_key} if model_key else set()
+    }
+    
+    if buynow_price is not None:
+        update_expr += ", buynowPrice = :buynow_price"
+        expr_values[":buynow_price"] = buynow_price
+    
+    if shipping_fee is not None:
+        update_expr += ", shippingFee = :shipping_fee, shippingText = :shipping_text, isFreeShipping = :is_free_shipping"
+        expr_values[":shipping_fee"] = shipping_fee
+        expr_values[":shipping_text"] = shipping_text
+        expr_values[":is_free_shipping"] = is_free_shipping
+    
+    if item_condition is not None:
+        update_expr += ", itemCondition = :item_condition"
+        expr_values[":item_condition"] = item_condition
+    
     closed_table.update_item(
         Key={"itemID": item["itemId"]},
-        UpdateExpression="""
-            SET itemType = :item_type,
-                title = :title,
-                price = :price,
-                bidCount = :bid_count,
-                endTime = :end_time,
-                sellerId = :seller_id,
-                sellerRating = :seller_rating,
-                prefecture = :prefecture,
-                #url = :url,
-                thumbnailUrl = :thumbnail,
-                sourceModel = :source_model,
-                modelStatus = if_not_exists(modelStatus, :pending),
-                lastScrapedAt = :now,
-                #ttl = :ttl
-            ADD searchModelKeys :model_key_set
-        """,
+        UpdateExpression=update_expr,
         ExpressionAttributeNames={
             "#url": "url",
             "#ttl": "ttl"
         },
-        ExpressionAttributeValues={
-            ":item_type": item.get("itemType", "auction"),
-            ":title": item.get("title", ""),
-            ":price": item.get("price", 0),
-            ":bid_count": item.get("bidCount", 0),
-            ":end_time": item.get("endTime") or "unknown",
-            ":seller_id": item.get("sellerId") or "unknown",
-            ":seller_rating": item.get("sellerRating") or "unknown",
-            ":prefecture": item.get("prefecture") or "unknown",
-            ":url": item.get("url", ""),
-            ":thumbnail": item.get("thumbnailUrl", ""),
-            ":source_model": model_info,
-            ":pending": "PENDING",
-            ":now": now.isoformat(),
-            ":ttl": int((now + timedelta(days=180)).timestamp()),
-            ":model_key_set": {model_key} if model_key else set()
-        }
+        ExpressionAttributeValues=expr_values
     )
 
 
 # ==================== 第四步：AI 清洗闭拍型号 ====================
 
 def get_unparsed_closed_items(limit: int = 100) -> List[Dict]:
-    """获取未解析型号的闭拍商品（支持分页）"""
+    """获取未解析型号的闭拍商品"""
     all_items = []
     last_key = None
     
@@ -681,7 +751,10 @@ def batch_parse_closed_models(items: List[Dict]) -> int:
             {
                 "itemId": item["itemID"],
                 "title": item.get("title", ""),
-                "sourceModel": item.get("sourceModel", {})
+                "price": safe_int(item.get("price", 0)),
+                "sourceModel": item.get("sourceModel", {}),
+                "itemCondition": item.get("itemCondition", ""),
+                "sellerType": item.get("sellerType", "personal")
             }
             for item in batch
         ]
@@ -709,7 +782,6 @@ def batch_parse_closed_models(items: List[Dict]) -> int:
             condition = parsed.get("condition", "UNKNOWN")
             exclusion_reason = parsed.get("exclusionReason", "")
             
-            # 代码层增加规则验证
             excluded_types = {"ACCESSORY", "PARTS", "BROKEN", "BOX_ONLY", "BUNDLE", "UNKNOWN"}
             effective_comparable = (
                 bool(models)
@@ -723,7 +795,6 @@ def batch_parse_closed_models(items: List[Dict]) -> int:
             )
             total_parsed += 1
         
-        # 标记未返回的商品
         input_ids = {item["itemID"] for item in batch}
         missing_ids = input_ids - returned_ids
         for missing_id in missing_ids:
@@ -745,7 +816,7 @@ def build_closed_model_parsing_prompt(items: List[Dict]) -> str:
 商品リスト：
 {items_text}
 
-以下のJSON形式で返してください。各商品IDに対して必ず結果を含めてください：
+以下のJSON形式で返してください：
 {{
   "items": [
     {{
@@ -765,29 +836,26 @@ def build_closed_model_parsing_prompt(items: List[Dict]) -> str:
   ]
 }}
 
-listingType の種類：
-- MAIN_PRODUCT: 本体（比較可能）
-- ACCESSORY: アクセサリ・ケース・保護フィルム
-- PARTS: 部品・パーツ
-- BROKEN: ジャンク・故障品
+listingType:
+- MAIN_PRODUCT: 本体
+- ACCESSORY: アクセサリ
+- PARTS: 部品
+- BROKEN: ジャンク
 - BOX_ONLY: 箱のみ
 - BUNDLE: 複数セット
-- UNKNOWN: 判断不能
-
-condition の種類：
-- NEW: 新品
-- USED: 中古
-- BROKEN: 故障・ジャンク
 - UNKNOWN: 不明
 
-判定ルール：
+condition:
+- NEW: 新品
+- USED: 中古
+- BROKEN: 故障
+- UNKNOWN: 不明
+
+ルール：
 1. アクセサリ、部品、箱のみは isComparable = false
 2. ジャンク品は isComparable = false
-3. 複数モデルが混在する場合は models に複数記載
-4. 全く関係ない商品は空の models 配列
-5. 確信度が低い場合（confidence < 0.7）は REVIEW_REQUIRED として扱う
-6. 全ての入力商品IDを含めてください
-7. 必ず有効なJSON形式のみを返してください
+3. 全ての入力商品IDを含めてください
+4. 必ず有効なJSON形式のみを返してください
 """
 
 
@@ -815,7 +883,6 @@ def save_closed_models(
             "confidence": str(model.get("confidence", 0))
         })
     
-    # 判断状态
     if not normalized_models:
         status = "REVIEW_REQUIRED"
     elif any(float(m.get("confidence", 0)) < 0.7 for m in normalized_models):
@@ -870,7 +937,7 @@ def mark_closed_parse_failed(item_id: str, error: str):
 # ==================== 第五步：估价分析 ====================
 
 def get_unpriced_active_items(limit: int = 50) -> List[Dict]:
-    """获取未定价的活跃商品（支持分页）"""
+    """获取未定价的活跃商品"""
     all_items = []
     last_key = None
     
@@ -909,9 +976,21 @@ def batch_price_analysis(items: List[Dict]) -> int:
             else:
                 ai_analysis = {}
             
-            # 确保 purchase_price 是 Decimal
-            purchase_price = Decimal(str(item.get("price", 0)))
-            pricing_result = merge_pricing_result(stats, ai_analysis, purchase_price)
+            # 计算实际成本
+            purchase_price = safe_decimal(item.get("price", 0))
+            
+            # 考虑运费
+            actual_shipping = safe_decimal(item.get("shippingFee"), DEFAULT_SHIPPING_COST)
+            if item.get("isFreeShipping", False) or actual_shipping == 0:
+                actual_shipping = Decimal("0")
+            
+            # 考虑即决价格
+            buynow_price = safe_decimal(item.get("buynowPrice")) if item.get("buynowPrice") else None
+            
+            pricing_result = merge_pricing_result(
+                stats, ai_analysis, purchase_price, 
+                actual_shipping, buynow_price
+            )
             save_pricing_result(item["itemID"], pricing_result)
             
             total_priced += 1
@@ -948,14 +1027,13 @@ def get_comparable_closed_items(active_item: Dict) -> List[Dict]:
             continue
         
         try:
-            # 使用 scan 但添加型号过滤（理想情况应使用 GSI）
             response = closed_table.scan(
                 FilterExpression=(
                     Attr("modelStatus").eq("COMPLETED") &
                     Attr("isComparable").eq(True) &
                     Attr("price").gt(0)
                 ),
-                Limit=200  # 限制扫描数量
+                Limit=200
             )
             
             for closed_item in response.get("Items", []):
@@ -981,25 +1059,20 @@ def get_comparable_closed_items(active_item: Dict) -> List[Dict]:
         except Exception as e:
             logger.error(f"查询闭拍商品失败: {e}")
     
-    # 按结束时间排序，取最近的
-    comparable.sort(
-        key=lambda x: x.get("endTime", ""),
-        reverse=True
-    )
+    comparable.sort(key=lambda x: x.get("endTime", ""), reverse=True)
     
     return comparable
 
 
 def calculate_price_statistics(comparable_items: List[Dict]) -> Dict:
-    """计算价格统计（使用 Decimal）"""
-    # 提取价格并转为 Decimal
+    """计算价格统计"""
     prices = []
     for item in comparable_items:
         try:
-            price = Decimal(str(item.get("price", 0)))
+            price = safe_decimal(item.get("price", 0))
             if price > 0:
                 prices.append(price)
-        except (ValueError, TypeError):
+        except:
             continue
     
     prices.sort()
@@ -1012,7 +1085,6 @@ def calculate_price_statistics(comparable_items: List[Dict]) -> Dict:
             "prices": [int(p) for p in prices]
         }
     
-    # 计算分位数（使用线性插值）
     def percentile(data: List[Decimal], p: float) -> Decimal:
         k = (len(data) - 1) * p
         f = int(k)
@@ -1026,7 +1098,6 @@ def calculate_price_statistics(comparable_items: List[Dict]) -> Dict:
     q3 = percentile(prices, 0.75)
     iqr = q3 - q1
     
-    # IQR 异常值过滤
     lower_bound = q1 - MAX_PRICE_DEVIATION * iqr
     upper_bound = q3 + MAX_PRICE_DEVIATION * iqr
     
@@ -1051,7 +1122,7 @@ def calculate_price_statistics(comparable_items: List[Dict]) -> Dict:
 
 
 def ai_price_analysis(active_item: Dict, comparable_items: List[Dict], stats: Dict) -> Dict:
-    """AI 深度估价分析（仅返回定性信息）"""
+    """AI 深度估价分析"""
     max_comparables = 20
     selected_comparables = comparable_items[:max_comparables]
     
@@ -1062,13 +1133,19 @@ def ai_price_analysis(active_item: Dict, comparable_items: List[Dict], stats: Di
 
 
 def build_pricing_prompt(active_item: Dict, comparable_items: List[Dict], stats: Dict) -> str:
-    """构建估价提示词（AI 只负责定性分析）"""
+    """构建估价提示词"""
     active_data = {
         "itemId": active_item["itemID"],
         "title": active_item.get("title", ""),
-        "currentBid": active_item.get("price", 0),
-        "bidCount": active_item.get("bidCount", 0),
+        "currentBid": safe_int(active_item.get("price", 0)),
+        "buynowPrice": safe_int(active_item.get("buynowPrice")) if active_item.get("buynowPrice") else None,
+        "bidCount": safe_int(active_item.get("bidCount", 0)),
         "sellerRating": active_item.get("sellerRating", ""),
+        "sellerType": active_item.get("sellerType", "personal"),
+        "itemCondition": active_item.get("itemCondition", ""),
+        "shippingFee": safe_int(active_item.get("shippingFee")) if active_item.get("shippingFee") is not None else None,
+        "isFreeShipping": active_item.get("isFreeShipping", False),
+        "prefecture": active_item.get("prefecture", ""),
         "models": active_item.get("models", [])
     }
     
@@ -1076,17 +1153,21 @@ def build_pricing_prompt(active_item: Dict, comparable_items: List[Dict], stats:
         {
             "itemId": item["itemID"],
             "title": item.get("title", ""),
-            "price": item.get("price", 0),
-            "bidCount": item.get("bidCount", 0),
+            "price": safe_int(item.get("price", 0)),
+            "bidCount": safe_int(item.get("bidCount", 0)),
             "endTime": item.get("endTime", ""),
             "listingType": item.get("listingType", ""),
-            "condition": item.get("condition", "UNKNOWN")
+            "condition": item.get("condition", "UNKNOWN"),
+            "sellerRating": item.get("sellerRating", ""),
+            "sellerType": item.get("sellerType", "personal"),
+            "shippingFee": safe_int(item.get("shippingFee")) if item.get("shippingFee") is not None else None,
+            "itemCondition": item.get("itemCondition", "")
         }
         for item in comparable_items[:20]
     ]
     
     return f"""
-あなたは中古電子製品の価格分析の専門家です。以下の情報を基に、商品のリスク評価と価格調整を行ってください。
+あなたは中古電子製品の価格分析の専門家です。以下の情報を基に、商品のリスク評価を行ってください。
 
 【分析対象商品】
 {json.dumps(active_data, ensure_ascii=False, indent=2)}
@@ -1104,30 +1185,30 @@ def build_pricing_prompt(active_item: Dict, comparable_items: List[Dict], stats:
   "decisionSignal": "REVIEW",
   "reasons": ["理由1", "理由2"],
   "riskFactors": ["リスク要因1", "リスク要因2"],
+  "conditionAdjustment": "NONE",
   "usableComparableItemIds": ["ID1", "ID2"]
 }}
 
-riskLevel:
-- LOW: リスクが低い（明確な商品、信頼できる出品者）
-- MEDIUM: 中程度のリスク
-- HIGH: 高リスク（不明瞭な説明、低評価の出品者）
-
-decisionSignal:
-- BUY_CANDIDATE: 購入候補（高利益率、低リスク）
-- REVIEW: 要確認
-- AVOID: 購入非推奨
-- INSUFFICIENT_DATA: データ不足
+riskLevel: LOW/MEDIUM/HIGH
+decisionSignal: BUY_CANDIDATE/REVIEW/AVOID/INSUFFICIENT_DATA
+conditionAdjustment: NONE/NEEDS_CHECK/MAJOR_DIFFERENCE
 
 分析ルール：
-1. 商品状態の違いを評価
-2. 出品者評価に基づくリスク判断
-3. 相場データの質と信頼性
-4. 説明文の明確さ
+1. 商品状態の違いを評価（新品/中古/ジャンク）
+2. 出品者タイプ（個人/ストア）と評価を考慮
+3. 送料の有無を考慮
+4. 即決価格がある場合はその妥当性も評価
 5. 必ず有効なJSON形式のみを返してください
 """
 
 
-def merge_pricing_result(stats: Dict, ai_analysis: Dict, purchase_price: Decimal) -> Dict:
+def merge_pricing_result(
+    stats: Dict, 
+    ai_analysis: Dict, 
+    purchase_price: Decimal,
+    actual_shipping: Decimal = Decimal("0"),
+    buynow_price: Optional[Decimal] = None
+) -> Dict:
     """合并统计和AI分析结果，代码计算所有金额"""
     if not stats.get("is_sufficient"):
         return to_decimal({
@@ -1137,7 +1218,6 @@ def merge_pricing_result(stats: Dict, ai_analysis: Dict, purchase_price: Decimal
             "comparableCount": stats.get("count", 0)
         })
     
-    # 使用统计中位数作为估算售价
     estimated_price = Decimal(str(stats["filtered_median"]))
     estimated_low = Decimal(str(stats["filtered_min"]))
     estimated_high = Decimal(str(stats["filtered_max"]))
@@ -1146,13 +1226,20 @@ def merge_pricing_result(stats: Dict, ai_analysis: Dict, purchase_price: Decimal
     platform_fee = (estimated_price * EXPECTED_SELLING_FEE_RATE).quantize(Decimal("1"), ROUND_HALF_UP)
     repair_reserve = (estimated_price * DEFAULT_REPAIR_RESERVE_RATE).quantize(Decimal("1"), ROUND_HALF_UP)
     risk_reserve = (estimated_price * RISK_RESERVE_RATE).quantize(Decimal("1"), ROUND_HALF_UP)
-    shipping_cost = DEFAULT_SHIPPING_COST
     
-    # 计算利润
-    gross_spread = estimated_price - purchase_price
-    total_costs = platform_fee + shipping_cost + repair_reserve + risk_reserve
-    net_profit = gross_spread - total_costs
-    profit_margin = (net_profit / estimated_price).quantize(Decimal("0.001"), ROUND_HALF_UP) if estimated_price > 0 else Decimal("0")
+    # 总成本（含运费）
+    total_costs = platform_fee + actual_shipping + repair_reserve + risk_reserve
+    
+    # 当前出价利润
+    net_profit_at_bid = estimated_price - purchase_price - total_costs
+    profit_margin_at_bid = (net_profit_at_bid / estimated_price).quantize(Decimal("0.001"), ROUND_HALF_UP) if estimated_price > 0 else Decimal("0")
+    
+    # 即决价格利润（如果有）
+    net_profit_buynow = None
+    profit_margin_buynow = None
+    if buynow_price and buynow_price > 0:
+        net_profit_buynow = estimated_price - buynow_price - total_costs
+        profit_margin_buynow = (net_profit_buynow / estimated_price).quantize(Decimal("0.001"), ROUND_HALF_UP) if estimated_price > 0 else Decimal("0")
     
     # 计算不同利润目标下的购入价格
     target_margin_20 = Decimal("0.20")
@@ -1160,33 +1247,35 @@ def merge_pricing_result(stats: Dict, ai_analysis: Dict, purchase_price: Decimal
     
     break_even_price = (
         estimated_price * (Decimal("1") - EXPECTED_SELLING_FEE_RATE - DEFAULT_REPAIR_RESERVE_RATE - RISK_RESERVE_RATE)
-        - shipping_cost
+        - actual_shipping
     ).quantize(Decimal("1"), ROUND_HALF_UP)
     
     target_price_20 = (
         estimated_price * (Decimal("1") - EXPECTED_SELLING_FEE_RATE - DEFAULT_REPAIR_RESERVE_RATE - RISK_RESERVE_RATE - target_margin_20)
-        - shipping_cost
+        - actual_shipping
     ).quantize(Decimal("1"), ROUND_HALF_UP)
     
     target_price_10 = (
         estimated_price * (Decimal("1") - EXPECTED_SELLING_FEE_RATE - DEFAULT_REPAIR_RESERVE_RATE - RISK_RESERVE_RATE - target_margin_10)
-        - shipping_cost
+        - actual_shipping
     ).quantize(Decimal("1"), ROUND_HALF_UP)
     
     # 决策逻辑
     risk_level = ai_analysis.get("riskLevel", "MEDIUM")
     pricing_confidence = Decimal(str(ai_analysis.get("pricingConfidence", 0.7)))
     
-    if net_profit <= 0:
+    if buynow_price and net_profit_buynow and net_profit_buynow > 0 and profit_margin_buynow >= Decimal("0.15"):
+        decision = "BUY_CANDIDATE"
+    elif net_profit_at_bid <= 0:
         decision = "AVOID"
     elif risk_level == "HIGH" or pricing_confidence < Decimal("0.5"):
         decision = "REVIEW"
-    elif profit_margin >= Decimal("0.20") and pricing_confidence >= Decimal("0.75") and risk_level == "LOW":
+    elif profit_margin_at_bid >= Decimal("0.20") and pricing_confidence >= Decimal("0.75") and risk_level == "LOW":
         decision = "BUY_CANDIDATE"
     else:
         decision = "REVIEW"
     
-    return to_decimal({
+    result = {
         "pricingStatus": "COMPLETED",
         "estimatedMarketPrice": int(estimated_price),
         "estimatedLow": int(estimated_low),
@@ -1195,26 +1284,34 @@ def merge_pricing_result(stats: Dict, ai_analysis: Dict, purchase_price: Decimal
         "breakEvenPurchasePrice": int(break_even_price),
         "targetPurchasePrice20Margin": int(target_price_20),
         "targetPurchasePrice10Margin": int(target_price_10),
-        "grossSpread": int(gross_spread),
-        "netProfitAfterCosts": int(net_profit),
-        "profitMargin": float(profit_margin),
+        "netProfitAtCurrentBid": int(net_profit_at_bid),
+        "profitMarginAtCurrentBid": float(profit_margin_at_bid),
         "pricingConfidence": float(pricing_confidence),
         "riskLevel": risk_level,
         "decisionSignal": decision,
         "reasons": ai_analysis.get("reasons", []),
         "riskFactors": ai_analysis.get("riskFactors", []),
+        "conditionAdjustment": ai_analysis.get("conditionAdjustment", "NONE"),
         "comparableItemIds": ai_analysis.get("usableComparableItemIds", []),
         "comparableCount": stats.get("filtered_count", 0),
         "priceBreakdown": {
             "estimatedSellingPrice": int(estimated_price),
             "currentBidPrice": int(purchase_price),
             "platformFee": int(platform_fee),
-            "shippingCost": int(shipping_cost),
+            "shippingCost": int(actual_shipping),
             "repairReserve": int(repair_reserve),
             "riskReserve": int(risk_reserve),
-            "netProfit": int(net_profit)
+            "netProfit": int(net_profit_at_bid)
         }
-    })
+    }
+    
+    # 添加即决价格信息
+    if buynow_price and buynow_price > 0:
+        result["buynowPrice"] = int(buynow_price)
+        result["netProfitAtBuynow"] = int(net_profit_buynow) if net_profit_buynow else None
+        result["profitMarginAtBuynow"] = float(profit_margin_buynow) if profit_margin_buynow else None
+    
+    return to_decimal(result)
 
 
 def save_pricing_result(item_id: str, pricing_result: Dict):
@@ -1251,16 +1348,16 @@ def mark_pricing_failed(item_id: str, error: str):
         """,
         ExpressionAttributeValues={
             ":status": "FAILED",
-            ":error": error[:500],  # 限制错误信息长度
+            ":error": error[:500],
             ":now": now
         }
     )
 
 
-# ==================== AI 调用（增强版） ====================
+# ==================== AI 调用 ====================
 
 def call_ai_with_retry(prompt: str) -> Optional[Dict]:
-    """调用 AI API（带重试和错误处理）"""
+    """调用 AI API（带重试）"""
     for attempt in range(AI_MAX_RETRIES):
         try:
             result = call_ai(prompt)
@@ -1273,7 +1370,6 @@ def call_ai_with_retry(prompt: str) -> Optional[Dict]:
             logger.error(f"AI 调用异常 (尝试 {attempt + 1}): {e}")
         
         if attempt < AI_MAX_RETRIES - 1:
-            # 指数退避 + 随机抖动
             delay = (2 ** attempt) + random.uniform(0, 1)
             time.sleep(delay)
     
@@ -1300,7 +1396,7 @@ def call_ai(prompt: str) -> Optional[Dict]:
         ],
         "temperature": 0.3,
         "max_tokens": 4000,
-        "response_format": {"type": "json_object"}  # 强制 JSON 输出
+        "response_format": {"type": "json_object"}
     }
     
     encoded_body = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -1331,7 +1427,7 @@ def call_ai(prompt: str) -> Optional[Dict]:
         logger.error(f"AI API HTTP {e.code}: {error_body[:500]}")
         
         if e.code == 429:
-            raise  # 限流，触发重试
+            raise
         return None
         
     except Exception as e:
@@ -1340,19 +1436,15 @@ def call_ai(prompt: str) -> Optional[Dict]:
 
 
 def parse_ai_json(content: str) -> Optional[Dict]:
-    """解析 AI 返回的 JSON（增强容错）"""
+    """解析 AI 返回的 JSON"""
     if not content:
         return None
     
     content = content.strip()
     
-    # 尝试多种解析方式
     parse_attempts = [
-        # 1. 直接解析
         lambda c: json.loads(c),
-        # 2. 移除 markdown 代码块
         lambda c: json.loads(re.sub(r"```(?:json)?\s*|\s*```", "", c)),
-        # 3. 提取 JSON 对象
         lambda c: json.loads(re.search(r"\{[\s\S]*\}", c).group(0)),
     ]
     
