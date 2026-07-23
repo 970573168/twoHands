@@ -15,7 +15,9 @@ logger.setLevel(logging.INFO)
 # ============ 环境变量 ============
 CLOSED_BASE_URL = os.getenv("CLOSED_BASE_URL", "https://auctions.yahoo.co.jp/closedsearch/closedsearch")
 ACTIVE_BASE_URL = os.getenv("ACTIVE_BASE_URL", "https://auctions.yahoo.co.jp/search/search")
-DEFAULT_PARAMS = os.getenv("DEFAULT_PARAMS", "is_postage_mode=1&dest_pref_code=23&n=60&s1=end&o1=a&mode=3&isdr=0")  # 添加了 s1=end&o1=a
+# 修改：根据搜索类型使用不同的默认参数
+DEFAULT_PARAMS_CLOSED = os.getenv("DEFAULT_PARAMS_CLOSED", "is_postage_mode=1&dest_pref_code=23&n=60&s1=end&o1=d&mode=3&isdr=0")  # o1=d 降序
+DEFAULT_PARAMS_ACTIVE = os.getenv("DEFAULT_PARAMS_ACTIVE", "is_postage_mode=1&dest_pref_code=23&n=60&s1=end&o1=a&mode=3&isdr=0")   # o1=a 升序
 MAX_PAGES = int(os.getenv("MAX_PAGES", "1"))
 TABLE_NAME_CLOSED = os.getenv("TABLE_NAME_CLOSED", "YahooAuctionItems")
 TABLE_NAME_ACTIVE = os.getenv("TABLE_NAME_ACTIVE", "YahooAuctionActiveItems")
@@ -53,14 +55,19 @@ def get_auction_params():
 def build_url(keyword, page, search_type):
     """
     构建请求 URL，合并：
-    1. DEFAULT_PARAMS 中的基础参数
+    1. 根据搜索类型选择对应的默认参数
     2. AUCTION_PARAM_* 环境变量中的自定义参数（可覆盖基础参数）
     3. 关键词和分页参数
     """
     params = {}
 
-    # 1. 解析 DEFAULT_PARAMS
-    for p in DEFAULT_PARAMS.replace("&amp;", "&").split("&"):
+    # 1. 根据搜索类型解析不同的默认参数
+    if search_type == "active":
+        default_params_str = DEFAULT_PARAMS_ACTIVE
+    else:
+        default_params_str = DEFAULT_PARAMS_CLOSED
+    
+    for p in default_params_str.replace("&amp;", "&").split("&"):
         if "=" in p:
             k, v = p.split("=", 1)
             params[k] = v
