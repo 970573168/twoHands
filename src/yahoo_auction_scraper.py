@@ -557,7 +557,7 @@ def save_items(items, table):
             
             table.put_item(
                 Item={
-                    "itemId": item_key,
+                    "itemID": item_key,
                     "itemType": item.get("itemType", "unknown"),
                     "title": item.get("title", ""),
                     "price": item.get("price", 0),
@@ -571,7 +571,7 @@ def save_items(items, table):
                     "scrapedAt": item.get("scrapedAt"),
                     "ttl": int((datetime.now(timezone.utc) + timedelta(days=180)).timestamp())
                 },
-                ConditionExpression="attribute_not_exists(itemId)"
+                ConditionExpression="attribute_not_exists(itemID)"
             )
             saved += 1
             logger.info(f"Saved to DynamoDB: [{item.get('itemType')}] {item_key} - {item.get('title', 'N/A')[:50]}")
