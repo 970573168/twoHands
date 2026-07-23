@@ -51,58 +51,10 @@ on:
         default: "productcatalog-lambda-code"
         type: string
 
-      ai_model:
-        description: "AI Model name"
-        required: false
-        default: "doubao-seed-2-0-mini-260428"
-        type: string
-
-      max_categories:
-        description: "Max categories per run"
-        required: false
-        default: "20"
-        type: string
-
-      max_brands:
-        description: "Max brands per category"
-        required: false
-        default: "20"
-        type: string
-
-      max_models:
-        description: "Max models per brand"
-        required: false
-        default: "50"
-        type: string
-
-      max_tokens:
-        description: "Max total tokens per run"
-        required: false
-        default: "100000"
-        type: string
-
-      timeout_buffer:
-        description: "Lambda timeout buffer seconds"
-        required: false
-        default: "30"
-        type: string
-
-      api_delay:
-        description: "API call delay seconds"
+      max_pages:
+        description: "Yahoo Auction max pages to scrape"
         required: false
         default: "1"
-        type: string
-
-      category_limit:
-        description: "Max categories to process"
-        required: false
-        default: "5"
-        type: string
-
-      brand_limit:
-        description: "Max brands per category"
-        required: false
-        default: "3"
         type: string
 
       log_retention:
@@ -111,41 +63,8 @@ on:
         default: "14"
         type: string
 
-      secret_name:
-        description: "Secrets Manager secret name prefix"
-        required: false
-        default: "ProductCatalog/ApiSecret"
-        type: string
-
-      yahoo_max_pages:
-        description: "Yahoo Auction max pages to scrape"
-        required: false
-        default: "1"
-        type: string
-
-      yahoo_request_timeout:
-        description: "Yahoo Auction request timeout seconds"
-        required: false
-        default: "30"
-        type: string
-
-      yahoo_items_per_page:
-        description: "Yahoo Auction items per page"
-        required: false
-        default: "50"
-        type: string
-
-      yahoo_debug_log:
-        description: "Yahoo Auction debug HTML logging"
-        required: false
-        default: "false"
-        type: choice
-        options:
-          - "true"
-          - "false"
-
-      yahoo_config_override:
-        description: "Yahoo Auction config JSON override (base URLs, table names, auction params)"
+      stack_params:
+        description: "Additional CloudFormation params JSON (overrides defaults)"
         required: false
         default: "{}"
         type: string
@@ -175,75 +94,25 @@ jobs:
           echo "AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)" >> "$GITHUB_ENV"
           echo "AWS_REGION=ap-northeast-1" >> "$GITHUB_ENV"
 
-      - name: Load Yahoo Auction Config
-        run: |
-          # 默认配置
-          YAHOO_CONFIG='{
-            "closedBaseUrl": "https://auctions.yahoo.co.jp/closedsearch/closedsearch",
-            "activeBaseUrl": "https://auctions.yahoo.co.jp/search/search",
-            "defaultParams": "n=50&select=6&mode=3&dest_pref_code=23",
-            "closedTableName": "YahooAuctionItems",
-            "activeTableName": "YahooAuctionActiveItems",
-            "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-          }'
-          
-          # 合并用户覆盖配置
-          OVERRIDE='${{ github.event.inputs.yahoo_config_override }}'
-          if [ "$OVERRIDE" != "{}" ]; then
-            YAHOO_CONFIG=$(echo "$YAHOO_CONFIG" | jq -c ". * $OVERRIDE")
-          fi
-          
-          echo "YAHOO_CONFIG=$YAHOO_CONFIG" >> "$GITHUB_ENV"
-          
-          # 提取各配置项
-          echo "YAHOO_CLOSED_URL=$(echo $YAHOO_CONFIG | jq -r '.closedBaseUrl')" >> "$GITHUB_ENV"
-          echo "YAHOO_ACTIVE_URL=$(echo $YAHOO_CONFIG | jq -r '.activeBaseUrl')" >> "$GITHUB_ENV"
-          echo "YAHOO_DEFAULT_PARAMS=$(echo $YAHOO_CONFIG | jq -r '.defaultParams')" >> "$GITHUB_ENV"
-          echo "YAHOO_CLOSED_TABLE=$(echo $YAHOO_CONFIG | jq -r '.closedTableName')" >> "$GITHUB_ENV"
-          echo "YAHOO_ACTIVE_TABLE=$(echo $YAHOO_CONFIG | jq -r '.activeTableName')" >> "$GITHUB_ENV"
-          echo "YAHOO_USER_AGENT=$(echo $YAHOO_CONFIG | jq -r '.userAgent')" >> "$GITHUB_ENV"
-          
-          # 提取自定义 auction 参数
-          AUCTION_PARAMS=$(echo $YAHOO_CONFIG | jq -r '.auctionParams // {} | to_entries | map("AUCTION_PARAM_\(.key | ascii_upcase)=\(.value)") | join("\n")')
-          echo "$AUCTION_PARAMS" >> "$GITHUB_ENV"
-
       - name: Prepare S3 Bucket Name
         run: |
           S3_BUCKET="${{ github.event.inputs.s3_bucket }}-${AWS_ACCOUNT_ID}"
           echo "S3_BUCKET=$S3_BUCKET" >> "$GITHUB_ENV"
-          echo "Using S3 bucket: $S3_BUCKET"
 
       - name: Create S3 Bucket if not exists
         if: ${{ github.event.inputs.deploy_main_app == 'true' || github.event.inputs.deploy_scraper == 'true' }}
         run: |
           if aws s3api head-bucket --bucket "$S3_BUCKET" 2>/dev/null; then
-            echo "Bucket $S3_BUCKET already exists"
+            echo "Bucket exists: $S3_BUCKET"
           else
-            echo "Creating bucket $S3_BUCKET"
             aws s3api create-bucket \
               --bucket "$S3_BUCKET" \
               --region "$AWS_REGION" \
               --create-bucket-configuration LocationConstraint="$AWS_REGION"
           fi
-          
-          aws s3api put-bucket-versioning \
-            --bucket "$S3_BUCKET" \
-            --versioning-configuration Status=Enabled
-          
-          aws s3api put-bucket-encryption \
-            --bucket "$S3_BUCKET" \
-            --server-side-encryption-configuration '{
-              "Rules": [{
-                "ApplyServerSideEncryptionByDefault": {
-                  "SSEAlgorithm": "AES256"
-                }
-              }]
-            }'
-          
-          aws s3api put-public-access-block \
-            --bucket "$S3_BUCKET" \
-            --public-access-block-configuration \
-              BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+          aws s3api put-bucket-versioning --bucket "$S3_BUCKET" --versioning-configuration Status=Enabled
+          aws s3api put-bucket-encryption --bucket "$S3_BUCKET" --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+          aws s3api put-public-access-block --bucket "$S3_BUCKET" --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
 
       - name: Build and Upload Lambda Code
         if: ${{ github.event.inputs.deploy_main_app == 'true' || github.event.inputs.deploy_scraper == 'true' }}
@@ -252,41 +121,25 @@ jobs:
           rm -rf "$BUILD_DIR" lambda.zip
           mkdir -p "$BUILD_DIR"
           
+          pip3 install requests beautifulsoup4 boto3 -t "$BUILD_DIR" \
+            --platform manylinux2014_aarch64 --only-binary=:all: --python-version 3.12 --quiet
+          
           if [ -f requirements.txt ]; then
             pip3 install -r requirements.txt -t "$BUILD_DIR" \
-              --platform manylinux2014_aarch64 \
-              --only-binary=:all: \
-              --python-version 3.12 \
-              --quiet
-          else
-            pip3 install requests beautifulsoup4 boto3 -t "$BUILD_DIR" \
-              --platform manylinux2014_aarch64 \
-              --only-binary=:all: \
-              --python-version 3.12 \
-              --quiet
+              --platform manylinux2014_aarch64 --only-binary=:all: --python-version 3.12 --quiet
           fi
           
-          if [ -d "src" ] && [ -n "$(ls -A src/*.py 2>/dev/null)" ]; then
-            cp src/*.py "$BUILD_DIR/"
-          elif [ -d "lambda" ] && [ -n "$(ls -A lambda/*.py 2>/dev/null)" ]; then
-            cp lambda/*.py "$BUILD_DIR/"
-          else
-            echo "Error: No source files found"
-            exit 1
-          fi
+          for d in src lambda; do
+            if [ -d "$d" ] && [ -n "$(ls -A $d/*.py 2>/dev/null)" ]; then
+              cp $d/*.py "$BUILD_DIR/" && break
+            fi
+          done
           
-          cd "$BUILD_DIR"
-          zip -r9 ../lambda.zip . -q
-          cd ..
+          cd "$BUILD_DIR" && zip -r9 ../lambda.zip . -q && cd ..
           TIMESTAMP=$(date +%Y%m%d%H%M%S)
           S3_KEY="productcatalog/lambda-${TIMESTAMP}.zip"
           aws s3 cp lambda.zip "s3://$S3_BUCKET/$S3_KEY"
           echo "S3_KEY=$S3_KEY" >> "$GITHUB_ENV"
-
-      - name: Validate Template
-        run: |
-          aws cloudformation validate-template \
-            --template-body file://cloudformation/productcatalog.yaml
 
       - name: Deploy Stack
         run: |
@@ -298,43 +151,20 @@ jobs:
             "ParameterKey=DeployMainApp,ParameterValue=${{ github.event.inputs.deploy_main_app }}"
             "ParameterKey=DeployScraper,ParameterValue=${{ github.event.inputs.deploy_scraper }}"
             "ParameterKey=LambdaCodeS3Bucket,ParameterValue=$S3_BUCKET"
-            "ParameterKey=LambdaCodeS3Key,ParameterValue=${S3_KEY:-productcatalog/lambda-placeholder.zip}"
+            "ParameterKey=LambdaCodeS3Key,ParameterValue=${S3_KEY:-productcatalog/lambda.zip}"
+            "ParameterKey=YahooAuctionMaxPages,ParameterValue=${{ github.event.inputs.max_pages }}"
+            "ParameterKey=LogRetentionDays,ParameterValue=${{ github.event.inputs.log_retention }}"
           )
           
-          if [ "${{ github.event.inputs.deploy_main_app }}" = "true" ]; then
-            PARAMS+=(
-              "ParameterKey=AiModel,ParameterValue=${{ github.event.inputs.ai_model }}"
-              "ParameterKey=ApiUrl,ParameterValue=https://ark.cn-beijing.volces.com/api/v3/chat/completions"
-              "ParameterKey=MaxCategoriesPerRun,ParameterValue=${{ github.event.inputs.max_categories }}"
-              "ParameterKey=MaxBrandsPerCategory,ParameterValue=${{ github.event.inputs.max_brands }}"
-              "ParameterKey=MaxModelsPerBrand,ParameterValue=${{ github.event.inputs.max_models }}"
-              "ParameterKey=MaxTotalTokens,ParameterValue=${{ github.event.inputs.max_tokens }}"
-              "ParameterKey=LambdaTimeoutBuffer,ParameterValue=${{ github.event.inputs.timeout_buffer }}"
-              "ParameterKey=ApiCallDelay,ParameterValue=${{ github.event.inputs.api_delay }}"
-              "ParameterKey=CategoryLimit,ParameterValue=${{ github.event.inputs.category_limit }}"
-              "ParameterKey=BrandLimit,ParameterValue=${{ github.event.inputs.brand_limit }}"
-              "ParameterKey=LogRetentionDays,ParameterValue=${{ github.event.inputs.log_retention }}"
-              "ParameterKey=SecretName,ParameterValue=${{ github.event.inputs.secret_name }}"
-            )
-            
-            if [ "${{ github.event.inputs.deploy_secret }}" = "true" ] && [ -n "${{ github.event.inputs.api_key }}" ]; then
-              PARAMS+=("ParameterKey=ApiKey,ParameterValue=${{ github.event.inputs.api_key }}")
-            fi
-          fi
+          [ "${{ github.event.inputs.deploy_secret }}" = "true" ] && [ -n "${{ github.event.inputs.api_key }}" ] && \
+            PARAMS+=("ParameterKey=ApiKey,ParameterValue=${{ github.event.inputs.api_key }}")
           
-          if [ "${{ github.event.inputs.deploy_scraper }}" = "true" ]; then
-            PARAMS+=(
-              "ParameterKey=YahooAuctionClosedBaseUrl,ParameterValue=${YAHOO_CLOSED_URL}"
-              "ParameterKey=YahooAuctionActiveBaseUrl,ParameterValue=${YAHOO_ACTIVE_URL}"
-              "ParameterKey=YahooAuctionDefaultParams,ParameterValue=${YAHOO_DEFAULT_PARAMS}"
-              "ParameterKey=YahooAuctionMaxPages,ParameterValue=${{ github.event.inputs.yahoo_max_pages }}"
-              "ParameterKey=YahooAuctionRequestTimeout,ParameterValue=${{ github.event.inputs.yahoo_request_timeout }}"
-              "ParameterKey=YahooAuctionUserAgent,ParameterValue=${YAHOO_USER_AGENT}"
-              "ParameterKey=YahooAuctionClosedTableName,ParameterValue=${YAHOO_CLOSED_TABLE}"
-              "ParameterKey=YahooAuctionActiveTableName,ParameterValue=${YAHOO_ACTIVE_TABLE}"
-              "ParameterKey=YahooAuctionDebugLogHtml,ParameterValue=${{ github.event.inputs.yahoo_debug_log }}"
-              "ParameterKey=YahooAuctionItemsPerPage,ParameterValue=${{ github.event.inputs.yahoo_items_per_page }}"
-            )
+          # 合并额外的 stack_params JSON
+          EXTRA_PARAMS='${{ github.event.inputs.stack_params }}'
+          if [ "$EXTRA_PARAMS" != "{}" ]; then
+            while IFS="=" read -r k v; do
+              [ -n "$k" ] && PARAMS+=("ParameterKey=$k,ParameterValue=$v")
+            done < <(echo "$EXTRA_PARAMS" | jq -r 'to_entries[] | "\(.key)=\(.value)"')
           fi
           
           aws cloudformation deploy \
@@ -347,17 +177,15 @@ jobs:
       - name: Show Stack Outputs
         if: success()
         run: |
-          STACK_NAME="productcatalog-app-${{ github.event.inputs.environment }}"
           aws cloudformation describe-stacks \
-            --stack-name "$STACK_NAME" \
+            --stack-name "productcatalog-app-${{ github.event.inputs.environment }}" \
             --query 'Stacks[0].Outputs[*].[OutputKey,OutputValue]' \
             --output table
 
       - name: Show Failed Resources
         if: failure()
         run: |
-          STACK_NAME="productcatalog-app-${{ github.event.inputs.environment }}"
           aws cloudformation describe-stack-events \
-            --stack-name "$STACK_NAME" \
+            --stack-name "productcatalog-app-${{ github.event.inputs.environment }}" \
             --query "StackEvents[?contains(ResourceStatus,'FAILED')].[LogicalResourceId,ResourceStatus,ResourceStatusReason,Timestamp]" \
             --output table
