@@ -28,6 +28,17 @@ INCLUDE_PAYPAY = os.getenv("INCLUDE_PAYPAY", "true").lower() == "true"
 
 dynamodb = boto3.resource("dynamodb")
 
+# 日本47都道府県列表
+PREFECTURES_LIST = [
+    "北海道", "青森県", "岩手県", "宮城県", "秋田県", "山形県", "福島県",
+    "茨城県", "栃木県", "群馬県", "埼玉県", "千葉県", "東京都", "神奈川県",
+    "新潟県", "富山県", "石川県", "福井県", "山梨県", "長野県", "岐阜県",
+    "静岡県", "愛知県", "三重県", "滋賀県", "京都府", "大阪府", "兵庫県",
+    "奈良県", "和歌山県", "鳥取県", "島根県", "岡山県", "広島県", "山口県",
+    "徳島県", "香川県", "愛媛県", "高知県", "福岡県", "佐賀県", "長崎県",
+    "熊本県", "大分県", "宮崎県", "鹿児島県", "沖縄県"
+]
+
 
 def get_target_table(search_type: str):
     """根据搜索类型返回对应的 DynamoDB 表"""
@@ -287,40 +298,167 @@ def find_product_items_in_container(container, search_type, include_paypay):
 
 def parse_shipping_info(li):
     """
-    解析运费信息
-    返回格式：{"shippingFee": 190, "shippingText": "＋送料190円"}
+    解析运费信息（修复版）
+    返回格式：{"shippingFee": 190, "shippingText": "＋送料190円", "isFreeShipping": False}
+    
+    运费状态：
+    - None: 运费未知
+    - 0: 包邮（送料込み/送料無料）
+    - 数字: 具体运费金额（円）
     """
     shipping = {
         "shippingFee": None,  # 运费金额（数字），None表示未知
-        "shippingText": None  # 运费原始文本
+        "shippingText": None,  # 运费原始文本
+        "isFreeShipping": False  # 是否包邮
     }
     
-    # 查找 Product__postage 元素
+    # 策略1: 查找 Product__postage 元素
     postage_elem = li.select_one('.Product__postage')
     if postage_elem:
         shipping_text = postage_elem.get_text(strip=True)
         shipping["shippingText"] = shipping_text
-        logger.info(f"Found shipping text: {shipping_text}")
+        logger.info(f"Found shipping text: '{shipping_text}'")
         
-        # 尝试提取数字金额
-        # 格式1: "＋送料190円"
+        # 如果文本为空，可能是送料込み（包邮）
+        if not shipping_text:
+            shipping["shippingFee"] = 0
+            shipping["isFreeShipping"] = True
+            shipping["shippingText"] = "送料込み"
+            logger.info("Empty shipping text, assuming free shipping (送料込み)")
+            return shipping
+        
+        # 格式1: "＋送料190円" 或 "送料190円"（包括范围运费 "送料398円〜"）
         match = re.search(r'送料(\d[\d,]*)円', shipping_text)
         if match:
             try:
                 shipping["shippingFee"] = int(match.group(1).replace(',', ''))
-                logger.info(f"Shipping fee: {shipping['shippingFee']}円")
+                shipping["isFreeShipping"] = False
+                
+                # 如果包含"〜"或"~"（范围运费），记录警告但保留最低金额
+                if '〜' in shipping_text or '~' in shipping_text:
+                    logger.info(f"Shipping fee range detected: {shipping['shippingFee']}円〜 (minimum)")
+                else:
+                    logger.info(f"Shipping fee: {shipping['shippingFee']}円")
             except ValueError:
                 pass
+        
+        # 格式2: "送料無料" 或 "無料"
         elif '無料' in shipping_text or '送料無料' in shipping_text:
             shipping["shippingFee"] = 0
-            logger.info("Free shipping")
+            shipping["isFreeShipping"] = True
+            logger.info("Free shipping (送料無料)")
+        
+        # 格式3: "送料未定" 或 "未定"
         elif '未定' in shipping_text:
             shipping["shippingFee"] = None
-            logger.info("Shipping fee undetermined")
+            shipping["isFreeShipping"] = False
+            logger.info("Shipping fee undetermined (送料未定)")
+        
+        # 格式4: "着払い"
+        elif '着払' in shipping_text:
+            shipping["shippingFee"] = None
+            shipping["isFreeShipping"] = False
+            shipping["shippingText"] = "着払い"
+            logger.info("Cash on delivery (着払い)")
+        
+        # 格式5: 其他情况，尝试提取任何数字
+        else:
+            match = re.search(r'(\d[\d,]*)円', shipping_text)
+            if match:
+                try:
+                    shipping["shippingFee"] = int(match.group(1).replace(',', ''))
+                    shipping["isFreeShipping"] = False
+                    logger.info(f"Shipping fee extracted from general pattern: {shipping['shippingFee']}円")
+                except ValueError:
+                    pass
     else:
-        logger.info("No shipping info element found")
+        # 策略2: 没有找到 Product__postage 元素
+        # 检查是否在 Product__priceInfo 中有运费信息
+        price_info = li.select_one('.Product__priceInfo')
+        if price_info:
+            price_info_text = price_info.get_text(strip=True)
+            if '送料無料' in price_info_text or '送料込み' in price_info_text:
+                shipping["shippingFee"] = 0
+                shipping["isFreeShipping"] = True
+                shipping["shippingText"] = "送料込み"
+                logger.info("Free shipping detected from price info")
+            else:
+                # 也没有明确的运费信息，可能是包邮
+                shipping["shippingFee"] = 0
+                shipping["isFreeShipping"] = True
+                shipping["shippingText"] = "送料込み(推定)"
+                logger.info("No shipping info found, assuming free shipping (送料込み)")
+        else:
+            logger.info("No shipping info element found")
     
     return shipping
+
+
+def parse_seller_location(li):
+    """
+    解析发货地/所在地（修复版）
+    返回：prefecture 字符串，如 "東京都"
+    """
+    prefecture = None
+    
+    # 策略1: 查找 .Product__sellFrom 中的 span.u-textGray
+    sell_from = li.select_one('.Product__sellFrom')
+    if sell_from:
+        sell_from_span = sell_from.find('span', class_='u-textGray')
+        if sell_from_span:
+            sell_from_text = sell_from_span.get_text(strip=True)
+            logger.debug(f"Product__sellFrom text: '{sell_from_text}'")
+            
+            # 提取"〇〇県から発送"中的县名
+            match = re.search(r'(.+?)から発送', sell_from_text)
+            if match:
+                prefecture = match.group(1).strip()
+                logger.info(f"Prefecture from Product__sellFrom: {prefecture}")
+            else:
+                # 可能只有县名没有"から発送"
+                prefecture = sell_from_text.strip()
+                logger.info(f"Prefecture from Product__sellFrom (direct text): {prefecture}")
+    
+    # 策略2: 查找 "から発送" 文本（原有方法，作为兜底）
+    if not prefecture:
+        for p in li.find_all("p"):
+            txt = p.get_text(strip=True)
+            if "から発送" in txt:
+                prefecture = txt.replace("から発送", "").strip()
+                logger.info(f"Prefecture from 'から発送' pattern: {prefecture}")
+                break
+    
+    # 策略3: 查找 div 中的发货信息
+    if not prefecture:
+        sell_from_divs = li.select('div[class*="sellFrom"], div[class*="SellFrom"]')
+        for div in sell_from_divs:
+            txt = div.get_text(strip=True)
+            if txt:
+                prefecture = txt.strip()
+                logger.info(f"Prefecture from sellFrom div: {prefecture}")
+                break
+    
+    # 策略4: 查找 span 或 div 中的 "から発送"
+    if not prefecture:
+        for elem in li.find_all(['span', 'div', 'p']):
+            txt = elem.get_text(strip=True)
+            if "から発送" in txt:
+                match = re.search(r'(.+?)から発送', txt)
+                if match:
+                    prefecture = match.group(1).strip()
+                    logger.info(f"Prefecture from general 'から発送' search: {prefecture}")
+                    break
+    
+    # 策略5: 全局搜索都道府県名
+    if not prefecture:
+        li_text = li.get_text()
+        for pref in PREFECTURES_LIST:
+            if pref in li_text:
+                prefecture = pref
+                logger.info(f"Prefecture found by name matching: {prefecture}")
+                break
+    
+    return prefecture
 
 
 def parse_item(li, include_paypay=True):
@@ -437,27 +575,26 @@ def parse_item(li, include_paypay=True):
         except ValueError:
             pass
     
-    # 回退：尝试找"落札価格"或"現在価格"或"価格"标签
+    # 回退：尝试找"落札価格"或"現在価格"或"即決価格"标签
     if not price_found:
-        price_container = li.find(string=re.compile(r"落札価格|現在価格|価格"))
-        if price_container:
-            parent = price_container.parent
-            if parent:
-                whole_text = parent.get_text(separator=" ", strip=True)
-                nums = re.findall(r"[\d,]+", whole_text)
-                if nums:
-                    try:
-                        price = int(nums[-1].replace(",", ""))
-                        price_found = True
-                        logger.info(f"Price found from label: {price}")
-                    except ValueError:
-                        pass
-
+        # 查找 Product__priceValue
+        price_value = li.select_one('.Product__priceValue')
+        if price_value:
+            price_text = price_value.get_text(strip=True)
+            match = re.search(r'([\d,]+)円', price_text)
+            if match:
+                try:
+                    price = int(match.group(1).replace(",", ""))
+                    price_found = True
+                    logger.info(f"Price found from Product__priceValue: {price}")
+                except ValueError:
+                    pass
+    
     # 兜底：查找所有 span 中的价格
     if not price_found:
         for span in li.find_all("span"):
             txt = span.get_text(strip=True)
-            m = re.match(r"^([\d,]+)円?$", txt)
+            m = re.match(r"^([\d,]+)円$", txt)
             if m:
                 try:
                     price = int(m.group(1).replace(",", ""))
@@ -473,7 +610,26 @@ def parse_item(li, include_paypay=True):
     # ---- 3. 运费信息 ----
     shipping = parse_shipping_info(li)
 
-    # ---- 4. 入札数（仅拍卖） ----
+    # ---- 4. 即决价格（BuyNow） ----
+    buynow_price = None
+    price_info_spans = li.select('.Product__price')
+    for price_span in price_info_spans:
+        label = price_span.select_one('.Product__label')
+        if label and '即決' in label.get_text():
+            value = price_span.select_one('.Product__priceValue')
+            if value:
+                value_text = value.get_text(strip=True)
+                if value_text != '-':
+                    match = re.search(r'([\d,]+)円', value_text)
+                    if match:
+                        try:
+                            buynow_price = int(match.group(1).replace(',', ''))
+                            logger.info(f"BuyNow price: {buynow_price}円")
+                        except ValueError:
+                            pass
+            break
+
+    # ---- 5. 入札数（仅拍卖） ----
     bid_count = 0
     if item_type == "auction":
         bid_link = li.find("a", href=re.compile(r"bid_hist"))
@@ -485,24 +641,21 @@ def parse_item(li, include_paypay=True):
             except ValueError:
                 pass
 
-    # ---- 5. 结束时间 ----
+    # ---- 6. 结束时间 ----
     end_time = None
     
-    # 策略1：从 data-auction-endtime 属性获取（Unix 时间戳格式）
     # 需要在 Product 容器上查找
     product_div = li.find_parent('div', class_='Product')
     if not product_div:
-        # 如果是 li 元素本身或者父级
         product_div = li
     
+    # 策略1：从 data-auction-endtime 属性获取（Unix 时间戳格式）
     endtime_elem = product_div.select_one('[data-auction-endtime]')
     if endtime_elem:
         endtime_value = endtime_elem.get('data-auction-endtime', '')
         if endtime_value:
             try:
-                # 转换为整数时间戳
                 timestamp = int(endtime_value)
-                # 转换为 datetime 对象
                 dt = datetime.fromtimestamp(timestamp, tz=timezone(timedelta(hours=9)))
                 end_time = dt.isoformat()
                 logger.info(f"End time from data-auction-endtime: {end_time} (timestamp: {timestamp})")
@@ -545,7 +698,7 @@ def parse_item(li, include_paypay=True):
     if not end_time:
         logger.info(f"No end time found for item {item_id} (type: {item_type})")
 
-    # ---- 6. 卖家 ID ----
+    # ---- 7. 卖家 ID ----
     seller_id = None
     
     # 优先从 data-auction-auc-seller-id 获取
@@ -592,7 +745,7 @@ def parse_item(li, include_paypay=True):
         else:
             logger.info(f"Seller not found for item {item_id} (type: {item_type})")
 
-    # ---- 7. 好评率 ----
+    # ---- 8. 好评率 ----
     rating = None
     
     # 优先查找 Product__ratingValue
@@ -606,16 +759,24 @@ def parse_item(li, include_paypay=True):
             logger.info(f"Seller is new (新規) for item {item_id}")
     
     # 回退：从卖家链接附近查找
-    if not rating and seller_link:
-        parent = seller_link.parent
-        if parent:
-            spans = parent.find_all("span")
-            for sp in spans:
-                txt = sp.get_text(strip=True)
-                if re.match(r"^\d{1,3}\.\d%$", txt):
-                    rating = txt
-                    logger.info(f"Rating found near seller: {rating}")
-                    break
+    if not rating:
+        seller_link_check = li.find("a", href=re.compile(r"/seller/|/user/"))
+        if seller_link_check:
+            parent = seller_link_check.parent
+            if parent:
+                for _ in range(3):  # 向上查找3层
+                    spans = parent.find_all("span")
+                    for sp in spans:
+                        txt = sp.get_text(strip=True)
+                        if re.match(r"^\d{1,3}\.\d%$", txt):
+                            rating = txt
+                            logger.info(f"Rating found near seller: {rating}")
+                            break
+                    if rating:
+                        break
+                    parent = parent.parent
+                    if not parent:
+                        break
 
     # 全局兜底查找
     if not rating:
@@ -629,19 +790,28 @@ def parse_item(li, include_paypay=True):
     if not rating:
         logger.info(f"Rating not found for item {item_id} (type: {item_type})")
 
-    # ---- 8. 发货地 ----
-    prefecture = None
-    for p in li.find_all("p"):
-        txt = p.get_text(strip=True)
-        if "から発送" in txt:
-            prefecture = txt.replace("から発送", "").strip()
-            logger.info(f"Prefecture: {prefecture}")
-            break
-
+    # ---- 9. 发货地（使用新的解析函数）----
+    prefecture = parse_seller_location(li)
     if not prefecture:
         logger.info(f"Prefecture not found for item {item_id} (type: {item_type})")
 
-    # ---- 9. 缩略图 URL（可选）----
+    # ---- 10. 卖家类型（个人/商店） ----
+    seller_type = "personal"
+    if li.select_one('.Product__icon--store'):
+        seller_type = "store"
+        logger.info(f"Seller type: store")
+
+    # ---- 11. 商品状态（新品/二手等） ----
+    item_condition = None
+    condition_icons = li.select('.Product__icon')
+    for icon in condition_icons:
+        icon_text = icon.get_text(strip=True)
+        if icon_text in ['未使用', '新品', '中古', '新規']:
+            item_condition = icon_text
+            logger.info(f"Item condition: {item_condition}")
+            break
+
+    # ---- 12. 缩略图 URL ----
     thumbnail_url = None
     
     # 优先从 data-auction-img 属性获取
@@ -657,19 +827,23 @@ def parse_item(li, include_paypay=True):
             if thumbnail_url:
                 logger.info(f"Thumbnail URL found from img tag")
 
-    # ---- 10. 构建返回对象 ----
+    # ---- 13. 构建返回对象 ----
     item = {
         "itemId": item_id,
         "itemType": item_type,
         "title": title,
         "price": price,
+        "buynowPrice": buynow_price,
         "shippingFee": shipping["shippingFee"],
         "shippingText": shipping["shippingText"],
+        "isFreeShipping": shipping["isFreeShipping"],
         "bidCount": bid_count,
         "endTime": end_time,
         "sellerId": seller_id,
         "sellerRating": rating,
+        "sellerType": seller_type,
         "prefecture": prefecture,
+        "itemCondition": item_condition,
         "url": href,
         "thumbnailUrl": thumbnail_url,
         "scrapedAt": datetime.now(timezone.utc).isoformat()
@@ -743,13 +917,17 @@ def save_items(items, table):
                     "itemType": item.get("itemType", "unknown"),
                     "title": item.get("title", ""),
                     "price": item.get("price", 0),
+                    "buynowPrice": item.get("buynowPrice"),
                     "shippingFee": item.get("shippingFee"),
                     "shippingText": item.get("shippingText", ""),
+                    "isFreeShipping": item.get("isFreeShipping", False),
                     "bidCount": item.get("bidCount", 0),
                     "endTime": item.get("endTime") or "unknown",
                     "sellerId": item.get("sellerId") or "unknown",
                     "sellerRating": item.get("sellerRating") or "unknown",
+                    "sellerType": item.get("sellerType", "personal"),
                     "prefecture": item.get("prefecture") or "unknown",
+                    "itemCondition": item.get("itemCondition"),
                     "url": item.get("url") or "",
                     "thumbnailUrl": item.get("thumbnailUrl") or "",
                     "scrapedAt": item.get("scrapedAt") or datetime.now(timezone.utc).isoformat(),
