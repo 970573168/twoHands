@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: "2010-09-09"
 
 Description: >
-  电子产品目录采集器 + AI API Secret + Yahoo Auction 抓取器
+  电子产品目录采集器 + AI API Secret + Yahoo Auction 抓取器 + 分析工作流
   Lambda 代码通过已有 S3 Bucket 部署
 
 Parameters:
@@ -137,7 +137,7 @@ Parameters:
     AllowedValues:
       - "true"
       - "false"
-    Description: 是否部署 Yahoo Auction 抓取器
+    Description: 是否部署 Yahoo Auction 抓取器和分析器
 
   YahooAuctionMaxPages:
     Type: Number
@@ -457,41 +457,19 @@ Resources:
         S3Key: !Ref LambdaCodeS3Key
       Environment:
         Variables:
-          # DynamoDB 表名
           TABLE_NAME: !Ref ProductCatalogTable
-          
-          # API 配置
           SECRET_NAME: !Sub "${SecretName}/${Environment}"
           AI_MODEL: !Ref AiModel
           API_URL: !Ref ApiUrl
-          
-          # 发现任务配置
           MAX_CATEGORIES: !Ref MaxCategoriesPerRun
           MAX_BRANDS: !Ref MaxBrandsPerCategory
           MAX_MODELS: !Ref MaxModelsPerBrand
-          
-          # Token 和超时控制
           MAX_TOTAL_TOKENS: !Ref MaxTotalTokens
           LAMBDA_TIMEOUT_SECONDS: "900"
           LAMBDA_TIMEOUT_BUFFER: !Ref LambdaTimeoutBuffer
-          
-          # API 调用参数（使用代码默认值）
-          TEMPERATURE: "0.7"
-          MAX_TOKENS: "4000"
-          TOP_P: "1.0"
-          REQUEST_TIMEOUT: "90"
-          MAX_RETRIES: "3"
-          
-          # 系统提示词（使用代码默认值）
-          SYSTEM_PROMPT: "You are a helpful assistant that returns data in JSON format."
-          
-          # 处理流程控制
           CATEGORY_LIMIT: !Ref CategoryLimit
           BRAND_LIMIT: !Ref BrandLimit
           API_CALL_DELAY: !Ref ApiCallDelay
-          
-          # 数据来源标识（使用代码默认值）
-          DATA_SOURCE: "AI_DISCOVERY"
       Tags:
         - Key: Application
           Value: ProductCatalog
@@ -566,6 +544,13 @@ Resources:
       LogGroupName: !Sub "/aws/lambda/YahooAuctionScraper-${Environment}"
       RetentionInDays: !Ref LogRetentionDays
 
+  YahooAuctionAnalyzerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: DeployScraperCondition
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/YahooAuctionAnalyzer-${Environment}"
+      RetentionInDays: !Ref LogRetentionDays
+
   # ---------- Lambda 执行角色 ----------
   YahooAuctionScraperRole:
     Type: AWS::IAM::Role
@@ -595,6 +580,7 @@ Resources:
                   - dynamodb:Query
                   - dynamodb:UpdateItem
                   - dynamodb:DeleteItem
+                  - dynamodb:Scan
                 Resource:
                   - !GetAtt YahooAuctionClosedTable.Arn
                   - !GetAtt YahooAuctionActiveTable.Arn
@@ -603,9 +589,11 @@ Resources:
                 Action:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
-                Resource: !Sub "${YahooAuctionScraperLogGroup.Arn}:*"
+                Resource:
+                  - !Sub "${YahooAuctionScraperLogGroup.Arn}:*"
+                  - !Sub "${YahooAuctionAnalyzerLogGroup.Arn}:*"
 
-  # ---------- Lambda 函数 ----------
+  # ---------- Lambda 函数：抓取器 ----------
   YahooAuctionScraper:
     Type: AWS::Lambda::Function
     Condition: DeployScraperCondition
@@ -627,16 +615,12 @@ Resources:
         S3Key: !Ref LambdaCodeS3Key
       Environment:
         Variables:
-          # 基础配置（只设置代码中有环境变量覆盖的参数）
           TABLE_NAME_CLOSED: !Sub "YahooAuctionItems-${Environment}"
           TABLE_NAME_ACTIVE: !Sub "YahooAuctionActiveItems-${Environment}"
           MAX_PAGES: !Ref YahooAuctionMaxPages
           REQUEST_TIMEOUT: !Ref YahooAuctionRequestTimeout
           DEBUG_LOG_HTML: !Ref YahooAuctionDebugLogHtml
           ITEMS_PER_PAGE: !Ref YahooAuctionItemsPerPage
-          
-          # 自定义搜索参数（仅当不为空时才覆盖代码默认值）
-          # 注意：这些参数为空时，代码会使用自身的默认值
           AUCTION_PARAM_NEW: !Ref AuctionParamNew
           AUCTION_PARAM_OFFER: !Ref AuctionParamOffer
           AUCTION_PARAM_SHIPPING: !Ref AuctionParamShipping
@@ -674,13 +658,12 @@ Resources:
         - Key: Environment
           Value: !Ref Environment
 
-
-  # ============ 商品分析工作流 Lambda ============
+  # ---------- Lambda 函数：分析器 ----------
   AuctionAnalyzerFunction:
     Type: AWS::Lambda::Function
     Condition: DeployScraperCondition
     DependsOn:
-      - YahooAuctionScraperLogGroup
+      - YahooAuctionAnalyzerLogGroup
       - YahooAuctionScraperRole
     Properties:
       FunctionName: !Sub "YahooAuctionAnalyzer-${Environment}"
@@ -697,8 +680,8 @@ Resources:
         S3Key: !Ref LambdaCodeS3Key
       Environment:
         Variables:
-          TABLE_NAME_ACTIVE: !Sub "${YahooAuctionActiveTableName}-${Environment}"
-          TABLE_NAME_CLOSED: !Sub "${YahooAuctionClosedTableName}-${Environment}"
+          TABLE_NAME_ACTIVE: !Sub "YahooAuctionActiveItems-${Environment}"
+          TABLE_NAME_CLOSED: !Sub "YahooAuctionItems-${Environment}"
           AI_API_URL: !Ref ApiUrl
           AI_MODEL: !Ref AiModel
           DEFAULT_SEARCH_COUNT: "3"
@@ -719,98 +702,80 @@ Outputs:
   LambdaCodeBucketName:
     Description: S3 存储 Lambda 代码的存储桶名称
     Value: !Ref LambdaCodeS3Bucket
-    Export:
-      Name: !Sub "${AWS::StackName}-CodeBucket"
 
   LambdaCodeObjectKey:
     Description: S3 中 Lambda 代码对象键
     Value: !Ref LambdaCodeS3Key
-    Export:
-      Name: !Sub "${AWS::StackName}-CodeKey"
 
   # ============ Secret 输出 ============
   ApiSecretArn:
     Description: API Secret ARN
     Condition: DeploySecretCondition
     Value: !Ref ApiSecret
-    Export:
-      Name: !Sub "${AWS::StackName}-SecretArn"
 
   ApiSecretName:
     Description: API Secret 名称
     Condition: DeploySecretCondition
     Value: !Sub "${SecretName}/${Environment}"
-    Export:
-      Name: !Sub "${AWS::StackName}-SecretName"
 
   # ============ 主应用输出 ============
   ProductCatalogTableName:
     Description: DynamoDB 产品目录表名称
     Condition: DeployMainAppCondition
     Value: !Ref ProductCatalogTable
-    Export:
-      Name: !Sub "${AWS::StackName}-TableName"
 
   ProductCatalogTableArn:
     Description: DynamoDB 产品目录表 ARN
     Condition: DeployMainAppCondition
     Value: !GetAtt ProductCatalogTable.Arn
-    Export:
-      Name: !Sub "${AWS::StackName}-TableArn"
 
   DiscoveryLambdaName:
     Description: Lambda 发现函数名称
     Condition: DeployMainAppCondition
     Value: !Ref ProductCatalogDiscovery
-    Export:
-      Name: !Sub "${AWS::StackName}-LambdaName"
 
   DiscoveryLambdaArn:
     Description: Lambda 发现函数 ARN
     Condition: DeployMainAppCondition
     Value: !GetAtt ProductCatalogDiscovery.Arn
-    Export:
-      Name: !Sub "${AWS::StackName}-LambdaArn"
 
-  # ============ Yahoo Auction 抓取器输出 ============
+  # ============ Yahoo Auction 输出 ============
   YahooAuctionClosedTableName:
     Description: Yahoo Auction closed items DynamoDB table name
     Condition: DeployScraperCondition
     Value: !Ref YahooAuctionClosedTable
-    Export:
-      Name: !Sub "${AWS::StackName}-YahooAuctionClosedTable"
 
   YahooAuctionClosedTableArn:
     Description: Yahoo Auction closed items DynamoDB table ARN
     Condition: DeployScraperCondition
     Value: !GetAtt YahooAuctionClosedTable.Arn
-    Export:
-      Name: !Sub "${AWS::StackName}-YahooAuctionClosedTableArn"
 
   YahooAuctionActiveTableName:
     Description: Yahoo Auction active items DynamoDB table name
     Condition: DeployScraperCondition
     Value: !Ref YahooAuctionActiveTable
-    Export:
-      Name: !Sub "${AWS::StackName}-YahooAuctionActiveTable"
 
   YahooAuctionActiveTableArn:
     Description: Yahoo Auction active items DynamoDB table ARN
     Condition: DeployScraperCondition
     Value: !GetAtt YahooAuctionActiveTable.Arn
-    Export:
-      Name: !Sub "${AWS::StackName}-YahooAuctionActiveTableArn"
 
   YahooAuctionScraperFunctionName:
     Description: Yahoo Auction scraper Lambda function name
     Condition: DeployScraperCondition
     Value: !Ref YahooAuctionScraper
-    Export:
-      Name: !Sub "${AWS::StackName}-YahooAuctionScraper"
 
   YahooAuctionScraperFunctionArn:
     Description: Yahoo Auction scraper Lambda function ARN
     Condition: DeployScraperCondition
     Value: !GetAtt YahooAuctionScraper.Arn
-    Export:
-      Name: !Sub "${AWS::StackName}-YahooAuctionScraperArn"
+
+  AuctionAnalyzerFunctionName:
+    Description: Yahoo Auction analyzer Lambda function name
+    Condition: DeployScraperCondition
+    Value: !Ref AuctionAnalyzerFunction
+
+  AuctionAnalyzerFunctionArn:
+    Description: Yahoo Auction analyzer Lambda function ARN
+    Condition: DeployScraperCondition
+    Value: !GetAtt AuctionAnalyzerFunction.Arn
