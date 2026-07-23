@@ -139,21 +139,6 @@ Parameters:
       - "false"
     Description: 是否部署 Yahoo Auction 抓取器
 
-  YahooAuctionClosedBaseUrl:
-    Type: String
-    Default: "https://auctions.yahoo.co.jp/closedsearch/closedsearch"
-    Description: Yahoo 闭拍搜索基础 URL
-
-  YahooAuctionActiveBaseUrl:
-    Type: String
-    Default: "https://auctions.yahoo.co.jp/search/search"
-    Description: Yahoo 活跃拍卖搜索基础 URL
-
-  YahooAuctionDefaultParams:
-    Type: String
-    Default: "n=50&select=6&mode=3&dest_pref_code=23&s1=end&o1=a"
-    Description: 默认查询参数（不含 p 和 b）
-
   YahooAuctionMaxPages:
     Type: Number
     Default: 1
@@ -167,21 +152,6 @@ Parameters:
     MinValue: 5
     MaxValue: 120
     Description: HTTP 请求超时（秒）
-
-  YahooAuctionUserAgent:
-    Type: String
-    Default: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    Description: 请求时使用的 User-Agent
-
-  YahooAuctionClosedTableName:
-    Type: String
-    Default: "YahooAuctionItems"
-    Description: 闭拍 DynamoDB 表名称前缀
-
-  YahooAuctionActiveTableName:
-    Type: String
-    Default: "YahooAuctionActiveItems"
-    Description: 活跃拍卖 DynamoDB 表名称前缀
 
   YahooAuctionDebugLogHtml:
     Type: String
@@ -198,161 +168,161 @@ Parameters:
     MaxValue: 100
     Description: 每页显示的商品数量
 
-  # ============ Yahoo Auction 自定义搜索参数（可留空）============
+  # ============ Yahoo Auction 自定义搜索参数（可留空，不覆盖代码默认值）============
   AuctionParamNew:
     Type: String
     Default: ""
-    Description: "新品筛选 (空或1)"
+    Description: "新品筛选 (空或1) - 可选"
 
   AuctionParamOffer:
     Type: String
     Default: ""
-    Description: "可议价 (空或1)"
+    Description: "可议价 (空或1) - 可选"
 
   AuctionParamShipping:
     Type: String
     Default: ""
-    Description: "配送方式"
+    Description: "配送方式 - 可选"
 
   AuctionParamIstatus:
     Type: String
     Default: ""
-    Description: "商品状态"
+    Description: "商品状态 - 可选"
 
   AuctionParamAbatch:
     Type: String
     Default: ""
-    Description: "批次参数"
+    Description: "批次参数 - 可选"
 
   AuctionParamLocCd:
     Type: String
     Default: ""
-    Description: "地区代码"
+    Description: "地区代码 - 可选"
 
   AuctionParamSelect:
     Type: String
     Default: ""
-    Description: "select 参数"
+    Description: "select 参数 - 可选"
 
   AuctionParamSpec:
     Type: String
     Default: ""
-    Description: "规格参数"
+    Description: "规格参数 - 可选"
 
   AuctionParamPriceType:
     Type: String
     Default: ""
-    Description: "价格类型"
+    Description: "价格类型 - 可选"
 
   AuctionParamMin:
     Type: String
     Default: ""
-    Description: "最低价格"
+    Description: "最低价格 - 可选"
 
   AuctionParamMax:
     Type: String
     Default: ""
-    Description: "最高价格"
+    Description: "最高价格 - 可选"
 
   AuctionParamCarInspection:
     Type: String
     Default: ""
-    Description: "车检参数"
+    Description: "车检参数 - 可选"
 
   AuctionParamFixed:
     Type: String
     Default: ""
-    Description: "一口价筛选"
+    Description: "一口价筛选 - 可选"
 
   AuctionParamAucminprice:
     Type: String
     Default: ""
-    Description: "拍卖最低价格"
+    Description: "拍卖最低价格 - 可选"
 
   AuctionParamAucmaxprice:
     Type: String
     Default: ""
-    Description: "拍卖最高价格"
+    Description: "拍卖最高价格 - 可选"
 
   AuctionParamAucminBidorbuyPrice:
     Type: String
     Default: ""
-    Description: "即决最低价格"
+    Description: "即决最低价格 - 可选"
 
   AuctionParamAucmaxBidorbuyPrice:
     Type: String
     Default: ""
-    Description: "即决最高价格"
+    Description: "即决最高价格 - 可选"
 
   AuctionParamLc1:
     Type: String
     Default: ""
-    Description: "LC1参数"
+    Description: "LC1参数 - 可选"
 
   AuctionParamJpypayment:
     Type: String
     Default: ""
-    Description: "PayPay等支付方式"
+    Description: "PayPay等支付方式 - 可选"
 
   AuctionParamPoint:
     Type: String
     Default: ""
-    Description: "积分参数"
+    Description: "积分参数 - 可选"
 
   AuctionParamThumb:
     Type: String
     Default: ""
-    Description: "缩略图参数"
+    Description: "缩略图参数 - 可选"
 
   AuctionParamWrappingicon:
     Type: String
     Default: ""
-    Description: "包装图标"
+    Description: "包装图标 - 可选"
 
   AuctionParamPrivacyDelivery:
     Type: String
     Default: ""
-    Description: "隐私配送"
+    Description: "隐私配送 - 可选"
 
   AuctionParamGiftIcon:
     Type: String
     Default: ""
-    Description: "礼品图标"
+    Description: "礼品图标 - 可选"
 
   AuctionParamCharity:
     Type: String
     Default: ""
-    Description: "慈善参数"
+    Description: "慈善参数 - 可选"
 
   AuctionParamMode:
     Type: String
     Default: ""
-    Description: "模式参数"
+    Description: "模式参数 - 可选（代码默认值为3）"
 
   AuctionParamN:
     Type: String
-    Default: "50"
-    Description: "每页数量"
+    Default: ""
+    Description: "每页数量 - 可选（代码默认值为60）"
 
   AuctionParamS1:
     Type: String
     Default: ""
-    Description: "排序字段"
+    Description: "排序字段 - 可选（代码默认值为end）"
 
   AuctionParamO1:
     Type: String
     Default: ""
-    Description: "排序方向 (a/d)"
+    Description: "排序方向 - 可选（代码默认值为a）"
 
   AuctionParamMaxSprice:
     Type: String
     Default: ""
-    Description: "最高售价"
+    Description: "最高售价 - 可选"
 
   AuctionParamType:
     Type: String
     Default: ""
-    Description: "类型 (auction/fixed/all)"
+    Description: "类型 (auction/fixed/all) - 可选"
 
 Conditions:
   DeploySecretCondition: !Equals [!Ref DeploySecret, "true"]
@@ -505,14 +475,14 @@ Resources:
           LAMBDA_TIMEOUT_SECONDS: "900"
           LAMBDA_TIMEOUT_BUFFER: !Ref LambdaTimeoutBuffer
           
-          # API 调用参数
+          # API 调用参数（使用代码默认值）
           TEMPERATURE: "0.7"
           MAX_TOKENS: "4000"
           TOP_P: "1.0"
           REQUEST_TIMEOUT: "90"
           MAX_RETRIES: "3"
           
-          # 系统提示词
+          # 系统提示词（使用代码默认值）
           SYSTEM_PROMPT: "You are a helpful assistant that returns data in JSON format."
           
           # 处理流程控制
@@ -520,7 +490,7 @@ Resources:
           BRAND_LIMIT: !Ref BrandLimit
           API_CALL_DELAY: !Ref ApiCallDelay
           
-          # 数据来源标识
+          # 数据来源标识（使用代码默认值）
           DATA_SOURCE: "AI_DISCOVERY"
       Tags:
         - Key: Application
@@ -537,7 +507,7 @@ Resources:
     Type: AWS::DynamoDB::Table
     Condition: DeployScraperCondition
     Properties:
-      TableName: !Sub "${YahooAuctionClosedTableName}-${Environment}"
+      TableName: !Sub "YahooAuctionItems-${Environment}"
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: itemID
@@ -565,7 +535,7 @@ Resources:
     Type: AWS::DynamoDB::Table
     Condition: DeployScraperCondition
     Properties:
-      TableName: !Sub "${YahooAuctionActiveTableName}-${Environment}"
+      TableName: !Sub "YahooAuctionActiveItems-${Environment}"
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: itemID
@@ -657,19 +627,16 @@ Resources:
         S3Key: !Ref LambdaCodeS3Key
       Environment:
         Variables:
-          # 基础配置
-          CLOSED_BASE_URL: !Ref YahooAuctionClosedBaseUrl
-          ACTIVE_BASE_URL: !Ref YahooAuctionActiveBaseUrl
-          DEFAULT_PARAMS: !Ref YahooAuctionDefaultParams
+          # 基础配置（只设置代码中有环境变量覆盖的参数）
+          TABLE_NAME_CLOSED: !Sub "YahooAuctionItems-${Environment}"
+          TABLE_NAME_ACTIVE: !Sub "YahooAuctionActiveItems-${Environment}"
           MAX_PAGES: !Ref YahooAuctionMaxPages
-          TABLE_NAME_CLOSED: !Sub "${YahooAuctionClosedTableName}-${Environment}"
-          TABLE_NAME_ACTIVE: !Sub "${YahooAuctionActiveTableName}-${Environment}"
           REQUEST_TIMEOUT: !Ref YahooAuctionRequestTimeout
-          USER_AGENT: !Ref YahooAuctionUserAgent
           DEBUG_LOG_HTML: !Ref YahooAuctionDebugLogHtml
           ITEMS_PER_PAGE: !Ref YahooAuctionItemsPerPage
           
-          # 自定义搜索参数（匹配代码中的 AUCTION_PARAM_ 前缀）
+          # 自定义搜索参数（仅当不为空时才覆盖代码默认值）
+          # 注意：这些参数为空时，代码会使用自身的默认值
           AUCTION_PARAM_NEW: !Ref AuctionParamNew
           AUCTION_PARAM_OFFER: !Ref AuctionParamOffer
           AUCTION_PARAM_SHIPPING: !Ref AuctionParamShipping
