@@ -23,7 +23,6 @@ REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 USER_AGENT = os.getenv("USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 DEBUG_LOG_HTML = os.getenv("DEBUG_LOG_HTML", "false").lower() == "true"
 ITEMS_PER_PAGE = int(os.getenv("ITEMS_PER_PAGE", "50"))
-# 新增：是否包含 PayPay Flea Market 商品
 INCLUDE_PAYPAY = os.getenv("INCLUDE_PAYPAY", "true").lower() == "true"
 
 dynamodb = boto3.resource("dynamodb")
@@ -40,15 +39,13 @@ def get_auction_params():
     """
     读取所有以 AUCTION_PARAM_ 开头的环境变量，返回参数字典。
     例如：AUCTION_PARAM_NEW=1 → {"new": "1"}
-    注意：环境变量名中的下划线会被保留，但转为小写后作为参数名。
-    若需要双下划线转点号等特殊处理，可在此扩展。
     """
     params = {}
     prefix = "AUCTION_PARAM_"
     for key, val in os.environ.items():
         if key.startswith(prefix):
             param_name = key[len(prefix):].lower()
-            if val:  # 只添加非空值
+            if val:
                 params[param_name] = val
     return params
 
@@ -91,7 +88,6 @@ def lambda_handler(event, context):
         }
 
     search_type = event.get("search_type", "closed")  # "closed" 或 "active"
-    # 支持在 event 中覆盖 INCLUDE_PAYPAY 设置
     include_paypay = event.get("include_paypay", INCLUDE_PAYPAY)
     
     logger.info(f"Scraping for keyword: '{keyword}', type: '{search_type}', include_paypay: {include_paypay}")
@@ -108,6 +104,8 @@ def lambda_handler(event, context):
     table = get_target_table(search_type)
     saved = save_items(items, table)
 
+    logger.info(f"Scraping completed: {len(items)} items scraped, {saved} saved to DynamoDB")
+    
     return {
         "statusCode": 200,
         "body": json.dumps({
@@ -133,22 +131,24 @@ def scrape_auctions(keyword, search_type, include_paypay=True):
                 headers={"User-Agent": USER_AGENT}
             )
             resp.raise_for_status()
+            logger.info(f"Page {page} response status: {resp.status_code}, content length: {len(resp.text)}")
         except requests.exceptions.RequestException as e:
             logger.error(f"Request failed for page {page}: {e}")
             continue
 
         items = parse_html(resp.text, search_type, include_paypay)
         if not items:
-            logger.info(f"No items on page {page}, stopping pagination")
+            logger.info(f"No items found on page {page}, stopping pagination")
             break
 
         all_items.extend(items)
-        logger.info(f"Page {page}: found {len(items)} items (total: {len(all_items)})")
+        logger.info(f"Page {page}: found {len(items)} items (total accumulated: {len(all_items)})")
 
         if len(items) < ITEMS_PER_PAGE:
-            logger.info(f"Last page reached (got {len(items)} < {ITEMS_PER_PAGE})")
+            logger.info(f"Last page reached (got {len(items)} items < {ITEMS_PER_PAGE} per page)")
             break
 
+    logger.info(f"Total items scraped across all pages: {len(all_items)}")
     return all_items
 
 
@@ -157,41 +157,126 @@ def parse_html(html, search_type, include_paypay=True):
     soup = BeautifulSoup(html, "html.parser")
     items = []
 
+    # 调试：打印页面结构
+    if DEBUG_LOG_HTML:
+        logger.info("=== DEBUG: Page structure ===")
+        for i, ul in enumerate(soup.find_all("ul")):
+            classes = " ".join(ul.get("class", []))
+            li_count = len(ul.find_all("li", recursive=False))
+            logger.info(f"UL #{i}: class='{classes}', li_count={li_count}")
+            
+            if li_count > 0:
+                first_li = ul.find("li", recursive=False)
+                li_class = " ".join(first_li.get("class", []))
+                logger.info(f"  First LI class: '{li_class}'")
+                logger.info(f"  First LI HTML: {str(first_li)[:300]}")
+        logger.info("=== END DEBUG ===")
+
     # 根据搜索类型选择合适的容器
     if search_type == "closed":
         container = soup.select_one("#closedSearchItems")
+        logger.info(f"Looking for closed search container: #closedSearchItems - {'Found' if container else 'Not found'}")
     else:
-        # 活跃拍卖页面可能有不同的容器 ID
-        container = soup.select_one("#auctionsItems") or soup.select_one(".Products__items")
+        # 活跃拍卖页面尝试多个可能的选择器
+        selectors = [
+            ".Products__list",
+            ".ProductList",
+            "[data-auction-list]",
+            ".SearchResults__list",
+            "#auctionsItems",
+            ".Products__items"
+        ]
+        container = None
+        for selector in selectors:
+            container = soup.select_one(selector)
+            if container:
+                logger.info(f"Found active search container using selector: {selector}")
+                break
+        
+        if not container:
+            logger.warning("No specific container found for active search, will scan all UL elements")
 
-    if not container:
-        logger.warning(f"No container found for search_type={search_type}, trying body")
-        container = soup.body
-
-    if not container:
-        logger.warning("No body found in HTML")
-        return items
-
-    # 查找商品列表的 ul 元素
-    ul = container.find("ul")
-    if not ul:
-        logger.warning("No ul found in container")
-        return items
-
-    for li in ul.find_all("li", recursive=False):
+    # 如果没找到特定容器，扫描所有 ul
+    product_items = []
+    
+    if container:
+        logger.info(f"Scanning container for product items")
+        product_items = find_product_items_in_container(container, search_type, include_paypay)
+    else:
+        logger.info("Scanning entire body for product items")
+        product_items = find_product_items_in_container(soup.body, search_type, include_paypay)
+    
+    logger.info(f"Found {len(product_items)} potential product items")
+    
+    # 解析每个商品
+    skipped_count = 0
+    for li in product_items:
         try:
             if DEBUG_LOG_HTML:
-                logger.info(f"Parsing LI: {str(li)[:1000]}...")
+                logger.info(f"Parsing product LI: {str(li)[:500]}...")
 
             item = parse_item(li, include_paypay)
             if item:
                 items.append(item)
-            # 移除这里的 warning，因为跳过非拍卖商品是正常行为
+            else:
+                skipped_count += 1
         except Exception as e:
-            logger.warning(f"Failed to parse item: {e}")
+            logger.warning(f"Failed to parse product item: {e}")
+            skipped_count += 1
             continue
 
+    logger.info(f"Successfully parsed {len(items)} items, skipped {skipped_count} items")
     return items
+
+
+def find_product_items_in_container(container, search_type, include_paypay):
+    """在容器中查找商品列表项"""
+    product_items = []
+    
+    # 构建链接匹配模式
+    if include_paypay:
+        link_pattern = re.compile(r"(/auction/|paypayfleamarket\.yahoo\.co\.jp/item/)")
+    else:
+        link_pattern = re.compile(r"/auction/")
+    
+    # 查找所有 ul 元素
+    uls = container.find_all("ul")
+    logger.info(f"Found {len(uls)} UL elements in container")
+    
+    for ul_idx, ul in enumerate(uls):
+        ul_class = " ".join(ul.get("class", [])).lower()
+        
+        # 跳过明显的非商品列表
+        if any(skip_word in ul_class for skip_word in ["category", "nav", "menu", "footer", "header", "breadcrumb"]):
+            logger.info(f"Skipping UL #{ul_idx}: class='{ul_class}' (non-product container)")
+            continue
+        
+        # 检查这个 ul 中是否有商品链接
+        has_product_links = False
+        for li in ul.find_all("li", recursive=False):
+            if li.find("a", href=link_pattern) or li.get("data-auction-id"):
+                has_product_links = True
+                break
+        
+        if has_product_links:
+            logger.info(f"UL #{ul_idx}: class='{ul_class}' - Found product links")
+            for li in ul.find_all("li", recursive=False):
+                li_class = " ".join(li.get("class", [])).lower()
+                
+                # 跳过分类项
+                if "category" in li_class:
+                    logger.info(f"  Skipping category LI: class='{li_class}'")
+                    continue
+                
+                # 检查是否包含商品链接
+                if li.find("a", href=link_pattern) or li.get("data-auction-id"):
+                    product_items.append(li)
+                    if DEBUG_LOG_HTML:
+                        logger.info(f"  Added product LI: class='{li_class}'")
+        else:
+            logger.info(f"UL #{ul_idx}: class='{ul_class}' - No product links found, skipping")
+    
+    return product_items
 
 
 def parse_item(li, include_paypay=True):
@@ -204,10 +289,8 @@ def parse_item(li, include_paypay=True):
     
     # 构建链接匹配模式
     if include_paypay:
-        # 同时匹配拍卖和 PayPay Flea Market
         link_pattern = re.compile(r"(/auction/|paypayfleamarket\.yahoo\.co\.jp/item/)")
     else:
-        # 只匹配拍卖
         link_pattern = re.compile(r"/auction/")
 
     # 优先选择 p 标签内的商品链接
@@ -215,16 +298,21 @@ def parse_item(li, include_paypay=True):
         a = p.find("a", href=link_pattern)
         if a:
             auction_link = a
+            if DEBUG_LOG_HTML:
+                logger.info(f"Found auction link in p tag: {a.get('href', '')}")
             break
 
     # 回退：查找任何 a 标签
     if not auction_link:
         auction_link = li.find("a", href=link_pattern)
+        if auction_link and DEBUG_LOG_HTML:
+            logger.info(f"Found auction link in fallback: {auction_link.get('href', '')}")
 
     if not auction_link:
-        # 改为 info 级别，因为跳过非目标商品是正常行为
         if DEBUG_LOG_HTML:
-            logger.info("Skipping non-auction/PayPay item")
+            # 打印所有链接用于调试
+            all_links = [a.get('href', '') for a in li.find_all('a', href=True)]
+            logger.info(f"Skipping item - no matching links found. Available links: {all_links[:5]}")
         return None
 
     href = auction_link.get("href", "")
@@ -233,17 +321,17 @@ def parse_item(li, include_paypay=True):
         return None
     
     # 提取商品 ID 和类型
-    # 匹配拍卖链接: /auction/xxxxx
     m = re.search(r"/auction/([a-z0-9]+)", href)
     if m:
         item_id = m.group(1)
         item_type = "auction"
+        logger.info(f"Found auction item: {item_id}")
     else:
-        # 匹配 PayPay Flea Market 链接: /item/xxxxx
         m = re.search(r"/item/([a-z0-9]+)", href)
         if m:
             item_id = m.group(1)
             item_type = "paypay"
+            logger.info(f"Found PayPay item: {item_id}")
     
     if not item_id:
         logger.warning(f"Could not extract item ID from href: {href}")
@@ -257,10 +345,14 @@ def parse_item(li, include_paypay=True):
         title = auction_link.get("title", "").strip()
 
     if not title:
-        logger.warning(f"Title missing for item {item_id}")
+        logger.warning(f"Title missing for item {item_id} (type: {item_type})")
+    else:
+        logger.info(f"Title: {title[:100]}")
 
     # ---- 2. 价格 ----
     price = 0
+    price_found = False
+    
     # 尝试找"落札価格"或"現在価格"或"価格"
     price_container = li.find(string=re.compile(r"落札価格|現在価格|価格"))
     if price_container:
@@ -271,23 +363,27 @@ def parse_item(li, include_paypay=True):
             if nums:
                 try:
                     price = int(nums[-1].replace(",", ""))
+                    price_found = True
+                    logger.info(f"Price found from label: {price}")
                 except ValueError:
                     pass
 
     # 兜底：查找所有 span 中的价格
-    if price == 0:
+    if not price_found:
         for span in li.find_all("span"):
             txt = span.get_text(strip=True)
             m = re.match(r"^([\d,]+)円?$", txt)
             if m:
                 try:
                     price = int(m.group(1).replace(",", ""))
+                    price_found = True
+                    logger.info(f"Price found from span: {price}")
                     break
                 except ValueError:
                     pass
 
-    if price == 0:
-        logger.warning(f"Price not found for item {item_id}")
+    if not price_found:
+        logger.info(f"Price not found for item {item_id} (type: {item_type})")
 
     # ---- 3. 入札数（仅拍卖） ----
     bid_count = 0
@@ -297,6 +393,7 @@ def parse_item(li, include_paypay=True):
             bid_text = bid_link.get_text(strip=True)
             try:
                 bid_count = int(re.sub(r"\D", "", bid_text))
+                logger.info(f"Bid count: {bid_count}")
             except ValueError:
                 pass
 
@@ -308,25 +405,30 @@ def parse_item(li, include_paypay=True):
     ended_elem = li.find(lambda tag: tag.name in ["span", "p"] and "終了" in tag.get_text())
     if ended_elem:
         time_text = ended_elem.get_text(strip=True)
-        logger.debug(f"Found end time element: {time_text}")
+        logger.info(f"Found end time from element: {time_text}")
     else:
         # 策略2：全局正则搜索时间格式
         all_text = li.get_text(separator=" ", strip=True)
         m = re.search(r"\d{1,2}/\d{1,2}\s+\d{1,2}:\d{2}", all_text)
         if m:
             time_text = m.group()
-            logger.debug(f"Extracted time by regex: {time_text}")
+            logger.info(f"Extracted time by regex: {time_text}")
 
     if time_text:
         end_time = parse_end_time(time_text)
+        if end_time:
+            logger.info(f"Parsed end time: {end_time}")
+        else:
+            logger.info(f"Failed to parse end time from: {time_text}")
     else:
-        logger.info(f"Could not extract end time for item {item_id} (type: {item_type})")
+        logger.info(f"No end time found for item {item_id} (type: {item_type})")
 
     # ---- 5. 卖家 ID ----
     seller_id = None
     seller_link = li.find("a", href=re.compile(r"/seller/"))
     if seller_link:
         seller_id = seller_link["href"].split("/")[-1]
+        logger.info(f"Seller ID: {seller_id}")
     else:
         logger.info(f"Seller not found for item {item_id} (type: {item_type})")
 
@@ -340,6 +442,7 @@ def parse_item(li, include_paypay=True):
                 txt = sp.get_text(strip=True)
                 if re.match(r"^\d{1,3}\.\d%$", txt):
                     rating = txt
+                    logger.info(f"Rating found near seller: {rating}")
                     break
 
     # 全局兜底查找
@@ -348,6 +451,7 @@ def parse_item(li, include_paypay=True):
             txt = sp.get_text(strip=True)
             if re.match(r"^\d{1,3}\.\d%$", txt):
                 rating = txt
+                logger.info(f"Rating found globally: {rating}")
                 break
 
     if not rating:
@@ -359,6 +463,7 @@ def parse_item(li, include_paypay=True):
         txt = p.get_text(strip=True)
         if "から発送" in txt:
             prefecture = txt.replace("から発送", "").strip()
+            logger.info(f"Prefecture: {prefecture}")
             break
 
     if not prefecture:
@@ -369,11 +474,13 @@ def parse_item(li, include_paypay=True):
     img = li.find("img")
     if img:
         thumbnail_url = img.get("src") or img.get("data-src")
+        if thumbnail_url:
+            logger.info(f"Thumbnail URL found")
 
     # ---- 9. 构建返回对象 ----
     item = {
-        "itemId": item_id,  # 改用通用字段名
-        "itemType": item_type,  # 新增：标识商品类型
+        "itemId": item_id,
+        "itemType": item_type,
         "title": title,
         "price": price,
         "bidCount": bid_count,
@@ -386,7 +493,7 @@ def parse_item(li, include_paypay=True):
         "scrapedAt": datetime.now(timezone.utc).isoformat()
     }
 
-    logger.info(f"Parsed item: [{item_type}] {item_id} - {title[:50] if title else 'N/A'}...")
+    logger.info(f"Successfully parsed item: [{item_type}] {item_id} - {title[:50] if title else 'N/A'}...")
     return item
 
 
@@ -399,6 +506,7 @@ def parse_end_time(text):
     - "7/15 23時03分"
     """
     if not text:
+        logger.debug("parse_end_time: empty text")
         return None
 
     # 清理文本
@@ -407,7 +515,7 @@ def parse_end_time(text):
     # 匹配日期时间
     m = re.search(r"(\d{1,4})?[\/-]?(\d{1,2})[\/-](\d{1,2})\s+(\d{1,2}):(\d{2})", text)
     if not m:
-        logger.warning(f"parse_end_time: could not parse '{text}'")
+        logger.info(f"parse_end_time: could not parse '{text}'")
         return None
 
     # 确定年份
@@ -425,6 +533,7 @@ def parse_end_time(text):
 
     try:
         dt = datetime(year, month, day, hour, minute, tzinfo=timezone(timedelta(hours=9)))
+        logger.debug(f"parse_end_time: parsed '{text}' -> {dt.isoformat()}")
         return dt.isoformat()
     except ValueError as e:
         logger.warning(f"Invalid date/time: {text} - {e}")
@@ -437,10 +546,13 @@ def save_items(items, table):
     返回成功保存的数量
     """
     saved = 0
+    skipped_duplicates = 0
+    failed = 0
+    
+    logger.info(f"Starting to save {len(items)} items to DynamoDB table: {table.name}")
+    
     for item in items:
         try:
-            # 使用 itemId 作为主键（已改为通用字段名）
-            # 如果需要区分类型，可以组合使用 itemType_itemId 作为主键
             item_key = item["itemId"]
             
             table.put_item(
@@ -462,10 +574,13 @@ def save_items(items, table):
                 ConditionExpression="attribute_not_exists(itemId)"
             )
             saved += 1
-            logger.info(f"Saved: [{item.get('itemType')}] {item_key}")
+            logger.info(f"Saved to DynamoDB: [{item.get('itemType')}] {item_key} - {item.get('title', 'N/A')[:50]}")
         except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
+            skipped_duplicates += 1
             logger.info(f"Skipped duplicate: {item_key}")
         except Exception as e:
+            failed += 1
             logger.error(f"Failed to save {item.get('itemId')}: {e}")
 
+    logger.info(f"DynamoDB save completed: {saved} saved, {skipped_duplicates} duplicates skipped, {failed} failed")
     return saved
