@@ -50,6 +50,14 @@ def _env_bool(key: str, default: bool) -> bool:
     return value.lower() == "true"
 
 
+def _env_str(key: str, default: str) -> str:
+    value = os.getenv(key)
+    if value is None or not value.strip():
+        logger.warning(f"{key} 未配置或为空，使用默认值: {default}")
+        return default
+    return value.strip()
+
+
 # ============ 环境变量 ============
 TABLE_NAME = os.getenv("TABLE_NAME", "YahooAuctionModelCatalog")
 AI_API_URL = os.getenv("AI_API_URL", "https://ark.cn-beijing.volces.com/api/v3/chat/completions")
@@ -66,7 +74,8 @@ AI_REQUEST_TIMEOUT = _env_int("AI_REQUEST_TIMEOUT", 90)
 AI_MAX_RETRIES = _env_int("AI_MAX_RETRIES", 3)
 AI_MAX_OUTPUT_TOKENS = _env_int("AI_MAX_OUTPUT_TOKENS", 4000)
 
-CATEGORIES_TO_SCAN = os.getenv("CATEGORIES_TO_SCAN", "スマートフォン,タブレット,ノートPC,ゲーム機,カメラ")
+# 修改默认值为英文，匹配数据库实际数据
+CATEGORIES_TO_SCAN = _env_str("CATEGORIES_TO_SCAN", "Smartphone,Tablet,Laptop,Game Console,Camera")
 MIN_CONFIDENCE_THRESHOLD = _env_decimal("MIN_CONFIDENCE_THRESHOLD", "0.5")
 
 MAX_TOTAL_TOKENS = _env_int("MAX_TOTAL_TOKENS", 50000)
@@ -197,6 +206,17 @@ def parse_bool(value: Any) -> bool:
     return bool(value)
 
 
+def convert_floats_to_decimal(value):
+    """递归转换 float 为 Decimal，避免 DynamoDB 写入错误"""
+    if isinstance(value, float):
+        return Decimal(str(value))
+    if isinstance(value, dict):
+        return {key: convert_floats_to_decimal(val) for key, val in value.items()}
+    if isinstance(value, list):
+        return [convert_floats_to_decimal(item) for item in value]
+    return value
+
+
 def response(status_code: int, body: Dict) -> Dict:
     return {
         "statusCode": status_code,
@@ -218,29 +238,25 @@ def get_unanalyzed_models(categories: List[str], limit: int = 10) -> List[Dict]:
     unanalyzed_models = []
     last_evaluated_key = None
 
+    # 清理分类列表，移除空字符串
+    categories = [str(cat).strip() for cat in (categories or []) if str(cat).strip()]
+
     logger.info(f"开始扫描待分析型号: table={TABLE_NAME}, categories={categories}, limit={limit}")
-    
-    # 诊断日志：确认DynamoDB连接信息
     logger.info(f"DynamoDB连接信息: table={table.name}, region={boto3.session.Session().region_name}")
 
-    try:
-        # 诊断扫描：查看表中的实际数据
-        debug_result = table.scan(Limit=5)
-        logger.info(
-            f"表诊断扫描: Count={debug_result.get('Count')}, "
-            f"ScannedCount={debug_result.get('ScannedCount')}, "
-            f"items={json.dumps(debug_result.get('Items', []), ensure_ascii=False, default=str)}"
-        )
-    except Exception as e:
-        logger.error(f"诊断扫描失败: {e}")
+    # 构建过滤表达式 - 修复空列表问题
+    filter_expression = Attr("entity_type").eq("PRODUCT")
+    
+    if categories:
+        filter_expression = filter_expression & Attr("category").is_in(categories)
+        logger.info(f"按指定品类扫描: {categories}")
+    else:
+        logger.warning("CATEGORIES_TO_SCAN 为空或未配置，将扫描所有 PRODUCT 记录")
 
     try:
         while len(unanalyzed_models) < limit:
             scan_params = {
-                "FilterExpression": (
-                    Attr("entity_type").eq("PRODUCT")
-                    & Attr("category").is_in(categories)
-                ),
+                "FilterExpression": filter_expression,
                 "Limit": 100
             }
 
@@ -249,14 +265,16 @@ def get_unanalyzed_models(categories: List[str], limit: int = 10) -> List[Dict]:
 
             db_response = table.scan(**scan_params)
 
+            items = db_response.get("Items", [])
             logger.info(
                 f"DynamoDB扫描结果: ScannedCount={db_response.get('ScannedCount')}, "
-                f"Count={db_response.get('Count')}"
+                f"Count={db_response.get('Count')}, "
+                f"HasMore={bool(db_response.get('LastEvaluatedKey'))}"
             )
 
-            for item in db_response.get("Items", []):
+            for item in items:
                 analysis_status = item.get("analysis_status", "PENDING")
-                retry_count = int(item.get("analysis_retry_count", 0))
+                retry_count = int(item.get("analysis_retry_count", 0) or 0)
                 last_analyzed = item.get("last_analyzed_at")
 
                 # 选择需要分析的型号：
@@ -271,12 +289,18 @@ def get_unanalyzed_models(categories: List[str], limit: int = 10) -> List[Dict]:
 
                 if should_analyze:
                     unanalyzed_models.append(item)
+                    logger.info(
+                        f"找到待分析型号: PK={item.get('PK')}, "
+                        f"category={item.get('category')}, "
+                        f"brand={item.get('brand')}, "
+                        f"model={item.get('model')}, "
+                        f"status={analysis_status}"
+                    )
 
                 if len(unanalyzed_models) >= limit:
                     break
 
             last_evaluated_key = db_response.get("LastEvaluatedKey")
-
             if not last_evaluated_key:
                 break
 
@@ -291,12 +315,11 @@ def get_unanalyzed_models(categories: List[str], limit: int = 10) -> List[Dict]:
 def update_model_analysis_result(model_info: Dict, analysis_result: Dict):
     """
     更新成功分析的型号记录
-    
-    Args:
-        model_info: 完整的DynamoDB记录，包含PK和SK
-        analysis_result: AI分析结果
     """
     now = datetime.now(timezone.utc).isoformat()
+    
+    # 转换 float 为 Decimal，避免 DynamoDB 类型错误
+    safe_result = convert_floats_to_decimal(analysis_result)
 
     try:
         table.update_item(
@@ -313,12 +336,12 @@ def update_model_analysis_result(model_info: Dict, analysis_result: Dict):
             """,
             ConditionExpression="attribute_exists(PK) AND attribute_exists(SK)",
             ExpressionAttributeValues={
-                ":result": analysis_result,
+                ":result": safe_result,
                 ":status": "COMPLETED",
                 ":now": now
             }
         )
-        logger.info(f"成功更新分析结果: PK={model_info.get('PK')}")
+        logger.info(f"成功更新分析结果: PK={model_info.get('PK')}, brand={model_info.get('brand')}, model={model_info.get('model')}")
     except Exception as e:
         logger.error(f"更新分析结果失败: PK={model_info.get('PK')}, error={e}")
         raise
@@ -327,10 +350,6 @@ def update_model_analysis_result(model_info: Dict, analysis_result: Dict):
 def mark_model_analysis_failed(model_info: Dict, error: str):
     """
     标记型号分析失败
-    
-    Args:
-        model_info: 完整的DynamoDB记录
-        error: 错误信息
     """
     now = datetime.now(timezone.utc).isoformat()
 
@@ -386,13 +405,13 @@ def build_model_analysis_prompt(model_info: Dict) -> str:
       "max": 最高価格（数値）,
       "typical": 一般的な価格（数値）
     }},
-    "depreciation_rate": "月間価値減少率（例：0.05）",
+    "depreciation_rate": 0.05,
     "popular_features": ["人気の特徴1", "特徴2"],
     "target_buyers": ["想定購入者層1", "層2"],
     "seasonal_factors": "季節要因の説明"
   }},
   "resale_potential": {{
-    "score": 1-10の数値,
+    "score": 8,
     "margin_potential": "HIGH/MEDIUM/LOW",
     "turnover_speed": "FAST/MEDIUM/SLOW",
     "risk_factors": ["リスク要因1", "要因2"],
@@ -573,7 +592,17 @@ def process_model_analysis(event: Dict = None) -> Dict:
     }
     
     try:
-        categories = [cat.strip() for cat in CATEGORIES_TO_SCAN.split(",") if cat.strip()]
+        # 支持事件中指定品类
+        event = event or {}
+        event_categories = event.get("categories")
+        
+        if isinstance(event_categories, list):
+            categories = [str(c).strip() for c in event_categories if str(c).strip()]
+        elif isinstance(event_categories, str):
+            categories = [c.strip() for c in event_categories.split(",") if c.strip()]
+        else:
+            categories = [c.strip() for c in CATEGORIES_TO_SCAN.split(",") if c.strip()]
+        
         logger.info(f"扫描品类: {categories}")
         
         unanalyzed_models = get_unanalyzed_models(categories, MAX_MODELS_PER_RUN * 2)
