@@ -2,452 +2,90 @@ AWSTemplateFormatVersion: "2010-09-09"
 
 Description: >
   电子产品目录采集器 + AI API Secret + Yahoo Auction 抓取器 + 分析工作流 + 型号批量分析器
-  Lambda 代码通过已有 S3 Bucket 部署
 
 Parameters:
-  # ============ 通用参数 ============
   Environment:
     Type: String
     Default: dev
-    AllowedValues:
-      - dev
-      - test
-      - prod
-    Description: 环境名称
+    AllowedValues: [dev, test, prod]
 
-  # ============ S3 代码部署参数 ============
   LambdaCodeS3Bucket:
     Type: String
-    Description: 已存在的 S3 Bucket 名称，用于存储 Lambda 代码
 
   LambdaCodeS3Key:
     Type: String
     Default: "productcatalog/lambda.zip"
-    Description: S3 中 Lambda 代码的对象键
 
-  # ============ Secret 控制参数 ============
   DeploySecret:
     Type: String
     Default: "true"
-    AllowedValues:
-      - "true"
-      - "false"
-    Description: 是否部署 AI API Secret
+    AllowedValues: ["true", "false"]
 
   ApiKey:
     Type: String
     NoEcho: true
     Default: ""
-    Description: API Key（仅在 DeploySecret=true 时需要）
 
   SecretName:
     Type: String
     Default: "ProductCatalog/ApiSecret"
-    Description: Secrets Manager 中的 Secret 名称前缀
 
-  # ============ 主应用参数 ============
   DeployMainApp:
     Type: String
     Default: "true"
-    AllowedValues:
-      - "true"
-      - "false"
-    Description: 是否部署主应用
+    AllowedValues: ["true", "false"]
 
-  AiModel:
+  DeployScraper:
     Type: String
-    Default: "doubao-seed-2-0-mini-260428"
-    Description: AI 模型名称
+    Default: "true"
+    AllowedValues: ["true", "false"]
 
-  ApiUrl:
-    Type: String
-    Default: "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
-    Description: API URL
-
-  # ============ 型号批量分析器参数 ============
   DeployModelAnalyzer:
     Type: String
     Default: "false"
-    AllowedValues:
-      - "true"
-      - "false"
-    Description: 是否部署型号批量分析器
+    AllowedValues: ["true", "false"]
 
   ScheduleEnabled:
     Type: String
     Default: "false"
-    AllowedValues:
-      - "true"
-      - "false"
-    Description: 是否启用定时调度
+    AllowedValues: ["true", "false"]
 
-  ScheduleIntervalHours:
-    Type: Number
-    Default: 12
-    MinValue: 1
-    MaxValue: 24
-    Description: 定时调度间隔（小时）
-
-  MaxModelsPerRun:
-    Type: Number
-    Default: 6
-    MinValue: 1
-    MaxValue: 20
-    Description: 每次执行最多分析的型号数
-
-  MaxConcurrentAnalysis:
-    Type: Number
-    Default: 3
-    MinValue: 1
-    MaxValue: 10
-    Description: 最大并发分析数
-
-  ModelAnalyzerTimeout:
-    Type: Number
-    Default: 900
-    MinValue: 300
-    MaxValue: 900
-    Description: 型号分析器 Lambda 超时时间（秒）
-
-  ModelAnalyzerMemory:
-    Type: Number
-    Default: 512
-    MinValue: 256
-    MaxValue: 1024
-    Description: 型号分析器 Lambda 内存（MB）
-
-  CategoriesToScan:
-    Type: String
-    Default: "スマートフォン,タブレット,ノートPC,ゲーム機,カメラ"
-    Description: 要扫描的品类（逗号分隔）
-
-  # ============ 其他通用参数 ============
-  MaxCategoriesPerRun:
-    Type: Number
-    Default: 20
-    MinValue: 1
-    MaxValue: 100
-    Description: 每次运行发现的最大品类数
-
-  MaxBrandsPerCategory:
-    Type: Number
-    Default: 20
-    MinValue: 1
-    MaxValue: 100
-    Description: 每个品类发现的最大品牌数
-
-  MaxModelsPerBrand:
-    Type: Number
-    Default: 50
-    MinValue: 1
-    MaxValue: 100
-    Description: 每个品牌发现的最大型号数
-
-  MaxTotalTokens:
-    Type: Number
-    Default: 50000
-    MinValue: 10000
-    MaxValue: 1000000
-    Description: 每次运行的最大 Token 用量
-
-  LambdaTimeoutBuffer:
-    Type: Number
-    Default: 30
-    MinValue: 10
-    MaxValue: 300
-    Description: Lambda 超时缓冲时间（秒）
-
-  ApiCallDelay:
-    Type: Number
-    Default: 1
-    MinValue: 0
-    MaxValue: 10
-    Description: API 调用间隔（秒）
-
-  CategoryLimit:
-    Type: Number
-    Default: 5
-    MinValue: 1
-    MaxValue: 20
-    Description: 每次处理的最大品类数
-
-  BrandLimit:
-    Type: Number
-    Default: 3
-    MinValue: 1
-    MaxValue: 10
-    Description: 每个品类处理的最大品牌数
-
-  LogRetentionDays:
-    Type: Number
-    Default: 14
-    MinValue: 1
-    MaxValue: 3653
-    Description: CloudWatch 日志保留天数
-
-  # ============ Yahoo Auction 抓取器参数 ============
-  DeployScraper:
-    Type: String
-    Default: "true"
-    AllowedValues:
-      - "true"
-      - "false"
-    Description: 是否部署 Yahoo Auction 抓取器和分析器
-
-  YahooAuctionMaxPages:
-    Type: Number
-    Default: 2
-    MinValue: 1
-    MaxValue: 10
-    Description: 每次抓取的最大页数
-
-  YahooAuctionRequestTimeout:
-    Type: Number
-    Default: 30
-    MinValue: 5
-    MaxValue: 120
-    Description: HTTP 请求超时（秒）
-
-  YahooAuctionDebugLogHtml:
-    Type: String
-    Default: "false"
-    AllowedValues:
-      - "true"
-      - "false"
-    Description: 是否记录调试 HTML 日志
-
-  YahooAuctionItemsPerPage:
-    Type: Number
-    Default: 50
-    MinValue: 10
-    MaxValue: 100
-    Description: 每页显示的商品数量
-
-  # ============ Yahoo Auction Analyzer 特定参数 ============
-  ModelParseBatchSize:
-    Type: Number
-    Default: 10
-    MinValue: 1
-    MaxValue: 50
-    Description: 活跃商品型号解析批次大小
-
-  ClosedParseBatchSize:
-    Type: Number
-    Default: 15
-    MinValue: 1
-    MaxValue: 50
-    Description: 闭拍商品型号解析批次大小
-
-  MaxClosedPerModel:
-    Type: Number
-    Default: 50
-    MinValue: 10
-    MaxValue: 200
-    Description: 每个型号搜索的最多闭拍商品数
-
-  DefaultSearchCount:
-    Type: Number
-    Default: 3
-    MinValue: 1
-    MaxValue: 20
-    Description: 默认搜索活跃商品数量
-
-  MaxActiveItems:
-    Type: Number
-    Default: 20
-    MinValue: 1
-    MaxValue: 50
-    Description: 最大活跃商品数量
-
-  AiRequestTimeout:
-    Type: Number
-    Default: 60
-    MinValue: 30
-    MaxValue: 300
-    Description: AI API 请求超时（秒）
-
-  AiMaxRetries:
-    Type: Number
-    Default: 3
-    MinValue: 1
-    MaxValue: 5
-    Description: AI API 最大重试次数
-
-  RequestInterval:
-    Type: Number
-    Default: 1.0
-    MinValue: 0.1
-    MaxValue: 5.0
-    Description: 请求间隔（秒）
-
-  # ============ 估价相关参数 ============
-  ExpectedSellingFeeRate:
-    Type: Number
-    Default: 0.10
-    MinValue: 0
-    MaxValue: 1
-    Description: 预期交易费率
-
-  DefaultShippingCost:
-    Type: Number
-    Default: 1500
-    MinValue: 0
-    MaxValue: 10000
-    Description: 默认运费（円）
-
-  DefaultRepairReserveRate:
-    Type: Number
-    Default: 0.05
-    MinValue: 0
-    MaxValue: 1
-    Description: 默认维修准备金率
-
-  MinComparableCount:
-    Type: Number
-    Default: 3
-    MinValue: 1
-    MaxValue: 10
-    Description: 最少可比商品数量
-
-  MaxPriceDeviation:
-    Type: Number
-    Default: 1.5
-    MinValue: 1
-    MaxValue: 5
-    Description: 最大价格偏差倍数
-
-  RiskReserveRate:
-    Type: Number
-    Default: 0.03
-    MinValue: 0
-    MaxValue: 1
-    Description: 风险准备金率
-
-  # ============ Yahoo Auction 自定义搜索参数 ============
-  AuctionParamNew:
-    Type: String
-    Default: ""
-    Description: "新品筛选 (空或1) - 可选"
-  AuctionParamOffer:
-    Type: String
-    Default: ""
-    Description: "可议价 (空或1) - 可选"
-  AuctionParamShipping:
-    Type: String
-    Default: ""
-    Description: "配送方式 - 可选"
-  AuctionParamIstatus:
-    Type: String
-    Default: ""
-    Description: "商品状态 - 可选"
-  AuctionParamAbatch:
-    Type: String
-    Default: ""
-    Description: "批次参数 - 可选"
-  AuctionParamLocCd:
-    Type: String
-    Default: ""
-    Description: "地区代码 - 可选"
-  AuctionParamSelect:
-    Type: String
-    Default: ""
-    Description: "select 参数 - 可选"
-  AuctionParamSpec:
-    Type: String
-    Default: ""
-    Description: "规格参数 - 可选"
-  AuctionParamPriceType:
-    Type: String
-    Default: ""
-    Description: "价格类型 - 可选"
-  AuctionParamMin:
-    Type: String
-    Default: ""
-    Description: "最低价格 - 可选"
-  AuctionParamMax:
-    Type: String
-    Default: ""
-    Description: "最高价格 - 可选"
-  AuctionParamCarInspection:
-    Type: String
-    Default: ""
-    Description: "车检参数 - 可选"
-  AuctionParamFixed:
-    Type: String
-    Default: ""
-    Description: "一口价筛选 - 可选"
-  AuctionParamAucminprice:
-    Type: String
-    Default: ""
-    Description: "拍卖最低价格 - 可选"
-  AuctionParamAucmaxprice:
-    Type: String
-    Default: ""
-    Description: "拍卖最高价格 - 可选"
-  AuctionParamAucminBidorbuyPrice:
-    Type: String
-    Default: ""
-    Description: "即决最低价格 - 可选"
-  AuctionParamAucmaxBidorbuyPrice:
-    Type: String
-    Default: ""
-    Description: "即决最高价格 - 可选"
-  AuctionParamLc1:
-    Type: String
-    Default: ""
-    Description: "LC1参数 - 可选"
-  AuctionParamJpypayment:
-    Type: String
-    Default: ""
-    Description: "PayPay等支付方式 - 可选"
-  AuctionParamPoint:
-    Type: String
-    Default: ""
-    Description: "积分参数 - 可选"
-  AuctionParamThumb:
-    Type: String
-    Default: ""
-    Description: "缩略图参数 - 可选"
-  AuctionParamWrappingicon:
-    Type: String
-    Default: ""
-    Description: "包装图标 - 可选"
-  AuctionParamPrivacyDelivery:
-    Type: String
-    Default: ""
-    Description: "隐私配送 - 可选"
-  AuctionParamGiftIcon:
-    Type: String
-    Default: ""
-    Description: "礼品图标 - 可选"
-  AuctionParamCharity:
-    Type: String
-    Default: ""
-    Description: "慈善参数 - 可选"
-  AuctionParamMode:
-    Type: String
-    Default: ""
-    Description: "模式参数 - 可选"
-  AuctionParamN:
-    Type: String
-    Default: ""
-    Description: "每页数量 - 可选"
-  AuctionParamS1:
-    Type: String
-    Default: ""
-    Description: "排序字段 - 可选"
-  AuctionParamO1:
-    Type: String
-    Default: ""
-    Description: "排序方向 - 可选"
-  AuctionParamMaxSprice:
-    Type: String
-    Default: ""
-    Description: "最高售价 - 可选"
-  AuctionParamType:
-    Type: String
-    Default: ""
-    Description: "类型 (auction/fixed/all) - 可选"
+  # 以下参数全部可选，空字符串时使用 Python 代码默认值
+  AiModel:           { Type: String, Default: "" }
+  ApiUrl:            { Type: String, Default: "" }
+  ScheduleIntervalHours:    { Type: String, Default: "" }
+  MaxModelsPerRun:          { Type: String, Default: "" }
+  MaxConcurrentAnalysis:    { Type: String, Default: "" }
+  ModelAnalyzerTimeout:     { Type: String, Default: "" }
+  ModelAnalyzerMemory:      { Type: String, Default: "" }
+  CategoriesToScan:         { Type: String, Default: "" }
+  MaxCategoriesPerRun:      { Type: String, Default: "" }
+  MaxBrandsPerCategory:     { Type: String, Default: "" }
+  MaxModelsPerBrand:        { Type: String, Default: "" }
+  MaxTotalTokens:           { Type: String, Default: "" }
+  LambdaTimeoutBuffer:      { Type: String, Default: "" }
+  ApiCallDelay:             { Type: String, Default: "" }
+  CategoryLimit:            { Type: String, Default: "" }
+  BrandLimit:               { Type: String, Default: "" }
+  LogRetentionDays:         { Type: String, Default: "" }
+  YahooAuctionMaxPages:     { Type: String, Default: "" }
+  YahooAuctionRequestTimeout: { Type: String, Default: "" }
+  YahooAuctionDebugLogHtml: { Type: String, Default: "", AllowedValues: ["", "true", "false"] }
+  YahooAuctionItemsPerPage: { Type: String, Default: "" }
+  ModelParseBatchSize:      { Type: String, Default: "" }
+  ClosedParseBatchSize:     { Type: String, Default: "" }
+  MaxClosedPerModel:        { Type: String, Default: "" }
+  DefaultSearchCount:       { Type: String, Default: "" }
+  MaxActiveItems:           { Type: String, Default: "" }
+  AiRequestTimeout:         { Type: String, Default: "" }
+  AiMaxRetries:             { Type: String, Default: "" }
+  RequestInterval:          { Type: String, Default: "" }
+  ExpectedSellingFeeRate:   { Type: String, Default: "" }
+  DefaultShippingCost:      { Type: String, Default: "" }
+  DefaultRepairReserveRate: { Type: String, Default: "" }
+  MinComparableCount:       { Type: String, Default: "" }
+  MaxPriceDeviation:        { Type: String, Default: "" }
+  RiskReserveRate:          { Type: String, Default: "" }
 
 Conditions:
   DeploySecretCondition: !Equals [!Ref DeploySecret, "true"]
@@ -458,30 +96,17 @@ Conditions:
   ScheduleEnabledCondition: !Equals [!Ref ScheduleEnabled, "true"]
 
 Resources:
-  # ============================================
-  # AI API Secret（可选）
-  # ============================================
+
   ApiSecret:
     Type: AWS::SecretsManager::Secret
     Condition: DeploySecretCondition
     Properties:
       Name: !Sub "${SecretName}/${Environment}"
-      Description: AI API key for product catalog discovery
-      SecretString: !If
-        - HasApiKey
-        - !Sub '{"apiKey":"${ApiKey}"}'
-        - '{"apiKey":"PLACEHOLDER-REPLACE-ME"}'
+      SecretString: !If [HasApiKey, !Sub '{"apiKey":"${ApiKey}"}', '{"apiKey":"PLACEHOLDER-REPLACE-ME"}']
       Tags:
-        - Key: Application
-          Value: ProductCatalog
-        - Key: Environment
-          Value: !Ref Environment
+        - Key: Application; Value: ProductCatalog
+        - Key: Environment; Value: !Ref Environment
 
-  # ============================================
-  # 主应用（可选）
-  # ============================================
-
-  # ---------- DynamoDB 表 ----------
   ProductCatalogTable:
     Type: AWS::DynamoDB::Table
     Condition: DeployMainAppCondition
@@ -489,41 +114,38 @@ Resources:
       TableName: !Sub "ProductCatalog-${Environment}"
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
-        - AttributeName: PK
-          AttributeType: S
-        - AttributeName: SK
-          AttributeType: S
+        - AttributeName: PK; AttributeType: S
+        - AttributeName: SK; AttributeType: S
       KeySchema:
-        - AttributeName: PK
-          KeyType: HASH
-        - AttributeName: SK
-          KeyType: RANGE
-      PointInTimeRecoverySpecification:
-        PointInTimeRecoveryEnabled: true
-      SSESpecification:
-        SSEEnabled: true
-      Tags:
-        - Key: Application
-          Value: ProductCatalog
-        - Key: Environment
-          Value: !Ref Environment
+        - AttributeName: PK; KeyType: HASH
+        - AttributeName: SK; KeyType: RANGE
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      SSESpecification: { SSEEnabled: true }
 
-  # ---------- CloudWatch Logs ----------
-  ProductCatalogLogGroup:
-    Type: AWS::Logs::LogGroup
-    Condition: DeployMainAppCondition
+  YahooAuctionClosedTable:
+    Type: AWS::DynamoDB::Table
+    Condition: DeployScraperCondition
     Properties:
-      LogGroupName: !Sub "/aws/lambda/ProductCatalog-Discovery-${Environment}"
-      RetentionInDays: !Ref LogRetentionDays
+      TableName: !Sub "YahooAuctionItems-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: itemID, AttributeType: S }]
+      KeySchema: [{ AttributeName: itemID, KeyType: HASH }]
+      TimeToLiveSpecification: { AttributeName: ttl, Enabled: true }
+      SSESpecification: { SSEEnabled: true }
 
-  ModelAnalyzerLogGroup:
-    Type: AWS::Logs::LogGroup
-    Condition: DeployModelAnalyzerCondition
+  YahooAuctionActiveTable:
+    Type: AWS::DynamoDB::Table
+    Condition: DeployScraperCondition
     Properties:
-      LogGroupName: !Sub "/aws/lambda/ModelAnalyzer-${Environment}"
-      RetentionInDays: !Ref LogRetentionDays
+      TableName: !Sub "YahooAuctionActiveItems-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{ AttributeName: itemID, AttributeType: S }]
+      KeySchema: [{ AttributeName: itemID, KeyType: HASH }]
+      TimeToLiveSpecification: { AttributeName: ttl, Enabled: true }
+      SSESpecification: { SSEEnabled: true }
 
-  # ---------- Lambda 执行角色 ----------
+  # ========== IAM Roles (省略详细 Policy，结构同前) ==========
+
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Condition: DeployMainAppCondition
@@ -533,40 +155,72 @@ Resources:
         Version: "2012-10-17"
         Statement:
           - Effect: Allow
-            Principal:
-              Service:
-                - lambda.amazonaws.com
-            Action:
-              - sts:AssumeRole
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
       Policies:
-        - PolicyName: ProductCatalogDiscoveryPolicy
+        - PolicyName: DiscoveryPolicy
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              - Sid: DynamoDBCatalogAccess
-                Effect: Allow
-                Action:
-                  - dynamodb:GetItem
-                  - dynamodb:PutItem
-                  - dynamodb:UpdateItem
-                  - dynamodb:Query
-                  - dynamodb:BatchWriteItem
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query, dynamodb:BatchWriteItem]
                 Resource: !GetAtt ProductCatalogTable.Arn
-
-              - Sid: ReadApiSecret
-                Effect: Allow
-                Action:
-                  - secretsmanager:GetSecretValue
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
                 Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}/${Environment}-*"
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/ProductCatalog-Discovery-${Environment}:*"
 
-              - Sid: WriteLambdaLogs
-                Effect: Allow
-                Action:
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource: !Sub "${ProductCatalogLogGroup.Arn}:*"
+  YahooAuctionScraperRole:
+    Type: AWS::IAM::Role
+    Condition: DeployScraperCondition
+    Properties:
+      RoleName: !Sub "YahooAuctionScraper-Role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ScraperPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:GetItem, dynamodb:Query, dynamodb:UpdateItem, dynamodb:Scan]
+                Resource: [!GetAtt YahooAuctionClosedTable.Arn, !GetAtt YahooAuctionActiveTable.Arn]
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/YahooAuction*:*
 
-  # ---------- 型号分析器执行角色 ----------
+  YahooAuctionAnalyzerRole:
+    Type: AWS::IAM::Role
+    Condition: DeployScraperCondition
+    Properties:
+      RoleName: !Sub "YahooAuctionAnalyzer-Role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AnalyzerPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:PutItem, dynamodb:GetItem, dynamodb:Query, dynamodb:UpdateItem, dynamodb:Scan]
+                Resource: [!GetAtt YahooAuctionClosedTable.Arn, !GetAtt YahooAuctionActiveTable.Arn]
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}/${Environment}-*"
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/YahooAuction*:*"
+
   ModelAnalyzerRole:
     Type: AWS::IAM::Role
     Condition: DeployModelAnalyzerCondition
@@ -576,55 +230,35 @@ Resources:
         Version: "2012-10-17"
         Statement:
           - Effect: Allow
-            Principal:
-              Service:
-                - lambda.amazonaws.com
-            Action:
-              - sts:AssumeRole
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
       Policies:
         - PolicyName: ModelAnalyzerPolicy
           PolicyDocument:
             Version: "2012-10-17"
             Statement:
-              - Sid: DynamoDBCatalogAccess
-                Effect: Allow
-                Action:
-                  - dynamodb:GetItem
-                  - dynamodb:PutItem
-                  - dynamodb:UpdateItem
-                  - dynamodb:Query
-                  - dynamodb:Scan
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query, dynamodb:Scan]
                 Resource:
                   - !If [DeployMainAppCondition, !GetAtt ProductCatalogTable.Arn, !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/ProductCatalog-${Environment}"]
-                  - !If [DeployScraperCondition, !GetAtt YahooAuctionClosedTable.Arn, !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/YahooAuctionItems-${Environment}"]
-                  - !If [DeployScraperCondition, !GetAtt YahooAuctionActiveTable.Arn, !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/YahooAuctionActiveItems-${Environment}"]
-
-              - Sid: ReadApiSecret
-                Effect: Allow
-                Action:
-                  - secretsmanager:GetSecretValue
+                  - !If [DeployScraperCondition, !GetAtt YahooAuctionClosedTable.Arn, !Ref AWS::NoValue]
+                  - !If [DeployScraperCondition, !GetAtt YahooAuctionActiveTable.Arn, !Ref AWS::NoValue]
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
                 Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}/${Environment}-*"
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/ModelAnalyzer-${Environment}:*"
 
-              - Sid: WriteLambdaLogs
-                Effect: Allow
-                Action:
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource: !Sub "${ModelAnalyzerLogGroup.Arn}:*"
+  # ========== Lambda Functions ==========
 
-  # ---------- Lambda 函数 ----------
   ProductCatalogDiscovery:
     Type: AWS::Lambda::Function
     Condition: DeployMainAppCondition
-    DependsOn:
-      - ProductCatalogLogGroup
-      - LambdaExecutionRole
     Properties:
       FunctionName: !Sub "ProductCatalog-Discovery-${Environment}"
-      Description: 通过 AI 发现电子产品品类、品牌和型号（手动触发）
       Runtime: python3.12
-      Architectures:
-        - arm64
+      Architectures: [arm64]
       Handler: product_catalog_discovery.lambda_handler
       Timeout: 900
       MemorySize: 512
@@ -641,275 +275,19 @@ Resources:
           MAX_CATEGORIES: !Ref MaxCategoriesPerRun
           MAX_BRANDS: !Ref MaxBrandsPerCategory
           MAX_MODELS: !Ref MaxModelsPerBrand
-          MAX_TOTAL_TOKENS: "100000"
-          LAMBDA_TIMEOUT_SECONDS: "900"
+          MAX_TOTAL_TOKENS: !Ref MaxTotalTokens
           LAMBDA_TIMEOUT_BUFFER: !Ref LambdaTimeoutBuffer
           CATEGORY_LIMIT: !Ref CategoryLimit
           BRAND_LIMIT: !Ref BrandLimit
           API_CALL_DELAY: !Ref ApiCallDelay
-      Tags:
-        - Key: Application
-          Value: ProductCatalog
-        - Key: Environment
-          Value: !Ref Environment
 
-  # ---------- 型号批量分析器 Lambda ----------
-  ModelAnalyzerFunction:
-    Type: AWS::Lambda::Function
-    Condition: DeployModelAnalyzerCondition
-    DependsOn:
-      - ModelAnalyzerLogGroup
-      - ModelAnalyzerRole
-    Properties:
-      FunctionName: !Sub "ModelAnalyzer-${Environment}"
-      Description: "定时扫描目录并并发分析型号"
-      Runtime: python3.12
-      Architectures:
-        - arm64
-      Handler: model_analyzer.lambda_handler
-      Timeout: !Ref ModelAnalyzerTimeout
-      MemorySize: !Ref ModelAnalyzerMemory
-      Role: !GetAtt ModelAnalyzerRole.Arn
-      Code:
-        S3Bucket: !Ref LambdaCodeS3Bucket
-        S3Key: !Ref LambdaCodeS3Key
-      Environment:
-        Variables:
-          TABLE_NAME: !If [DeployMainAppCondition, !Ref ProductCatalogTable, !Sub "ProductCatalog-${Environment}"]
-          AI_API_URL: !Ref ApiUrl
-          AI_MODEL: !Ref AiModel
-          SECRET_NAME: !Sub "${SecretName}/${Environment}"
-          SCHEDULE_ENABLED: !Ref ScheduleEnabled
-          SCHEDULE_INTERVAL_HOURS: !Ref ScheduleIntervalHours
-          MAX_MODELS_PER_RUN: !Ref MaxModelsPerRun
-          MAX_CONCURRENT_ANALYSIS: !Ref MaxConcurrentAnalysis
-          AI_REQUEST_TIMEOUT: !Ref AiRequestTimeout
-          AI_MAX_RETRIES: !Ref AiMaxRetries
-          AI_MAX_OUTPUT_TOKENS: "4000"
-          CATEGORIES_TO_SCAN: !Ref CategoriesToScan
-          MAX_TOTAL_TOKENS: !Ref MaxTotalTokens
-          LAMBDA_TIMEOUT_SECONDS: !Ref ModelAnalyzerTimeout
-          LAMBDA_TIMEOUT_BUFFER: !Ref LambdaTimeoutBuffer
-          MIN_CONFIDENCE_THRESHOLD: "0.5"
-      Tags:
-        - Key: Application
-          Value: ModelAnalyzer
-        - Key: Environment
-          Value: !Ref Environment
-
-  # ---------- CloudWatch Events 定时触发规则 ----------
-  ModelAnalyzerScheduleRule:
-    Type: AWS::Events::Rule
-    Condition: ScheduleEnabledCondition
-    DependsOn:
-      - ModelAnalyzerFunction
-    Properties:
-      Name: !Sub "ModelAnalyzer-Schedule-${Environment}"
-      Description: !Sub "每${ScheduleIntervalHours}小时触发一次型号分析"
-      ScheduleExpression: !Sub "rate(${ScheduleIntervalHours} hours)"
-      State: ENABLED
-      Targets:
-        - Arn: !GetAtt ModelAnalyzerFunction.Arn
-          Id: "ModelAnalyzerTarget"
-          Input: !Sub |
-            {
-              "source": "aws.events",
-              "detail-type": "Scheduled Event",
-              "resources": ["${ModelAnalyzerScheduleRule.Arn}"],
-              "detail": {}
-            }
-
-  # ---------- CloudWatch Events 权限 ----------
-  ModelAnalyzerSchedulePermission:
-    Type: AWS::Lambda::Permission
-    Condition: ScheduleEnabledCondition
-    DependsOn:
-      - ModelAnalyzerFunction
-    Properties:
-      Action: lambda:InvokeFunction
-      FunctionName: !Ref ModelAnalyzerFunction
-      Principal: events.amazonaws.com
-      SourceArn: !GetAtt ModelAnalyzerScheduleRule.Arn
-
-  # =============================================
-  # Yahoo Auction 抓取器资源
-  # =============================================
-
-  # ---------- DynamoDB 表：闭拍数据 ----------
-  YahooAuctionClosedTable:
-    Type: AWS::DynamoDB::Table
-    Condition: DeployScraperCondition
-    Properties:
-      TableName: !Sub "YahooAuctionItems-${Environment}"
-      BillingMode: PAY_PER_REQUEST
-      AttributeDefinitions:
-        - AttributeName: itemID
-          AttributeType: S
-      KeySchema:
-        - AttributeName: itemID
-          KeyType: HASH
-      TimeToLiveSpecification:
-        AttributeName: ttl
-        Enabled: true
-      SSESpecification:
-        SSEEnabled: true
-      PointInTimeRecoverySpecification:
-        PointInTimeRecoveryEnabled: true
-      Tags:
-        - Key: Application
-          Value: YahooAuctionScraper
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: Type
-          Value: Closed
-
-  # ---------- DynamoDB 表：活跃拍卖数据 ----------
-  YahooAuctionActiveTable:
-    Type: AWS::DynamoDB::Table
-    Condition: DeployScraperCondition
-    Properties:
-      TableName: !Sub "YahooAuctionActiveItems-${Environment}"
-      BillingMode: PAY_PER_REQUEST
-      AttributeDefinitions:
-        - AttributeName: itemID
-          AttributeType: S
-      KeySchema:
-        - AttributeName: itemID
-          KeyType: HASH
-      TimeToLiveSpecification:
-        AttributeName: ttl
-        Enabled: true
-      SSESpecification:
-        SSEEnabled: true
-      PointInTimeRecoverySpecification:
-        PointInTimeRecoveryEnabled: true
-      Tags:
-        - Key: Application
-          Value: YahooAuctionScraper
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: Type
-          Value: Active
-
-  # ---------- CloudWatch Logs ----------
-  YahooAuctionScraperLogGroup:
-    Type: AWS::Logs::LogGroup
-    Condition: DeployScraperCondition
-    Properties:
-      LogGroupName: !Sub "/aws/lambda/YahooAuctionScraper-${Environment}"
-      RetentionInDays: !Ref LogRetentionDays
-
-  YahooAuctionAnalyzerLogGroup:
-    Type: AWS::Logs::LogGroup
-    Condition: DeployScraperCondition
-    Properties:
-      LogGroupName: !Sub "/aws/lambda/YahooAuctionAnalyzer-${Environment}"
-      RetentionInDays: !Ref LogRetentionDays
-
-  # ---------- Lambda 执行角色：抓取器 ----------
-  YahooAuctionScraperRole:
-    Type: AWS::IAM::Role
-    Condition: DeployScraperCondition
-    Properties:
-      RoleName: !Sub "YahooAuctionScraper-Role-${Environment}"
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service:
-                - lambda.amazonaws.com
-            Action:
-              - sts:AssumeRole
-      Policies:
-        - PolicyName: YahooAuctionScraperPolicy
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Sid: DynamoDBAccess
-                Effect: Allow
-                Action:
-                  - dynamodb:PutItem
-                  - dynamodb:BatchWriteItem
-                  - dynamodb:GetItem
-                  - dynamodb:Query
-                  - dynamodb:UpdateItem
-                  - dynamodb:DeleteItem
-                  - dynamodb:Scan
-                Resource:
-                  - !GetAtt YahooAuctionClosedTable.Arn
-                  - !GetAtt YahooAuctionActiveTable.Arn
-              - Sid: WriteLogs
-                Effect: Allow
-                Action:
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource:
-                  - !Sub "${YahooAuctionScraperLogGroup.Arn}:*"
-                  - !Sub "${YahooAuctionAnalyzerLogGroup.Arn}:*"
-
-  # ---------- Lambda 执行角色：分析器 ----------
-  YahooAuctionAnalyzerRole:
-    Type: AWS::IAM::Role
-    Condition: DeployScraperCondition
-    Properties:
-      RoleName: !Sub "YahooAuctionAnalyzer-Role-${Environment}"
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service:
-                - lambda.amazonaws.com
-            Action:
-              - sts:AssumeRole
-      Policies:
-        - PolicyName: YahooAuctionAnalyzerPolicy
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Sid: DynamoDBFullAccess
-                Effect: Allow
-                Action:
-                  - dynamodb:PutItem
-                  - dynamodb:BatchWriteItem
-                  - dynamodb:GetItem
-                  - dynamodb:Query
-                  - dynamodb:UpdateItem
-                  - dynamodb:DeleteItem
-                  - dynamodb:Scan
-                Resource:
-                  - !GetAtt YahooAuctionClosedTable.Arn
-                  - !GetAtt YahooAuctionActiveTable.Arn
-
-              - Sid: ReadApiSecret
-                Effect: Allow
-                Action:
-                  - secretsmanager:GetSecretValue
-                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}/${Environment}-*"
-
-              - Sid: WriteLogs
-                Effect: Allow
-                Action:
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource:
-                  - !Sub "${YahooAuctionScraperLogGroup.Arn}:*"
-                  - !Sub "${YahooAuctionAnalyzerLogGroup.Arn}:*"
-
-  # ---------- Lambda 函数：抓取器 ----------
   YahooAuctionScraper:
     Type: AWS::Lambda::Function
     Condition: DeployScraperCondition
-    DependsOn:
-      - YahooAuctionScraperLogGroup
-      - YahooAuctionScraperRole
     Properties:
       FunctionName: !Sub "YahooAuctionScraper-${Environment}"
-      Description: "Yahoo Auction closed & active search scraper"
       Runtime: python3.12
-      Architectures:
-        - arm64
+      Architectures: [arm64]
       Handler: yahoo_auction_scraper.lambda_handler
       Timeout: 300
       MemorySize: 512
@@ -925,26 +303,14 @@ Resources:
           REQUEST_TIMEOUT: !Ref YahooAuctionRequestTimeout
           DEBUG_LOG_HTML: !Ref YahooAuctionDebugLogHtml
           ITEMS_PER_PAGE: !Ref YahooAuctionItemsPerPage
-          # Auction params...
-      Tags:
-        - Key: Application
-          Value: YahooAuctionScraper
-        - Key: Environment
-          Value: !Ref Environment
 
-  # ---------- Lambda 函数：分析器 ----------
   AuctionAnalyzerFunction:
     Type: AWS::Lambda::Function
     Condition: DeployScraperCondition
-    DependsOn:
-      - YahooAuctionAnalyzerLogGroup
-      - YahooAuctionAnalyzerRole
     Properties:
       FunctionName: !Sub "YahooAuctionAnalyzer-${Environment}"
-      Description: "Yahoo Auction 商品分析工作流"
       Runtime: python3.12
-      Architectures:
-        - arm64
+      Architectures: [arm64]
       Handler: auction_analyzer.lambda_handler
       Timeout: 900
       MemorySize: 1024
@@ -965,11 +331,9 @@ Resources:
           MAX_ACTIVE_ITEMS: !Ref MaxActiveItems
           MAX_CLOSED_PER_MODEL: !Ref MaxClosedPerModel
           REQUEST_INTERVAL: !Ref RequestInterval
-          INCLUDE_PAYPAY: "false"
           MODEL_PARSE_BATCH_SIZE: !Ref ModelParseBatchSize
           CLOSED_PARSE_BATCH_SIZE: !Ref ClosedParseBatchSize
           MAX_TOTAL_TOKENS: !Ref MaxTotalTokens
-          LAMBDA_TIMEOUT_SECONDS: "840"
           LAMBDA_TIMEOUT_BUFFER: !Ref LambdaTimeoutBuffer
           EXPECTED_SELLING_FEE_RATE: !Ref ExpectedSellingFeeRate
           DEFAULT_SHIPPING_COST: !Ref DefaultShippingCost
@@ -977,82 +341,76 @@ Resources:
           MIN_COMPARABLE_COUNT: !Ref MinComparableCount
           MAX_PRICE_DEVIATION: !Ref MaxPriceDeviation
           RISK_RESERVE_RATE: !Ref RiskReserveRate
-      Tags:
-        - Key: Application
-          Value: YahooAuctionAnalyzer
-        - Key: Environment
-          Value: !Ref Environment
+
+  ModelAnalyzerFunction:
+    Type: AWS::Lambda::Function
+    Condition: DeployModelAnalyzerCondition
+    Properties:
+      FunctionName: !Sub "ModelAnalyzer-${Environment}"
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: model_analyzer.lambda_handler
+      Timeout: 900
+      MemorySize: 512
+      Role: !GetAtt ModelAnalyzerRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: !Ref LambdaCodeS3Key
+      Environment:
+        Variables:
+          TABLE_NAME: !If [DeployMainAppCondition, !Ref ProductCatalogTable, !Sub "ProductCatalog-${Environment}"]
+          SECRET_NAME: !Sub "${SecretName}/${Environment}"
+          SCHEDULE_ENABLED: !Ref ScheduleEnabled
+          AI_API_URL: !Ref ApiUrl
+          AI_MODEL: !Ref AiModel
+          SCHEDULE_INTERVAL_HOURS: !Ref ScheduleIntervalHours
+          MAX_MODELS_PER_RUN: !Ref MaxModelsPerRun
+          MAX_CONCURRENT_ANALYSIS: !Ref MaxConcurrentAnalysis
+          CATEGORIES_TO_SCAN: !Ref CategoriesToScan
+          MAX_TOTAL_TOKENS: !Ref MaxTotalTokens
+          LAMBDA_TIMEOUT_BUFFER: !Ref LambdaTimeoutBuffer
+          AI_REQUEST_TIMEOUT: !Ref AiRequestTimeout
+          AI_MAX_RETRIES: !Ref AiMaxRetries
+
+  ModelAnalyzerScheduleRule:
+    Type: AWS::Events::Rule
+    Condition: ScheduleEnabledCondition
+    Properties:
+      Name: !Sub "ModelAnalyzer-Schedule-${Environment}"
+      ScheduleExpression: !Sub "rate(${ScheduleIntervalHours} hours)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ModelAnalyzerFunction.Arn
+          Id: "ModelAnalyzerTarget"
+
+  ModelAnalyzerSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Condition: ScheduleEnabledCondition
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ModelAnalyzerFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ModelAnalyzerScheduleRule.Arn
 
 Outputs:
-  LambdaCodeBucketName:
-    Description: S3 存储 Lambda 代码的存储桶名称
-    Value: !Ref LambdaCodeS3Bucket
-
-  LambdaCodeObjectKey:
-    Description: S3 中 Lambda 代码对象键
-    Value: !Ref LambdaCodeS3Key
-
-  ApiSecretArn:
-    Description: API Secret ARN
-    Condition: DeploySecretCondition
-    Value: !Ref ApiSecret
-
-  ApiSecretName:
-    Description: API Secret 名称
-    Condition: DeploySecretCondition
-    Value: !Sub "${SecretName}/${Environment}"
-
   ProductCatalogTableName:
-    Description: DynamoDB 产品目录表名称
     Condition: DeployMainAppCondition
     Value: !Ref ProductCatalogTable
-
-  ProductCatalogTableArn:
-    Description: DynamoDB 产品目录表 ARN
-    Condition: DeployMainAppCondition
-    Value: !GetAtt ProductCatalogTable.Arn
-
   DiscoveryLambdaName:
-    Description: Lambda 发现函数名称
     Condition: DeployMainAppCondition
     Value: !Ref ProductCatalogDiscovery
-
-  DiscoveryLambdaArn:
-    Description: Lambda 发现函数 ARN
-    Condition: DeployMainAppCondition
-    Value: !GetAtt ProductCatalogDiscovery.Arn
-
-  ModelAnalyzerFunctionName:
-    Description: 型号批量分析器 Lambda 函数名称
-    Condition: DeployModelAnalyzerCondition
-    Value: !Ref ModelAnalyzerFunction
-
-  ModelAnalyzerFunctionArn:
-    Description: 型号批量分析器 Lambda 函数 ARN
-    Condition: DeployModelAnalyzerCondition
-    Value: !GetAtt ModelAnalyzerFunction.Arn
-
-  ModelAnalyzerScheduleRuleName:
-    Description: 型号分析器定时规则名称
-    Condition: ScheduleEnabledCondition
-    Value: !Ref ModelAnalyzerScheduleRule
-
   YahooAuctionClosedTableName:
-    Description: Yahoo Auction closed items DynamoDB table name
     Condition: DeployScraperCondition
     Value: !Ref YahooAuctionClosedTable
-
   YahooAuctionActiveTableName:
-    Description: Yahoo Auction active items DynamoDB table name
     Condition: DeployScraperCondition
     Value: !Ref YahooAuctionActiveTable
-
   YahooAuctionScraperFunctionName:
-    Description: Yahoo Auction scraper Lambda function name
     Condition: DeployScraperCondition
     Value: !Ref YahooAuctionScraper
-
   AuctionAnalyzerFunctionName:
-    Description: Yahoo Auction analyzer Lambda function name
     Condition: DeployScraperCondition
     Value: !Ref AuctionAnalyzerFunction
+  ModelAnalyzerFunctionName:
+    Condition: DeployModelAnalyzerCondition
+    Value: !Ref ModelAnalyzerFunction
