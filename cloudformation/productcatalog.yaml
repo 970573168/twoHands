@@ -551,7 +551,7 @@ Resources:
       LogGroupName: !Sub "/aws/lambda/YahooAuctionAnalyzer-${Environment}"
       RetentionInDays: !Ref LogRetentionDays
 
-  # ---------- Lambda 执行角色 ----------
+  # ---------- Lambda 执行角色：抓取器 ----------
   YahooAuctionScraperRole:
     Type: AWS::IAM::Role
     Condition: DeployScraperCondition
@@ -584,6 +584,55 @@ Resources:
                 Resource:
                   - !GetAtt YahooAuctionClosedTable.Arn
                   - !GetAtt YahooAuctionActiveTable.Arn
+              - Sid: WriteLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "${YahooAuctionScraperLogGroup.Arn}:*"
+                  - !Sub "${YahooAuctionAnalyzerLogGroup.Arn}:*"
+
+  # ---------- Lambda 执行角色：分析器（扩展权限） ----------
+  YahooAuctionAnalyzerRole:
+    Type: AWS::IAM::Role
+    Condition: DeployScraperCondition
+    Properties:
+      RoleName: !Sub "YahooAuctionAnalyzer-Role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: YahooAuctionAnalyzerPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: DynamoDBFullAccess
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt YahooAuctionClosedTable.Arn
+                  - !GetAtt YahooAuctionActiveTable.Arn
+
+              - Sid: ReadApiSecret
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}/${Environment}-*"
+
               - Sid: WriteLogs
                 Effect: Allow
                 Action:
@@ -664,17 +713,17 @@ Resources:
     Condition: DeployScraperCondition
     DependsOn:
       - YahooAuctionAnalyzerLogGroup
-      - YahooAuctionScraperRole
+      - YahooAuctionAnalyzerRole
     Properties:
       FunctionName: !Sub "YahooAuctionAnalyzer-${Environment}"
-      Description: "Yahoo Auction商品分析工作流"
+      Description: "Yahoo Auction商品分析工作流（支持 AI 估价、模型解析、权限完整）"
       Runtime: python3.12
       Architectures:
         - arm64
       Handler: auction_analyzer.lambda_handler
       Timeout: 900
       MemorySize: 1024
-      Role: !GetAtt YahooAuctionScraperRole.Arn
+      Role: !GetAtt YahooAuctionAnalyzerRole.Arn
       Code:
         S3Bucket: !Ref LambdaCodeS3Bucket
         S3Key: !Ref LambdaCodeS3Key
@@ -692,6 +741,9 @@ Resources:
           EXPECTED_SELLING_FEE_RATE: "0.10"
           DEFAULT_SHIPPING_COST: "1500"
           MIN_COMPARABLE_COUNT: "3"
+          MAX_TOTAL_TOKENS: !Ref MaxTotalTokens
+          LAMBDA_TIMEOUT_SECONDS: "840"
+          LAMBDA_TIMEOUT_BUFFER: !Ref LambdaTimeoutBuffer
       Tags:
         - Key: Application
           Value: YahooAuctionAnalyzer
@@ -780,3 +832,13 @@ Outputs:
     Description: Yahoo Auction analyzer Lambda function ARN
     Condition: DeployScraperCondition
     Value: !GetAtt AuctionAnalyzerFunction.Arn
+
+  YahooAuctionScraperRoleArn:
+    Description: Yahoo Auction scraper execution role ARN
+    Condition: DeployScraperCondition
+    Value: !GetAtt YahooAuctionScraperRole.Arn
+
+  YahooAuctionAnalyzerRoleArn:
+    Description: Yahoo Auction analyzer execution role ARN
+    Condition: DeployScraperCondition
+    Value: !GetAtt YahooAuctionAnalyzerRole.Arn
