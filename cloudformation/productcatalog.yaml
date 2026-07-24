@@ -42,7 +42,7 @@ Parameters:
 
   DeployModelAnalyzer:
     Type: String
-    Default: "false"
+    Default: "true"
     AllowedValues: ["true", "false"]
 
   ScheduleEnabled:
