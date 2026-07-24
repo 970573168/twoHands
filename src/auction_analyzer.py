@@ -1,16 +1,11 @@
 """
-Yahoo Auction 商品分析工作流 Lambda (最终修复版)
-主要修复：
-1. 严格按照 count 参数控制搜索数量
-2. 只处理本次抓取的商品ID
-3. 型号解析分批处理，检查 finish_reason
-4. Token 上限从环境变量读取
-5. 第五步限定范围
-6. 统计准确性
-7. 状态准确性
-8. 运费安全处理
-9. 修复第三步被跳过的问题
-10. 修复 DynamoDB 保留关键字 condition 冲突 → 使用 parsedCondition
+Yahoo Auction 商品分析工作流 Lambda (关键参数验证版)
+主要功能：
+1. AI 解析型号时同时识别影响价格的关键参数
+2. 缺少关键参数的商品标记为 EXCLUDED，不进入后续分析
+3. 闭拍商品同样执行关键参数验证和型号匹配
+4. 搜索词包含完整关键参数
+5. 多层保护确保只有完整、匹配的商品进入价格分析
 """
 
 import os
@@ -252,6 +247,16 @@ def determine_shipping_status(shipping_text: str) -> Dict:
     }
 
 
+def build_closed_search_keyword(model_info: Dict) -> str:
+    """构建包含完整关键参数的搜索关键词"""
+    parts = [
+        normalize(model_info.get("brand", "")),
+        normalize(model_info.get("model", "")),
+        normalize(model_info.get("storage", ""))
+    ]
+    return " ".join(x for x in parts if x)
+
+
 def response(status_code: int, body: Dict) -> Dict:
     return {
         "statusCode": status_code,
@@ -284,9 +289,7 @@ def lambda_handler(event, context):
         
         logger.info(
             f"开始商品分析工作流: keyword='{keyword}', "
-            f"count={count}, force_reprocess={force_reprocess}, "
-            f"token_limit={MAX_TOTAL_TOKENS}, "
-            f"model_batch_size={MODEL_PARSE_BATCH_SIZE}"
+            f"count={count}, force_reprocess={force_reprocess}"
         )
         
         try:
@@ -323,6 +326,7 @@ def execute_workflow(keyword: str, count: int, force_reprocess: bool) -> Dict:
         "keyword": keyword,
         "active_scraped": 0,
         "active_parsed": 0,
+        "active_excluded": 0,
         "active_parse_failed": 0,
         "active_review_required": 0,
         "models_found": 0,
@@ -370,9 +374,10 @@ def execute_workflow(keyword: str, count: int, force_reprocess: bool) -> Dict:
         
         if items_to_parse:
             check_limits()
-            logger.info(f"第二步：批量解析型号 ({len(items_to_parse)} 个商品)")
+            logger.info(f"第二步：批量解析型号和关键参数 ({len(items_to_parse)} 个商品)")
             parse_result = batch_parse_models(items_to_parse)
             workflow_result["active_parsed"] = parse_result["parsed"]
+            workflow_result["active_excluded"] = parse_result.get("excluded", 0)
             workflow_result["active_parse_failed"] = parse_result["failed"]
             workflow_result["active_review_required"] = parse_result["review_required"]
             workflow_result["models_found"] = parse_result["models_found"]
@@ -388,8 +393,9 @@ def execute_workflow(keyword: str, count: int, force_reprocess: bool) -> Dict:
             logger.info(f"第三步：搜索闭拍商品 ({len(unique_models)} 个型号)")
             for i, (model_key, model_info) in enumerate(unique_models.items()):
                 check_limits()
-                logger.info(f"  搜索型号 [{i+1}/{len(unique_models)}]: {model_info['brand']} {model_info['model']}")
-                model_keyword = f'{model_info["brand"]} {model_info["model"]}'
+                logger.info(f"  搜索型号 [{i+1}/{len(unique_models)}]: {model_info['brand']} {model_info['model']} {model_info.get('storage', '')}")
+                
+                model_keyword = build_closed_search_keyword(model_info)
                 closed_items = search_closed_for_model(
                     model_keyword, 
                     model_info,
@@ -399,14 +405,14 @@ def execute_workflow(keyword: str, count: int, force_reprocess: bool) -> Dict:
                 if i < len(unique_models) - 1:
                     time.sleep(REQUEST_INTERVAL)
         else:
-            logger.info("第三步：未找到已解析的型号，跳过闭拍搜索")
+            logger.info("第三步：未找到符合分析条件的型号，跳过闭拍搜索")
         
         # ========== 第四步 ==========
         unparsed_closed = get_unparsed_closed_items(limit=100)
         
         if unparsed_closed:
             check_limits()
-            logger.info(f"第四步：清洗闭拍商品型号 ({len(unparsed_closed)} 个商品)")
+            logger.info(f"第四步：清洗闭拍商品型号和关键参数 ({len(unparsed_closed)} 个商品)")
             parsed_count = batch_parse_closed_models(unparsed_closed)
             workflow_result["closed_parsed"] = parsed_count
         else:
@@ -427,7 +433,7 @@ def execute_workflow(keyword: str, count: int, force_reprocess: bool) -> Dict:
             workflow_result["pricing_insufficient_data"] = pricing_result["insufficient_data"]
             workflow_result["pricing_failed"] = pricing_result["failed"]
         else:
-            logger.info("第五步：没有需要估价的商品（可能型号未解析或已估价）")
+            logger.info("第五步：没有需要估价的商品")
         
         elapsed = time.time() - start_time
         workflow_result["elapsed_seconds"] = round(elapsed, 1)
@@ -570,7 +576,7 @@ def upsert_active_item(item: Dict, keyword: str):
     )
 
 
-# ==================== 第二步：型号解析 ====================
+# ==================== 第二步：型号解析（含关键参数验证）====================
 
 def get_active_items_by_ids(item_ids: List[str], only_pending: bool = True) -> List[Dict]:
     items = []
@@ -601,10 +607,10 @@ def get_all_active_items_by_ids(item_ids: List[str]) -> List[Dict]:
 
 def batch_parse_models(items: List[Dict]) -> Dict:
     if not items:
-        return {"parsed": 0, "review_required": 0, "models_found": 0, "failed": 0, "errors": []}
+        return {"parsed": 0, "excluded": 0, "review_required": 0, "models_found": 0, "failed": 0, "errors": []}
     
     batch_size = MODEL_PARSE_BATCH_SIZE
-    totals = {"parsed": 0, "review_required": 0, "models_found": 0, "failed": 0, "errors": []}
+    totals = {"parsed": 0, "excluded": 0, "review_required": 0, "models_found": 0, "failed": 0, "errors": []}
     
     for start in range(0, len(items), batch_size):
         batch = items[start:start + batch_size]
@@ -629,15 +635,20 @@ def batch_parse_models(items: List[Dict]) -> Dict:
         
         for parsed in parsed_items:
             item_id = parsed.get("itemId")
-            models = parsed.get("models", [])
-            if item_id:
-                returned_ids.add(item_id)
-                saved_status = save_active_models(item_id, models)
-                if saved_status == "COMPLETED":
-                    totals["parsed"] += 1
-                    totals["models_found"] += len(models)
-                elif saved_status == "REVIEW_REQUIRED":
-                    totals["review_required"] += 1
+            
+            if not item_id:
+                continue
+            
+            returned_ids.add(item_id)
+            saved_status = save_active_models(item_id, parsed)
+            
+            if saved_status == "COMPLETED":
+                totals["parsed"] += 1
+                totals["models_found"] += len(parsed.get("models", []))
+            elif saved_status == "EXCLUDED":
+                totals["excluded"] += 1
+            elif saved_status == "REVIEW_REQUIRED":
+                totals["review_required"] += 1
         
         input_ids = {item["itemID"] for item in batch}
         missing_ids = input_ids - returned_ids
@@ -652,8 +663,8 @@ def batch_parse_models(items: List[Dict]) -> Dict:
     
     logger.info(
         f"型号解析完成: 成功={totals['parsed']}, "
+        f"排除={totals['excluded']}, "
         f"需审核={totals['review_required']}, "
-        f"模型数={totals['models_found']}, "
         f"失败={totals['failed']}"
     )
     return totals
@@ -661,57 +672,169 @@ def batch_parse_models(items: List[Dict]) -> Dict:
 
 def build_model_parsing_prompt(items: List[Dict]) -> str:
     items_text = json.dumps(items, ensure_ascii=False, indent=2)
+    
     return f"""
-あなたは電子製品の専門家です。以下のYahooオークションの商品タイトルから、具体的な製品モデルを特定してください。
+あなたは中古電子製品の商品識別と価格比較適格性判定の専門家です。
+
+以下のYahooオークションの商品タイトルについて、具体的な製品モデルを解析し、
+価格に大きな影響を与える必須パラメータがタイトルに明記されているか判定してください。
 
 商品リスト：
 {items_text}
 
-以下のJSON形式で返してください。各商品IDに対して必ず結果を含めてください：
+以下のJSON形式のみで返してください。
+全ての商品IDを必ず含めてください。
+
 {{
   "items": [
     {{
       "itemId": "商品ID",
       "models": [
         {{
-          "brand": "ブランド名（例：Lenovo, Apple, Sony）",
-          "model": "モデル名（例：ThinkPad X1 Carbon Gen 11, iPhone 14 Pro）",
+          "brand": "ブランド名",
+          "model": "容量などを含まない基本モデル名",
+          "storage": "256GBなど。該当しない場合は空文字",
+          "normalizedModel": "価格比較用の完全な正規化モデル",
           "confidence": 0.95,
-          "evidence": "タイトルからの証拠"
+          "evidence": "タイトル内の根拠"
         }}
       ],
-      "isAccessory": false
+      "listingType": "MAIN_PRODUCT",
+      "isAccessory": false,
+      "hasAllCriticalParameters": true,
+      "missingCriticalParameters": [],
+      "criticalParameters": {{
+        "パラメータ名": {{
+          "value": "タイトルから取得した値",
+          "evidence": "タイトル内の根拠"
+        }}
+      }},
+      "isAnalysisEligible": true,
+      "exclusionReason": ""
     }}
   ]
 }}
 
-ルール：
-1. 各商品IDに対して必ずエントリを作成してください
-2. 一つの商品に複数のモデルが含まれる可能性があります
-3. アクセサリ（ケース、充電器、バッテリー等）の場合は isAccessory = true
-4. confidence は 0.0〜1.0 の範囲です
-5. 特定できない場合は models を空配列にしてください
-6. 必ず有効なJSON形式のみを返してください
-7. 全ての入力商品IDを含めてください
+listingType:
+- MAIN_PRODUCT: 製品本体
+- ACCESSORY: ケース、充電器、ケーブル、保護フィルム等
+- PARTS: 部品
+- BROKEN: ジャンク、故障品
+- BOX_ONLY: 箱のみ
+- BUNDLE: 比較困難な複数商品セット
+- UNKNOWN: 商品種類を確定できない
+
+重要ルール：
+
+1. 商品カテゴリごとに、市場価格へ大きな影響を与える必須パラメータを判断してください。
+
+2. 例：
+   - スマートフォン：正確なシリーズ、Pro/Pro Max/Plus等のバリエーション、ストレージ容量
+   - ノートPC：正確なシリーズと世代、CPU、メモリ、ストレージ容量
+   - カメラ：正確な本体型番、ボディのみかレンズキットか
+   - ゲーム機：世代、通常版/Slim/Pro、ストレージ容量
+
+3. 必須パラメータがタイトルに一つでも明記されていない場合：
+   - hasAllCriticalParameters = false
+   - isAnalysisEligible = false
+   - missingCriticalParameters に不足項目を入れる
+   - exclusionReason に理由を入れる
+
+4. タイトルに明記されていない情報を推測してはいけません。
+
+5. 画像、一般知識、他の商品、出品者情報から値を補完してはいけません。
+
+6. 型番から仕様が一意に確定できる場合でも、タイトル内に型番が明記されている場合に限り、
+   evidence にその型番を記録してください。不確実な型番対応は推測しないでください。
+
+7. アクセサリ、部品、箱のみ、ジャンク、比較困難なセット商品は：
+   - isAnalysisEligible = false
+
+8. normalizedModel は価格が異なる仕様を区別できる形式にしてください。
+   例：
+   - APPLE IPHONE 15 PRO 256GB
+   - APPLE IPHONE 15 PRO MAX 256GB
+   - LENOVO THINKPAD X1 CARBON GEN 11 I7 16GB 512GB
+
+9. 色は通常、必須パラメータにしないでください。
+   ただし限定版など市場価格へ大きな影響を与える場合は必須にできます。
+
+10. 必ず有効なJSONのみを返してください。
 """
 
 
-def save_active_models(item_id: str, models: List[Dict]) -> str:
+def save_active_models(item_id: str, parsed: Dict) -> str:
+    """保存活跃商品型号（含关键参数验证）"""
+    models = parsed.get("models", [])
+    listing_type = normalize(parsed.get("listingType", "UNKNOWN")).upper()
+    is_accessory = parse_bool(parsed.get("isAccessory", False))
+    has_all_critical = parse_bool(parsed.get("hasAllCriticalParameters", False))
+    is_analysis_eligible = parse_bool(parsed.get("isAnalysisEligible", False))
+    missing_parameters = parsed.get("missingCriticalParameters", [])
+    critical_parameters = parsed.get("criticalParameters", {})
+    exclusion_reason = normalize(parsed.get("exclusionReason", ""))
+    
+    if not isinstance(missing_parameters, list):
+        missing_parameters = []
+    if not isinstance(critical_parameters, dict):
+        critical_parameters = {}
+    
     normalized_models = []
     for model in models:
+        if not isinstance(model, dict):
+            continue
+        
         brand = normalize(model.get("brand", ""))
         model_name = normalize(model.get("model", ""))
+        storage = normalize(model.get("storage", ""))
+        ai_normalized_model = normalize(model.get("normalizedModel", "")).upper()
+        
         if not brand or not model_name:
             continue
+        
+        if ai_normalized_model:
+            normalized_key = ai_normalized_model
+        else:
+            key_parts = [brand, model_name]
+            if storage:
+                key_parts.append(storage)
+            normalized_key = normalize_model_key(key_parts[0], " ".join(key_parts[1:]))
+        
         normalized_models.append({
             "brand": brand,
             "model": model_name,
-            "normalizedModel": normalize_model_key(brand, model_name),
+            "storage": storage,
+            "normalizedModel": normalized_key,
             "confidence": str(model.get("confidence", 0)),
             "evidence": normalize(model.get("evidence", ""))
         })
     
-    status = "COMPLETED" if normalized_models else "REVIEW_REQUIRED"
+    excluded_listing_types = {"ACCESSORY", "PARTS", "BROKEN", "BOX_ONLY", "BUNDLE", "UNKNOWN"}
+    exclusion_reasons = []
+    
+    if listing_type in excluded_listing_types:
+        exclusion_reasons.append(f"商品类型不适合价格分析: {listing_type}")
+    if is_accessory:
+        exclusion_reasons.append("商品是配件")
+    if not has_all_critical:
+        if missing_parameters:
+            exclusion_reasons.append("标题缺少影响价格的关键参数: " + ", ".join(str(x) for x in missing_parameters))
+        else:
+            exclusion_reasons.append("标题缺少影响价格的关键参数")
+    if not is_analysis_eligible:
+        exclusion_reasons.append(exclusion_reason or "AI判定不适合价格分析")
+    
+    if not normalized_models:
+        status = "REVIEW_REQUIRED"
+    elif exclusion_reasons:
+        status = "EXCLUDED"
+    elif any(safe_decimal(model.get("confidence", 0)) < Decimal("0.7") for model in normalized_models):
+        status = "REVIEW_REQUIRED"
+    else:
+        status = "COMPLETED"
+    
+    final_exclusion_reason = "; ".join(dict.fromkeys(exclusion_reasons))
+    
     now = datetime.now(timezone.utc).isoformat()
     
     active_table.update_item(
@@ -719,16 +842,35 @@ def save_active_models(item_id: str, models: List[Dict]) -> str:
         UpdateExpression="""
             SET models = :models,
                 modelStatus = :status,
+                listingType = :listing_type,
+                isAccessory = :is_accessory,
+                hasAllCriticalParameters = :has_all_critical,
+                missingCriticalParameters = :missing_parameters,
+                criticalParameters = :critical_parameters,
+                isAnalysisEligible = :is_analysis_eligible,
+                exclusionReason = :exclusion_reason,
                 modelParsedAt = :now,
                 workflowStatus = :workflow
         """,
         ExpressionAttributeValues={
             ":models": normalized_models,
             ":status": status,
+            ":listing_type": listing_type,
+            ":is_accessory": is_accessory,
+            ":has_all_critical": has_all_critical,
+            ":missing_parameters": missing_parameters,
+            ":critical_parameters": to_decimal(critical_parameters),
+            ":is_analysis_eligible": (status == "COMPLETED"),
+            ":exclusion_reason": final_exclusion_reason,
             ":now": now,
-            ":workflow": "MODEL_PARSED"
+            ":workflow": (
+                "MODEL_PARSED" if status == "COMPLETED"
+                else "MODEL_EXCLUDED" if status == "EXCLUDED"
+                else "MODEL_REVIEW_REQUIRED"
+            )
         }
     )
+    
     return status
 
 
@@ -753,10 +895,16 @@ def mark_active_model_failed(item_id: str, error: str):
 
 
 def get_unique_models(active_items: List[Dict]) -> Dict[str, Dict]:
+    """获取唯一定型号列表（只返回 COMPLETED + isAnalysisEligible + hasAllCriticalParameters）"""
     unique = {}
     for item in active_items:
         if item.get("modelStatus") != "COMPLETED":
             continue
+        if item.get("isAnalysisEligible") is not True:
+            continue
+        if item.get("hasAllCriticalParameters") is not True:
+            continue
+        
         models = item.get("models", [])
         if isinstance(models, str):
             try:
@@ -765,6 +913,7 @@ def get_unique_models(active_items: List[Dict]) -> Dict[str, Dict]:
                 continue
         if not isinstance(models, list):
             continue
+        
         for model in models:
             if not isinstance(model, dict):
                 continue
@@ -773,6 +922,7 @@ def get_unique_models(active_items: List[Dict]) -> Dict[str, Dict]:
                 unique[key] = {
                     "brand": model.get("brand", ""),
                     "model": model.get("model", ""),
+                    "storage": model.get("storage", ""),
                     "normalizedModel": key
                 }
     return unique
@@ -871,7 +1021,7 @@ def upsert_closed_item(item: Dict, model_info: Dict):
     )
 
 
-# ==================== 第四步：AI 清洗闭拍型号 ====================
+# ==================== 第四步：AI 清洗闭拍型号（含关键参数验证和型号匹配）====================
 
 def get_unparsed_closed_items(limit: int = 100) -> List[Dict]:
     all_items = []
@@ -914,6 +1064,7 @@ def batch_parse_closed_models(items: List[Dict]) -> int:
         result = call_ai_with_retry(prompt)
         if not result:
             continue
+        
         parsed_items = result.get("items", [])
         returned_ids = set()
         for parsed in parsed_items:
@@ -921,40 +1072,70 @@ def batch_parse_closed_models(items: List[Dict]) -> int:
             if not item_id:
                 continue
             returned_ids.add(item_id)
+            
             models = parsed.get("models", [])
-            listing_type = parsed.get("listingType", "UNKNOWN")
-            is_comparable = parsed.get("isComparable", False)
+            listing_type = normalize(parsed.get("listingType", "UNKNOWN")).upper()
+            is_comparable = parse_bool(parsed.get("isComparable", False))
             condition = parsed.get("condition", "UNKNOWN")
-            exclusion_reason = parsed.get("exclusionReason", "")
+            exclusion_reason = normalize(parsed.get("exclusionReason", ""))
+            has_all_critical = parse_bool(parsed.get("hasAllCriticalParameters", False))
+            missing_parameters = parsed.get("missingCriticalParameters", [])
+            critical_parameters = parsed.get("criticalParameters", {})
+            matches_source_model = parse_bool(parsed.get("matchesSourceModel", False))
+            
+            if not isinstance(missing_parameters, list):
+                missing_parameters = []
+            if not isinstance(critical_parameters, dict):
+                critical_parameters = {}
+            
             excluded_types = {"ACCESSORY", "PARTS", "BROKEN", "BOX_ONLY", "BUNDLE", "UNKNOWN"}
             effective_comparable = (
                 bool(models)
                 and listing_type not in excluded_types
                 and is_comparable
+                and has_all_critical
+                and matches_source_model
             )
+            
             save_closed_models(
-                item_id, models, listing_type, 
-                effective_comparable, condition, exclusion_reason
+                item_id=item_id,
+                models=models,
+                listing_type=listing_type,
+                is_comparable=effective_comparable,
+                condition=condition,
+                exclusion_reason=exclusion_reason,
+                has_all_critical=has_all_critical,
+                missing_parameters=missing_parameters,
+                critical_parameters=critical_parameters,
+                matches_source_model=matches_source_model
             )
             total_parsed += 1
+        
         input_ids = {item["itemID"] for item in batch}
         missing_ids = input_ids - returned_ids
         for missing_id in missing_ids:
             mark_closed_parse_failed(missing_id, "AI_NOT_RETURNED")
+        
         if i + batch_size < len(items):
             time.sleep(REQUEST_INTERVAL)
+    
     return total_parsed
 
 
 def build_closed_model_parsing_prompt(items: List[Dict]) -> str:
     items_text = json.dumps(items, ensure_ascii=False, indent=2)
+    
     return f"""
-あなたは中古電子製品の専門家です。以下のYahooオークションの落札商品が、検索対象モデルと一致するか判定してください。
+あなたは中古電子製品の商品識別と価格比較適格性判定の専門家です。
+
+以下のYahooオークション落札商品のタイトルを解析し、
+検索対象モデルと価格比較可能か判定してください。
 
 商品リスト：
 {items_text}
 
-以下のJSON形式で返してください：
+以下のJSON形式のみで返してください。
+
 {{
   "items": [
     {{
@@ -962,12 +1143,24 @@ def build_closed_model_parsing_prompt(items: List[Dict]) -> str:
       "models": [
         {{
           "brand": "ブランド名",
-          "model": "モデル名",
-          "confidence": 0.95
+          "model": "基本モデル名",
+          "storage": "256GBなど。該当しない場合は空文字",
+          "normalizedModel": "価格比較用の完全な正規化モデル",
+          "confidence": 0.95,
+          "evidence": "タイトル内の根拠"
         }}
       ],
       "listingType": "MAIN_PRODUCT",
       "condition": "USED",
+      "hasAllCriticalParameters": true,
+      "missingCriticalParameters": [],
+      "criticalParameters": {{
+        "パラメータ名": {{
+          "value": "タイトルから取得した値",
+          "evidence": "タイトル内の根拠"
+        }}
+      }},
+      "matchesSourceModel": true,
       "isComparable": true,
       "exclusionReason": ""
     }}
@@ -975,60 +1168,114 @@ def build_closed_model_parsing_prompt(items: List[Dict]) -> str:
 }}
 
 listingType:
-- MAIN_PRODUCT: 本体
-- ACCESSORY: アクセサリ
-- PARTS: 部品
-- BROKEN: ジャンク
-- BOX_ONLY: 箱のみ
-- BUNDLE: 複数セット
-- UNKNOWN: 不明
+- MAIN_PRODUCT
+- ACCESSORY
+- PARTS
+- BROKEN
+- BOX_ONLY
+- BUNDLE
+- UNKNOWN
 
 condition:
-- NEW: 新品
-- USED: 中古
-- BROKEN: 故障
-- UNKNOWN: 不明
+- NEW
+- USED
+- BROKEN
+- UNKNOWN
 
-ルール：
-1. アクセサリ、部品、箱のみは isComparable = false
-2. ジャンク品は isComparable = false
-3. 全ての入力商品IDを含めてください
-4. 必ず有効なJSON形式のみを返してください
+重要ルール：
+
+1. 商品カテゴリごとに、市場価格へ大きな影響を与える必須パラメータを判断してください。
+
+2. 必須パラメータがタイトルに一つでも明記されていない場合：
+   - hasAllCriticalParameters = false
+   - isComparable = false
+   - missingCriticalParameters に不足項目を記録
+   - exclusionReason に理由を記録
+
+3. タイトルに明記されていない情報を推測してはいけません。
+
+4. sourceModel とタイトルから解析したモデルを比較してください。
+
+5. 基本モデル、バリエーション、容量など、
+   価格へ大きな影響を与える仕様が sourceModel と異なる場合：
+   - matchesSourceModel = false
+   - isComparable = false
+
+6. アクセサリ、部品、ジャンク、箱のみ、比較困難なセット商品は
+   isComparable = false にしてください。
+
+7. normalizedModel は容量など価格差を生む仕様を含めてください。
+
+8. 例：
+   - APPLE IPHONE 15 PRO 128GB
+   - APPLE IPHONE 15 PRO 256GB
+   - APPLE IPHONE 15 PRO MAX 256GB
+
+9. 全ての入力商品IDを必ず含めてください。
+
+10. 必ず有効なJSONのみを返してください。
 """
 
 
 def save_closed_models(
-    item_id: str, 
-    models: List[Dict], 
-    listing_type: str, 
+    item_id: str,
+    models: List[Dict],
+    listing_type: str,
     is_comparable: bool,
     condition: str = "UNKNOWN",
-    exclusion_reason: str = ""
+    exclusion_reason: str = "",
+    has_all_critical: bool = False,
+    missing_parameters: Optional[List[str]] = None,
+    critical_parameters: Optional[Dict] = None,
+    matches_source_model: bool = False
 ):
-    """保存闭拍商品型号（使用 parsedCondition 避免 DynamoDB 保留关键字冲突）"""
+    """保存闭拍商品型号（含关键参数验证和型号匹配）"""
+    missing_parameters = missing_parameters or []
+    critical_parameters = critical_parameters or {}
+    
     normalized_models = []
     for model in models:
+        if not isinstance(model, dict):
+            continue
+        
         brand = normalize(model.get("brand", ""))
         model_name = normalize(model.get("model", ""))
+        storage = normalize(model.get("storage", ""))
+        ai_normalized = normalize(model.get("normalizedModel", "")).upper()
+        
         if not brand or not model_name:
             continue
+        
+        if ai_normalized:
+            normalized_key = ai_normalized
+        else:
+            full_model = " ".join(x for x in [model_name, storage] if x)
+            normalized_key = normalize_model_key(brand, full_model)
+        
         normalized_models.append({
             "brand": brand,
             "model": model_name,
-            "normalizedModel": normalize_model_key(brand, model_name),
-            "confidence": str(model.get("confidence", 0))
+            "storage": storage,
+            "normalizedModel": normalized_key,
+            "confidence": str(model.get("confidence", 0)),
+            "evidence": normalize(model.get("evidence", ""))
         })
     
     if not normalized_models:
         status = "REVIEW_REQUIRED"
-    elif any(float(m.get("confidence", 0)) < 0.7 for m in normalized_models):
+    elif not has_all_critical:
+        status = "EXCLUDED"
+    elif not matches_source_model:
+        status = "EXCLUDED"
+    elif not is_comparable:
+        status = "EXCLUDED"
+    elif any(safe_decimal(m.get("confidence", 0)) < Decimal("0.7") for m in normalized_models):
         status = "REVIEW_REQUIRED"
     else:
         status = "COMPLETED"
     
     now = datetime.now(timezone.utc).isoformat()
     
-    # 使用 parsedCondition 字段名，避免 DynamoDB 保留关键字 condition
     closed_table.update_item(
         Key={"itemID": item_id},
         UpdateExpression="""
@@ -1037,6 +1284,10 @@ def save_closed_models(
                 listingType = :listing_type,
                 isComparable = :is_comparable,
                 parsedCondition = :condition_val,
+                hasAllCriticalParameters = :has_all_critical,
+                missingCriticalParameters = :missing_parameters,
+                criticalParameters = :critical_parameters,
+                matchesSourceModel = :matches_source_model,
                 exclusionReason = :exclusion_reason,
                 modelParsedAt = :now
         """,
@@ -1044,9 +1295,13 @@ def save_closed_models(
             ":models": normalized_models,
             ":status": status,
             ":listing_type": listing_type,
-            ":is_comparable": is_comparable,
+            ":is_comparable": (status == "COMPLETED" and is_comparable),
             ":condition_val": condition,
-            ":exclusion_reason": exclusion_reason,
+            ":has_all_critical": has_all_critical,
+            ":missing_parameters": missing_parameters,
+            ":critical_parameters": to_decimal(critical_parameters),
+            ":matches_source_model": matches_source_model,
+            ":exclusion_reason": normalize(exclusion_reason),
             ":now": now
         }
     )
@@ -1076,6 +1331,7 @@ def get_unpriced_items_for_ids(
     require_model_completed: bool = True,
     limit: int = 50
 ) -> List[Dict]:
+    """获取未定价的活跃商品（多重保护）"""
     items = []
     for item_id in item_ids:
         try:
@@ -1083,10 +1339,20 @@ def get_unpriced_items_for_ids(
             item = response.get("Item")
             if not item:
                 continue
+            
             if item.get("pricingStatus") != "PENDING":
                 continue
-            if require_model_completed and item.get("modelStatus") != "COMPLETED":
-                continue
+            
+            if require_model_completed:
+                if item.get("modelStatus") != "COMPLETED":
+                    continue
+                if item.get("isAnalysisEligible") is not True:
+                    continue
+                if item.get("hasAllCriticalParameters") is not True:
+                    continue
+                if item.get("exclusionReason"):
+                    continue
+            
             models = item.get("models", [])
             if isinstance(models, str):
                 try:
@@ -1095,6 +1361,7 @@ def get_unpriced_items_for_ids(
                     models = []
             if not models:
                 continue
+            
             items.append(item)
             if len(items) >= limit:
                 break
@@ -1167,6 +1434,7 @@ def batch_price_analysis(items: List[Dict]) -> Dict:
 
 
 def get_comparable_closed_items(active_item: Dict) -> List[Dict]:
+    """获取可比闭拍商品（多重保护：只返回完全匹配的 COMPLETED 商品）"""
     models = active_item.get("models", [])
     if isinstance(models, str):
         try:
@@ -1185,18 +1453,23 @@ def get_comparable_closed_items(active_item: Dict) -> List[Dict]:
         model_key = model.get("normalizedModel")
         if not model_key:
             continue
+        
         try:
             response = closed_table.scan(
                 FilterExpression=(
                     Attr("modelStatus").eq("COMPLETED") &
                     Attr("isComparable").eq(True) &
+                    Attr("hasAllCriticalParameters").eq(True) &
+                    Attr("matchesSourceModel").eq(True) &
                     Attr("price").gt(0)
                 ),
                 Limit=200
             )
+            
             for closed_item in response.get("Items", []):
                 if closed_item["itemID"] in seen_ids:
                     continue
+                
                 item_models = closed_item.get("models", [])
                 if isinstance(item_models, str):
                     try:
@@ -1205,6 +1478,7 @@ def get_comparable_closed_items(active_item: Dict) -> List[Dict]:
                         continue
                 if not isinstance(item_models, list):
                     continue
+                
                 for item_model in item_models:
                     if isinstance(item_model, dict) and item_model.get("normalizedModel") == model_key:
                         comparable.append(closed_item)
@@ -1291,7 +1565,6 @@ def build_pricing_prompt(active_item: Dict, comparable_items: List[Dict], stats:
         "models": active_item.get("models", [])
     }
     
-    # 修复：读取 parsedCondition 字段
     comparables_data = [
         {
             "itemId": item["itemID"],
