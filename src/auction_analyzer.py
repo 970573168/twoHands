@@ -47,6 +47,15 @@ AI_MAX_RETRIES = int(os.getenv("AI_MAX_RETRIES", "3"))
 REQUEST_INTERVAL = float(os.getenv("REQUEST_INTERVAL", "1.0"))
 INCLUDE_PAYPAY = os.getenv("INCLUDE_PAYPAY", "false").lower() == "true"
 
+# 新增：Secrets Manager 配置
+SECRET_NAME = os.getenv("SECRET_NAME", "")
+USE_SECRETS_MANAGER = os.getenv("USE_SECRETS_MANAGER", "false").lower() == "true"
+
+# 新增：Token 和超时控制配置
+MAX_TOTAL_TOKENS = int(os.getenv("MAX_TOTAL_TOKENS", "100000"))
+LAMBDA_TIMEOUT_SECONDS = int(os.getenv("LAMBDA_TIMEOUT_SECONDS", "840"))
+LAMBDA_TIMEOUT_BUFFER = int(os.getenv("LAMBDA_TIMEOUT_BUFFER", "30"))
+
 # 估价配置 - 使用 Decimal 避免浮点数问题
 EXPECTED_SELLING_FEE_RATE = Decimal(os.getenv("EXPECTED_SELLING_FEE_RATE", "0.10"))
 DEFAULT_SHIPPING_COST = Decimal(os.getenv("DEFAULT_SHIPPING_COST", "1500"))
@@ -55,9 +64,124 @@ MIN_COMPARABLE_COUNT = int(os.getenv("MIN_COMPARABLE_COUNT", "3"))
 MAX_PRICE_DEVIATION = Decimal(os.getenv("MAX_PRICE_DEVIATION", "1.5"))
 RISK_RESERVE_RATE = Decimal(os.getenv("RISK_RESERVE_RATE", "0.03"))
 
+# 重试配置
+RETRYABLE_CODES = {408, 409, 429, 500, 502, 503, 504}
+
 dynamodb = boto3.resource("dynamodb")
 active_table = dynamodb.Table(TABLE_NAME_ACTIVE)
 closed_table = dynamodb.Table(TABLE_NAME_CLOSED)
+
+# 初始化 Secrets Manager 客户端
+secretsmanager = boto3.client("secretsmanager") if USE_SECRETS_MANAGER else None
+
+# 全局变量
+_api_key_cache = None
+_total_tokens_used = 0
+_lambda_start_time = None
+
+
+# ==================== 密钥管理函数 ====================
+
+def get_api_key():
+    """获取 API 密钥（支持 Secrets Manager）"""
+    global _api_key_cache
+    
+    # 如果已缓存，直接返回
+    if _api_key_cache:
+        return _api_key_cache
+    
+    # 优先使用环境变量中的 API Key
+    if AI_API_KEY:
+        _api_key_cache = AI_API_KEY
+        logger.info("使用环境变量中的 API Key")
+        return _api_key_cache
+    
+    # 使用 Secrets Manager
+    if USE_SECRETS_MANAGER and SECRET_NAME:
+        try:
+            logger.info(f"从 Secrets Manager 获取密钥: {SECRET_NAME}")
+            response = secretsmanager.get_secret_value(SecretId=SECRET_NAME)
+            secret_string = response.get("SecretString")
+            
+            if not secret_string:
+                raise RuntimeError("Secret 中没有 SecretString 值")
+            
+            # 尝试解析 JSON 格式的 Secret
+            try:
+                secret_dict = json.loads(secret_string)
+                api_key = (
+                    secret_dict.get("apiKey") or 
+                    secret_dict.get("api_key") or 
+                    secret_dict.get("key") or
+                    secret_dict.get("API_KEY")
+                )
+                if not api_key:
+                    raise RuntimeError("Secret JSON 中未找到 apiKey/api_key/key/API_KEY")
+                _api_key_cache = api_key
+            except json.JSONDecodeError:
+                # 如果不是 JSON，直接使用字符串
+                _api_key_cache = secret_string
+            
+            logger.info("成功从 Secrets Manager 获取 API Key")
+            return _api_key_cache
+            
+        except Exception as e:
+            logger.error(f"从 Secrets Manager 获取密钥失败: {e}")
+            raise RuntimeError(f"无法获取 API 密钥: {e}")
+    
+    raise RuntimeError("未配置 API 密钥（请设置 AI_API_KEY 或启用 USE_SECRETS_MANAGER 并配置 SECRET_NAME）")
+
+
+# ==================== Token 和超时控制函数 ====================
+
+def get_elapsed_seconds():
+    """获取从 Lambda 开始到现在的运行时间（秒）"""
+    if _lambda_start_time is None:
+        return 0
+    return time.time() - _lambda_start_time
+
+
+def get_remaining_seconds():
+    """获取 Lambda 剩余可用时间（秒）"""
+    elapsed = get_elapsed_seconds()
+    remaining = LAMBDA_TIMEOUT_SECONDS - elapsed - LAMBDA_TIMEOUT_BUFFER
+    return max(0, remaining)
+
+
+def check_timeout():
+    """检查是否接近 Lambda 超时"""
+    remaining = get_remaining_seconds()
+    if remaining <= 0:
+        raise RuntimeError(
+            f"Lambda超时倒计时: 已运行{get_elapsed_seconds():.1f}秒, "
+            f"超时限制{LAMBDA_TIMEOUT_SECONDS}秒, 缓冲{LAMBDA_TIMEOUT_BUFFER}秒"
+        )
+
+
+def check_token_limit():
+    """检查 Token 是否超过限制"""
+    if _total_tokens_used >= MAX_TOTAL_TOKENS:
+        raise RuntimeError(
+            f"Token用量已达上限: {_total_tokens_used}/{MAX_TOTAL_TOKENS}，中断执行"
+        )
+
+
+def check_limits():
+    """检查所有限制条件（Token + 超时）"""
+    check_token_limit()
+    check_timeout()
+
+
+def update_token_usage(usage):
+    """更新全局 Token 用量"""
+    global _total_tokens_used
+    if usage:
+        total = usage.get("total_tokens", 0)
+        _total_tokens_used += total
+        logger.info(
+            f"Token用量更新: +{total}, 总计={_total_tokens_used}/{MAX_TOTAL_TOKENS}, "
+            f"剩余={MAX_TOTAL_TOKENS - _total_tokens_used}"
+        )
 
 
 # ==================== 工具函数 ====================
@@ -137,6 +261,10 @@ def safe_decimal(value: Any, default: Decimal = Decimal("0")) -> Decimal:
 
 def lambda_handler(event, context):
     """主入口函数"""
+    global _total_tokens_used, _lambda_start_time
+    _total_tokens_used = 0
+    _lambda_start_time = time.time()
+    
     try:
         keyword = normalize(event.get("keyword", ""))
         
@@ -156,13 +284,29 @@ def lambda_handler(event, context):
         
         logger.info(
             f"开始商品分析工作流: keyword='{keyword}', "
-            f"count={count}, force_reprocess={force_reprocess}"
+            f"count={count}, force_reprocess={force_reprocess}, "
+            f"token_limit={MAX_TOTAL_TOKENS}, "
+            f"lambda_timeout={LAMBDA_TIMEOUT_SECONDS}s, "
+            f"use_secrets_manager={USE_SECRETS_MANAGER}"
         )
         
-        if not AI_API_KEY:
-            logger.warning("AI_API_KEY 环境变量未配置，仅执行抓取")
+        # 验证 API Key 可用性
+        try:
+            api_key = get_api_key()
+            logger.info("API Key 验证成功")
+        except Exception as e:
+            logger.warning(f"API Key 获取失败: {e}，仅执行抓取")
+            api_key = None
         
         result = execute_workflow(keyword, count, force_reprocess)
+        
+        # 添加执行统计信息
+        result["execution_stats"] = {
+            "total_tokens_used": _total_tokens_used,
+            "token_limit": MAX_TOTAL_TOKENS,
+            "elapsed_seconds": get_elapsed_seconds(),
+            "remaining_seconds": get_remaining_seconds()
+        }
         
         return response(200, result)
         
@@ -170,7 +314,9 @@ def lambda_handler(event, context):
         logger.error(f"工作流执行失败: {e}", exc_info=True)
         return response(500, {
             "error": "内部错误",
-            "details": str(e)
+            "details": str(e),
+            "total_tokens_used": _total_tokens_used,
+            "elapsed_seconds": get_elapsed_seconds()
         })
 
 
@@ -190,6 +336,9 @@ def execute_workflow(keyword: str, count: int, force_reprocess: bool) -> Dict:
     }
     
     try:
+        # 检查超时和 Token 限制
+        check_limits()
+        
         # ========== 第一步：搜索并保存活跃商品 ==========
         logger.info(f"第一步：搜索活跃商品: {keyword}")
         active_item_ids = scrape_and_save_active(keyword, count)
@@ -202,8 +351,14 @@ def execute_workflow(keyword: str, count: int, force_reprocess: bool) -> Dict:
         # 重新从 DynamoDB 读取完整的商品信息
         all_active = get_active_items_by_keyword(keyword)
         
-        if not AI_API_KEY:
-            logger.info("AI_API_KEY 未配置，跳过 AI 相关步骤")
+        # 检查 API Key 是否可用
+        try:
+            api_key = get_api_key()
+            if not api_key:
+                logger.info("API Key 未配置，跳过 AI 相关步骤")
+                return workflow_result
+        except:
+            logger.info("API Key 获取失败，跳过 AI 相关步骤")
             return workflow_result
         
         # 筛选需要解析型号的商品
@@ -213,6 +368,9 @@ def execute_workflow(keyword: str, count: int, force_reprocess: bool) -> Dict:
         ]
         
         if items_to_parse:
+            # 检查限制条件
+            check_limits()
+            
             # ========== 第二步：批量解析活跃商品型号 ==========
             logger.info(f"第二步：批量解析型号 ({len(items_to_parse)} 个商品)")
             parse_result = batch_parse_models(items_to_parse)
@@ -230,6 +388,9 @@ def execute_workflow(keyword: str, count: int, force_reprocess: bool) -> Dict:
             logger.info(f"第三步：搜索闭拍商品 ({len(unique_models)} 个型号)")
             total_closed = 0
             for i, model_info in enumerate(unique_models.values()):
+                # 检查限制条件
+                check_limits()
+                
                 if i > 0:
                     time.sleep(REQUEST_INTERVAL)
                 
@@ -246,6 +407,9 @@ def execute_workflow(keyword: str, count: int, force_reprocess: bool) -> Dict:
         unparsed_closed = get_unparsed_closed_items()
         
         if unparsed_closed:
+            # 检查限制条件
+            check_limits()
+            
             logger.info(f"第四步：清洗闭拍商品型号 ({len(unparsed_closed)} 个商品)")
             parsed_count = batch_parse_closed_models(unparsed_closed)
             workflow_result["closed_parsed"] = parsed_count
@@ -254,6 +418,9 @@ def execute_workflow(keyword: str, count: int, force_reprocess: bool) -> Dict:
         unpriced_items = get_unpriced_active_items()
         
         if unpriced_items:
+            # 检查限制条件
+            check_limits()
+            
             logger.info(f"第五步：估价分析 ({len(unpriced_items)} 个商品)")
             priced_count = batch_price_analysis(unpriced_items)
             workflow_result["priced_items"] = priced_count
@@ -265,6 +432,16 @@ def execute_workflow(keyword: str, count: int, force_reprocess: bool) -> Dict:
         logger.info(f"工作流完成: {json.dumps(workflow_result, ensure_ascii=False, default=str)}")
         return workflow_result
         
+    except RuntimeError as e:
+        error_msg = str(e)
+        if "Token用量已达上限" in error_msg or "Lambda超时倒计时" in error_msg or "剩余时间不足" in error_msg:
+            logger.warning(f"工作流安全中断: {error_msg}")
+            workflow_result["status"] = "INTERRUPTED"
+            workflow_result["interrupt_reason"] = error_msg
+            workflow_result["total_tokens_used"] = _total_tokens_used
+            workflow_result["elapsed_seconds"] = time.time() - start_time
+            return workflow_result
+        raise
     except Exception as e:
         logger.error(f"工作流出错: {e}", exc_info=True)
         workflow_result["status"] = "FAILED"
@@ -411,6 +588,9 @@ def batch_parse_models(items: List[Dict]) -> Dict:
     """批量解析活跃商品型号"""
     if not items:
         return {"parsed": 0, "review_required": 0, "models_found": 0}
+    
+    # 检查限制条件
+    check_limits()
     
     items_data = [
         {
@@ -745,6 +925,9 @@ def batch_parse_closed_models(items: List[Dict]) -> int:
     total_parsed = 0
     
     for i in range(0, len(items), batch_size):
+        # 检查限制条件
+        check_limits()
+        
         batch = items[i:i + batch_size]
         
         items_data = [
@@ -968,6 +1151,9 @@ def batch_price_analysis(items: List[Dict]) -> int:
     
     for item in items:
         try:
+            # 检查限制条件
+            check_limits()
+            
             comparable_items = get_comparable_closed_items(item)
             stats = calculate_price_statistics(comparable_items)
             
@@ -997,6 +1183,12 @@ def batch_price_analysis(items: List[Dict]) -> int:
             
             time.sleep(REQUEST_INTERVAL)
             
+        except RuntimeError as e:
+            error_msg = str(e)
+            if "Token用量已达上限" in error_msg or "Lambda超时倒计时" in error_msg:
+                logger.warning(f"估价分析中断: {error_msg}")
+                break
+            raise
         except Exception as e:
             logger.error(f"估价失败 {item.get('itemID')}: {e}")
             mark_pricing_failed(item["itemID"], str(e))
@@ -1354,18 +1546,35 @@ def mark_pricing_failed(item_id: str, error: str):
     )
 
 
-# ==================== AI 调用 ====================
+# ==================== AI 调用（支持 Secrets Manager 和 Token 控制）====================
 
 def call_ai_with_retry(prompt: str) -> Optional[Dict]:
-    """调用 AI API（带重试）"""
+    """调用 AI API（带重试、Token 控制和超时检查）"""
     for attempt in range(AI_MAX_RETRIES):
         try:
+            # 检查限制条件
+            check_limits()
+            
+            # 检查剩余时间是否足够
+            remaining = get_remaining_seconds()
+            if remaining < AI_REQUEST_TIMEOUT + 10:
+                raise RuntimeError(
+                    f"剩余时间不足，无法完成API调用: 剩余{remaining:.1f}秒, "
+                    f"请求超时{AI_REQUEST_TIMEOUT}秒"
+                )
+            
             result = call_ai(prompt)
             if result is not None:
                 return result
             
             logger.warning(f"AI 返回空结果，重试 {attempt + 1}/{AI_MAX_RETRIES}")
             
+        except RuntimeError as e:
+            error_msg = str(e)
+            if "Token用量已达上限" in error_msg or "Lambda超时倒计时" in error_msg or "剩余时间不足" in error_msg:
+                logger.warning(f"AI调用中断: {error_msg}")
+                raise
+            logger.error(f"AI 调用异常 (尝试 {attempt + 1}): {e}")
         except Exception as e:
             logger.error(f"AI 调用异常 (尝试 {attempt + 1}): {e}")
         
@@ -1378,9 +1587,12 @@ def call_ai_with_retry(prompt: str) -> Optional[Dict]:
 
 
 def call_ai(prompt: str) -> Optional[Dict]:
-    """调用 AI API"""
-    if not AI_API_KEY:
-        raise ValueError("AI_API_KEY 未配置")
+    """调用 AI API（使用 Secrets Manager 获取密钥）"""
+    try:
+        api_key = get_api_key()
+    except Exception as e:
+        logger.error(f"获取 API Key 失败: {e}")
+        raise
     
     body = {
         "model": AI_MODEL,
@@ -1405,7 +1617,7 @@ def call_ai(prompt: str) -> Optional[Dict]:
         AI_API_URL,
         data=encoded_body,
         headers={
-            "Authorization": f"Bearer {AI_API_KEY}",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json"
         },
         method="POST"
@@ -1414,6 +1626,11 @@ def call_ai(prompt: str) -> Optional[Dict]:
     try:
         with urllib.request.urlopen(request, timeout=AI_REQUEST_TIMEOUT) as response:
             result = json.loads(response.read().decode("utf-8"))
+            
+            # 提取并更新 Token 使用量
+            usage = result.get("usage", {})
+            if usage:
+                update_token_usage(usage)
             
             if "choices" in result and len(result["choices"]) > 0:
                 content = result["choices"][0]["message"]["content"]
@@ -1426,7 +1643,7 @@ def call_ai(prompt: str) -> Optional[Dict]:
         error_body = e.read().decode("utf-8", errors="replace")
         logger.error(f"AI API HTTP {e.code}: {error_body[:500]}")
         
-        if e.code == 429:
+        if e.code in RETRYABLE_CODES:
             raise
         return None
         
