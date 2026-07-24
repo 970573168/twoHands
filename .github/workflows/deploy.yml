@@ -48,6 +48,7 @@ on:
       s3_bucket:
         description: "S3 bucket name for Lambda code"
         required: true
+        default: "productcatalog-lambda-code"
         type: string
 
       stack_params:
@@ -132,7 +133,6 @@ jobs:
         run: |
           STACK_NAME="productcatalog-app-${{ github.event.inputs.environment }}"
           
-          # 只传必需的参数，其余使用 CloudFormation 模板默认值
           PARAMS=(
             "Environment=${{ github.event.inputs.environment }}"
             "DeploySecret=${{ github.event.inputs.deploy_secret }}"
@@ -142,11 +142,9 @@ jobs:
             "LambdaCodeS3Key=${S3_KEY:-productcatalog/lambda.zip}"
           )
           
-          # 如果部署 Secret 且提供了 API Key，则传入
           [ "${{ github.event.inputs.deploy_secret }}" = "true" ] && [ -n "${{ github.event.inputs.api_key }}" ] && \
             PARAMS+=("ApiKey=${{ github.event.inputs.api_key }}")
           
-          # 合并额外的 stack_params JSON（可选覆盖）
           EXTRA_PARAMS='${{ github.event.inputs.stack_params }}'
           if [ "$EXTRA_PARAMS" != "{}" ] && [ -n "$EXTRA_PARAMS" ]; then
             while IFS="=" read -r k v; do
