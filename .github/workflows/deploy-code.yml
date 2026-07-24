@@ -36,6 +36,12 @@ on:
         required: true
         default: false
         type: boolean
+      
+      update_model_analyzer:
+        description: '更新 Model Analyzer（型号批量分析器）'
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   id-token: write
@@ -67,22 +73,49 @@ jobs:
           echo "📊 计算源代码哈希..."
           
           # Auction Scraper 哈希
-          AUCTION_HASH=$(find src -name "yahoo_auction_scraper.py" -exec sha256sum {} \; | sha256sum | cut -d' ' -f1)
+          if [ -f "src/yahoo_auction_scraper.py" ]; then
+            AUCTION_HASH=$(sha256sum src/yahoo_auction_scraper.py | cut -d' ' -f1)
+          else
+            AUCTION_HASH="file_not_found"
+          fi
           echo "auction_hash=$AUCTION_HASH" >> $GITHUB_OUTPUT
           echo "  Auction Scraper: $AUCTION_HASH"
           
           # Analyzer 哈希
-          ANALYZER_HASH=$(find src -name "auction_analyzer.py" -exec sha256sum {} \; | sha256sum | cut -d' ' -f1)
+          if [ -f "src/auction_analyzer.py" ]; then
+            ANALYZER_HASH=$(sha256sum src/auction_analyzer.py | cut -d' ' -f1)
+          else
+            ANALYZER_HASH="file_not_found"
+          fi
           echo "analyzer_hash=$ANALYZER_HASH" >> $GITHUB_OUTPUT
           echo "  Analyzer: $ANALYZER_HASH"
           
-          # Catalog 哈希
-          CATALOG_HASH=$(find src -name "product_catalog_discovery.py" -exec sha256sum {} \; | sha256sum | cut -d' ' -f1)
+          # Catalog Discovery 哈希
+          if [ -f "src/product_catalog_discovery.py" ]; then
+            CATALOG_HASH=$(sha256sum src/product_catalog_discovery.py | cut -d' ' -f1)
+          else
+            CATALOG_HASH="file_not_found"
+          fi
           echo "catalog_hash=$CATALOG_HASH" >> $GITHUB_OUTPUT
           echo "  Catalog Discovery: $CATALOG_HASH"
           
+          # Model Analyzer 哈希
+          if [ -f "src/model_analyzer.py" ]; then
+            MODEL_ANALYZER_HASH=$(sha256sum src/model_analyzer.py | cut -d' ' -f1)
+          else
+            MODEL_ANALYZER_HASH="file_not_found"
+          fi
+          echo "model_analyzer_hash=$MODEL_ANALYZER_HASH" >> $GITHUB_OUTPUT
+          echo "  Model Analyzer: $MODEL_ANALYZER_HASH"
+          
           # 总体哈希（用于 S3 文件命名）
-          SOURCE_HASH=$(find src -type f -name "*.py" -exec sha256sum {} \; | sort | sha256sum | cut -d' ' -f1)
+          SOURCE_HASH=""
+          for f in src/*.py; do
+            if [ -f "$f" ]; then
+              SOURCE_HASH="${SOURCE_HASH}$(sha256sum "$f" | cut -d' ' -f1)"
+            fi
+          done
+          SOURCE_HASH=$(echo "$SOURCE_HASH" | sha256sum | cut -d' ' -f1)
           echo "source_hash=$SOURCE_HASH" >> $GITHUB_OUTPUT
           echo "  Overall: $SOURCE_HASH"
 
@@ -113,6 +146,13 @@ jobs:
             BUILD_REASONS="${BUILD_REASONS} Catalog"
           fi
           
+          # 检查是否需要更新 model_analyzer
+          if [[ "${{ github.event.inputs.update_model_analyzer }}" == "true" ]]; then
+            echo "✅ 需要更新 Model Analyzer"
+            NEED_BUILD="true"
+            BUILD_REASONS="${BUILD_REASONS} ModelAnalyzer"
+          fi
+          
           if [[ "$NEED_BUILD" == "false" ]]; then
             echo "⚠️ 没有选择任何要更新的函数，跳过构建"
           else
@@ -125,12 +165,49 @@ jobs:
         if: steps.check.outputs.need_build == 'true'
         run: |
           echo "🔨 正在构建 Lambda 包..."
-          chmod +x build.sh
           
-          # 传递环境变量给构建脚本
-          export BUILD_ENV="${{ github.event.inputs.environment }}"
+          # 创建临时构建目录
+          BUILD_DIR=$(mktemp -d)
+          echo "构建目录: $BUILD_DIR"
           
-          ./build.sh
+          # 复制所有 Lambda 源代码
+          if [[ "${{ github.event.inputs.update_auction }}" == "true" ]] && [ -f "src/yahoo_auction_scraper.py" ]; then
+            cp src/yahoo_auction_scraper.py "$BUILD_DIR/"
+            echo "✅ 已复制 yahoo_auction_scraper.py"
+          fi
+          
+          if [[ "${{ github.event.inputs.update_analyzer }}" == "true" ]] && [ -f "src/auction_analyzer.py" ]; then
+            cp src/auction_analyzer.py "$BUILD_DIR/"
+            echo "✅ 已复制 auction_analyzer.py"
+          fi
+          
+          if [[ "${{ github.event.inputs.update_catalog }}" == "true" ]] && [ -f "src/product_catalog_discovery.py" ]; then
+            cp src/product_catalog_discovery.py "$BUILD_DIR/"
+            echo "✅ 已复制 product_catalog_discovery.py"
+          fi
+          
+          if [[ "${{ github.event.inputs.update_model_analyzer }}" == "true" ]] && [ -f "src/model_analyzer.py" ]; then
+            cp src/model_analyzer.py "$BUILD_DIR/"
+            echo "✅ 已复制 model_analyzer.py"
+          fi
+          
+          # 复制依赖（如果存在 requirements.txt）
+          if [ -f "requirements.txt" ]; then
+            echo "📦 安装 Python 依赖..."
+            pip install -r requirements.txt -t "$BUILD_DIR" --no-cache-dir
+          fi
+          
+          # 列出构建内容
+          echo "📋 构建内容："
+          ls -la "$BUILD_DIR/"
+          
+          # 打包
+          cd "$BUILD_DIR"
+          zip -r "$GITHUB_WORKSPACE/lambda.zip" .
+          cd "$GITHUB_WORKSPACE"
+          
+          echo "✅ Lambda 包构建完成"
+          echo "包大小: $(du -h lambda.zip | cut -f1)"
 
       - name: 配置 AWS 凭证
         if: steps.check.outputs.need_build == 'true'
@@ -151,7 +228,7 @@ jobs:
           echo "存储桶: $S3_BUCKET"
           echo "路径: $S3_KEY"
           
-          # 上传并验证
+          # 上传
           aws s3 cp lambda.zip "s3://$S3_BUCKET/$S3_KEY"
           
           # 验证上传
@@ -218,7 +295,6 @@ jobs:
               echo "⏳ 等待函数更新完成..."
               aws lambda wait function-updated --function-name "$FUNCTION_NAME"
               
-              # 更新函数描述为新的哈希值
               aws lambda update-function-configuration \
                 --function-name "$FUNCTION_NAME" \
                 --description "${{ steps.hash.outputs.analyzer_hash }}"
@@ -250,12 +326,42 @@ jobs:
               echo "⏳ 等待函数更新完成..."
               aws lambda wait function-updated --function-name "$FUNCTION_NAME"
               
-              # 更新函数描述为新的哈希值
               aws lambda update-function-configuration \
                 --function-name "$FUNCTION_NAME" \
                 --description "${{ steps.hash.outputs.catalog_hash }}"
               
               echo "✅ ProductCatalog-Discovery 更新完成"
+            fi
+          else
+            echo "⚠️ 函数不存在，跳过更新"
+          fi
+
+      - name: 更新 Model Analyzer 函数
+        if: steps.check.outputs.need_build == 'true' && github.event.inputs.update_model_analyzer == 'true'
+        run: |
+          FUNCTION_NAME="ModelAnalyzer-${{ github.event.inputs.environment }}"
+          echo "🔄 正在检查 $FUNCTION_NAME..."
+          
+          if aws lambda get-function --function-name "$FUNCTION_NAME" >/dev/null 2>&1; then
+            CURRENT_HASH=$(aws lambda get-function --function-name "$FUNCTION_NAME" --query 'Configuration.Description' --output text 2>/dev/null || echo "")
+            
+            if [[ "$CURRENT_HASH" == "${{ steps.hash.outputs.model_analyzer_hash }}" ]]; then
+              echo "✅ 代码未变更，跳过更新"
+            else
+              echo "🔄 更新函数代码..."
+              aws lambda update-function-code \
+                --function-name "$FUNCTION_NAME" \
+                --s3-bucket "${{ env.s3_bucket }}" \
+                --s3-key "${{ env.s3_key }}"
+              
+              echo "⏳ 等待函数更新完成..."
+              aws lambda wait function-updated --function-name "$FUNCTION_NAME"
+              
+              aws lambda update-function-configuration \
+                --function-name "$FUNCTION_NAME" \
+                --description "${{ steps.hash.outputs.model_analyzer_hash }}"
+              
+              echo "✅ ModelAnalyzer 更新完成"
             fi
           else
             echo "⚠️ 函数不存在，跳过更新"
@@ -273,6 +379,7 @@ jobs:
             echo "   Auction Scraper: ${{ steps.hash.outputs.auction_hash }}"
             echo "   Analyzer: ${{ steps.hash.outputs.analyzer_hash }}"
             echo "   Catalog: ${{ steps.hash.outputs.catalog_hash }}"
+            echo "   Model Analyzer: ${{ steps.hash.outputs.model_analyzer_hash }}"
             echo "   Overall: ${{ steps.hash.outputs.source_hash }}"
           fi
           echo ""
@@ -292,6 +399,11 @@ jobs:
           else
             echo "   ⏭️  ProductCatalog-Discovery-${{ github.event.inputs.environment }} (跳过)"
           fi
+          if [[ "${{ github.event.inputs.update_model_analyzer }}" == "true" ]]; then
+            echo "   ✅ ModelAnalyzer-${{ github.event.inputs.environment }}"
+          else
+            echo "   ⏭️  ModelAnalyzer-${{ github.event.inputs.environment }} (跳过)"
+          fi
           echo "=========================================="
 
       - name: 部署失败通知
@@ -300,5 +412,6 @@ jobs:
           echo "=========================================="
           echo "❌ 部署失败！"
           echo "环境: ${{ github.event.inputs.environment }}"
+          echo "时间: $(date)"
           echo "请检查日志获取详细错误信息"
           echo "=========================================="
