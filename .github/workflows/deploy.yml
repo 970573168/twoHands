@@ -48,23 +48,10 @@ on:
       s3_bucket:
         description: "S3 bucket name for Lambda code"
         required: true
-        default: "productcatalog-lambda-code"
-        type: string
-
-      max_pages:
-        description: "Yahoo Auction max pages to scrape"
-        required: false
-        default: "1"
-        type: string
-
-      log_retention:
-        description: "CloudWatch log retention days"
-        required: false
-        default: "14"
         type: string
 
       stack_params:
-        description: "Additional CloudFormation params JSON (overrides defaults)"
+        description: "CloudFormation params to override defaults (JSON format)"
         required: false
         default: "{}"
         type: string
@@ -145,6 +132,7 @@ jobs:
         run: |
           STACK_NAME="productcatalog-app-${{ github.event.inputs.environment }}"
           
+          # 只传必需的参数，其余使用 CloudFormation 模板默认值
           PARAMS=(
             "Environment=${{ github.event.inputs.environment }}"
             "DeploySecret=${{ github.event.inputs.deploy_secret }}"
@@ -152,20 +140,22 @@ jobs:
             "DeployScraper=${{ github.event.inputs.deploy_scraper }}"
             "LambdaCodeS3Bucket=$S3_BUCKET"
             "LambdaCodeS3Key=${S3_KEY:-productcatalog/lambda.zip}"
-            "YahooAuctionMaxPages=${{ github.event.inputs.max_pages }}"
-            "LogRetentionDays=${{ github.event.inputs.log_retention }}"
           )
           
+          # 如果部署 Secret 且提供了 API Key，则传入
           [ "${{ github.event.inputs.deploy_secret }}" = "true" ] && [ -n "${{ github.event.inputs.api_key }}" ] && \
-            PARAMS+=("ParameterKey=ApiKey,ParameterValue=${{ github.event.inputs.api_key }}")
+            PARAMS+=("ApiKey=${{ github.event.inputs.api_key }}")
           
-          # 合并额外的 stack_params JSON
+          # 合并额外的 stack_params JSON（可选覆盖）
           EXTRA_PARAMS='${{ github.event.inputs.stack_params }}'
-          if [ "$EXTRA_PARAMS" != "{}" ]; then
+          if [ "$EXTRA_PARAMS" != "{}" ] && [ -n "$EXTRA_PARAMS" ]; then
             while IFS="=" read -r k v; do
-              [ -n "$k" ] && PARAMS+=("ParameterKey=$k,ParameterValue=$v")
+              [ -n "$k" ] && PARAMS+=("$k=$v")
             done < <(echo "$EXTRA_PARAMS" | jq -r 'to_entries[] | "\(.key)=\(.value)"')
           fi
+          
+          echo "Deploying with params:"
+          printf '%s\n' "${PARAMS[@]}"
           
           aws cloudformation deploy \
             --template-file cloudformation/productcatalog.yaml \
