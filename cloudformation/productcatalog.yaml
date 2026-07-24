@@ -88,10 +88,10 @@ Parameters:
   # ============ Token 和超时控制 ============
   MaxTotalTokens:
     Type: Number
-    Default: 100000
-    MinValue: 1000
+    Default: 50000
+    MinValue: 10000
     MaxValue: 1000000
-    Description: 每次运行的最大 Token 用量
+    Description: 每次运行的最大 Token 用量（Analyzer 默认50000，ProductCatalog 默认100000）
 
   LambdaTimeoutBuffer:
     Type: Number
@@ -167,6 +167,106 @@ Parameters:
     MinValue: 10
     MaxValue: 100
     Description: 每页显示的商品数量
+
+  # ============ Yahoo Auction Analyzer 特定参数 ============
+  ModelParseBatchSize:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 50
+    Description: 活跃商品型号解析批次大小（每批最多处理的商品数）
+
+  ClosedParseBatchSize:
+    Type: Number
+    Default: 15
+    MinValue: 1
+    MaxValue: 50
+    Description: 闭拍商品型号解析批次大小
+
+  MaxClosedPerModel:
+    Type: Number
+    Default: 50
+    MinValue: 10
+    MaxValue: 200
+    Description: 每个型号搜索的最多闭拍商品数
+
+  DefaultSearchCount:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 20
+    Description: 默认搜索活跃商品数量
+
+  MaxActiveItems:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    MaxValue: 50
+    Description: 最大活跃商品数量
+
+  AiRequestTimeout:
+    Type: Number
+    Default: 60
+    MinValue: 30
+    MaxValue: 300
+    Description: AI API 请求超时（秒）
+
+  AiMaxRetries:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 5
+    Description: AI API 最大重试次数
+
+  RequestInterval:
+    Type: Number
+    Default: 1.0
+    MinValue: 0.1
+    MaxValue: 5.0
+    Description: 请求间隔（秒）
+
+  # ============ 估价相关参数 ============
+  ExpectedSellingFeeRate:
+    Type: Number
+    Default: 0.10
+    MinValue: 0
+    MaxValue: 1
+    Description: 预期交易费率（如 0.10 = 10%）
+
+  DefaultShippingCost:
+    Type: Number
+    Default: 1500
+    MinValue: 0
+    MaxValue: 10000
+    Description: 默认运费（円）
+
+  DefaultRepairReserveRate:
+    Type: Number
+    Default: 0.05
+    MinValue: 0
+    MaxValue: 1
+    Description: 默认维修准备金率
+
+  MinComparableCount:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 10
+    Description: 最少可比商品数量（用于估价）
+
+  MaxPriceDeviation:
+    Type: Number
+    Default: 1.5
+    MinValue: 1
+    MaxValue: 5
+    Description: 最大价格偏差倍数（用于筛选异常值）
+
+  RiskReserveRate:
+    Type: Number
+    Default: 0.03
+    MinValue: 0
+    MaxValue: 1
+    Description: 风险准备金率
 
   # ============ Yahoo Auction 自定义搜索参数（可留空，不覆盖代码默认值）============
   AuctionParamNew:
@@ -464,7 +564,7 @@ Resources:
           MAX_CATEGORIES: !Ref MaxCategoriesPerRun
           MAX_BRANDS: !Ref MaxBrandsPerCategory
           MAX_MODELS: !Ref MaxModelsPerBrand
-          MAX_TOTAL_TOKENS: !Ref MaxTotalTokens
+          MAX_TOTAL_TOKENS: "100000"
           LAMBDA_TIMEOUT_SECONDS: "900"
           LAMBDA_TIMEOUT_BUFFER: !Ref LambdaTimeoutBuffer
           CATEGORY_LIMIT: !Ref CategoryLimit
@@ -716,7 +816,7 @@ Resources:
       - YahooAuctionAnalyzerRole
     Properties:
       FunctionName: !Sub "YahooAuctionAnalyzer-${Environment}"
-      Description: "Yahoo Auction商品分析工作流（支持 AI 估价、模型解析、权限完整）"
+      Description: "Yahoo Auction 商品分析工作流（支持 AI 估价、模型解析、权限完整）"
       Runtime: python3.12
       Architectures:
         - arm64
@@ -729,21 +829,42 @@ Resources:
         S3Key: !Ref LambdaCodeS3Key
       Environment:
         Variables:
-          SECRET_NAME: !Sub "${SecretName}/${Environment}"
+          # ========== DynamoDB 配置 ==========
           TABLE_NAME_ACTIVE: !Sub "YahooAuctionActiveItems-${Environment}"
           TABLE_NAME_CLOSED: !Sub "YahooAuctionItems-${Environment}"
+
+          # ========== Secrets Manager 配置 ==========
+          SECRET_NAME: !Sub "${SecretName}/${Environment}"
+
+          # ========== AI API 配置 ==========
           AI_API_URL: !Ref ApiUrl
           AI_MODEL: !Ref AiModel
-          DEFAULT_SEARCH_COUNT: "3"
-          MAX_CLOSED_PER_MODEL: "50"
-          REQUEST_INTERVAL: "1.0"
+          AI_REQUEST_TIMEOUT: !Ref AiRequestTimeout
+          AI_MAX_RETRIES: !Ref AiMaxRetries
+
+          # ========== 搜索和抓取配置 ==========
+          DEFAULT_SEARCH_COUNT: !Ref DefaultSearchCount
+          MAX_ACTIVE_ITEMS: !Ref MaxActiveItems
+          MAX_CLOSED_PER_MODEL: !Ref MaxClosedPerModel
+          REQUEST_INTERVAL: !Ref RequestInterval
           INCLUDE_PAYPAY: "false"
-          EXPECTED_SELLING_FEE_RATE: "0.10"
-          DEFAULT_SHIPPING_COST: "1500"
-          MIN_COMPARABLE_COUNT: "3"
+
+          # ========== 批量处理配置（新增） ==========
+          MODEL_PARSE_BATCH_SIZE: !Ref ModelParseBatchSize
+          CLOSED_PARSE_BATCH_SIZE: !Ref ClosedParseBatchSize
+
+          # ========== Token 和超时控制 ==========
           MAX_TOTAL_TOKENS: !Ref MaxTotalTokens
           LAMBDA_TIMEOUT_SECONDS: "840"
           LAMBDA_TIMEOUT_BUFFER: !Ref LambdaTimeoutBuffer
+
+          # ========== 估价配置 ==========
+          EXPECTED_SELLING_FEE_RATE: !Ref ExpectedSellingFeeRate
+          DEFAULT_SHIPPING_COST: !Ref DefaultShippingCost
+          DEFAULT_REPAIR_RESERVE_RATE: !Ref DefaultRepairReserveRate
+          MIN_COMPARABLE_COUNT: !Ref MinComparableCount
+          MAX_PRICE_DEVIATION: !Ref MaxPriceDeviation
+          RISK_RESERVE_RATE: !Ref RiskReserveRate
       Tags:
         - Key: Application
           Value: YahooAuctionAnalyzer
