@@ -104,8 +104,10 @@ Resources:
       Name: !Sub "${SecretName}/${Environment}"
       SecretString: !If [HasApiKey, !Sub '{"apiKey":"${ApiKey}"}', '{"apiKey":"PLACEHOLDER-REPLACE-ME"}']
       Tags:
-        - Key: Application; Value: ProductCatalog
-        - Key: Environment; Value: !Ref Environment
+        - Key: Application
+          Value: ProductCatalog
+        - Key: Environment
+          Value: !Ref Environment
 
   ProductCatalogTable:
     Type: AWS::DynamoDB::Table
