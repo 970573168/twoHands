@@ -50,42 +50,146 @@ Parameters:
     Default: "false"
     AllowedValues: ["true", "false"]
 
-  # 以下参数全部可选，空字符串时使用 Python 代码默认值
-  AiModel:           { Type: String, Default: "" }
-  ApiUrl:            { Type: String, Default: "" }
-  ScheduleIntervalHours:    { Type: String, Default: "" }
-  MaxModelsPerRun:          { Type: String, Default: "" }
-  MaxConcurrentAnalysis:    { Type: String, Default: "" }
-  ModelAnalyzerTimeout:     { Type: String, Default: "" }
-  ModelAnalyzerMemory:      { Type: String, Default: "" }
-  CategoriesToScan:         { Type: String, Default: "" }
-  MaxCategoriesPerRun:      { Type: String, Default: "" }
-  MaxBrandsPerCategory:     { Type: String, Default: "" }
-  MaxModelsPerBrand:        { Type: String, Default: "" }
-  MaxTotalTokens:           { Type: String, Default: "" }
-  LambdaTimeoutBuffer:      { Type: String, Default: "" }
-  ApiCallDelay:             { Type: String, Default: "" }
-  CategoryLimit:            { Type: String, Default: "" }
-  BrandLimit:               { Type: String, Default: "" }
-  LogRetentionDays:         { Type: String, Default: "" }
-  YahooAuctionMaxPages:     { Type: String, Default: "" }
-  YahooAuctionRequestTimeout: { Type: String, Default: "" }
-  YahooAuctionDebugLogHtml: { Type: String, Default: "", AllowedValues: ["", "true", "false"] }
-  YahooAuctionItemsPerPage: { Type: String, Default: "" }
-  ModelParseBatchSize:      { Type: String, Default: "" }
-  ClosedParseBatchSize:     { Type: String, Default: "" }
-  MaxClosedPerModel:        { Type: String, Default: "" }
-  DefaultSearchCount:       { Type: String, Default: "" }
-  MaxActiveItems:           { Type: String, Default: "" }
-  AiRequestTimeout:         { Type: String, Default: "" }
-  AiMaxRetries:             { Type: String, Default: "" }
-  RequestInterval:          { Type: String, Default: "" }
-  ExpectedSellingFeeRate:   { Type: String, Default: "" }
-  DefaultShippingCost:      { Type: String, Default: "" }
-  DefaultRepairReserveRate: { Type: String, Default: "" }
-  MinComparableCount:       { Type: String, Default: "" }
-  MaxPriceDeviation:        { Type: String, Default: "" }
-  RiskReserveRate:          { Type: String, Default: "" }
+  AiModel:
+    Type: String
+    Default: ""
+
+  ApiUrl:
+    Type: String
+    Default: ""
+
+  ScheduleIntervalHours:
+    Type: String
+    Default: ""
+
+  MaxModelsPerRun:
+    Type: String
+    Default: ""
+
+  MaxConcurrentAnalysis:
+    Type: String
+    Default: ""
+
+  ModelAnalyzerTimeout:
+    Type: String
+    Default: ""
+
+  ModelAnalyzerMemory:
+    Type: String
+    Default: ""
+
+  CategoriesToScan:
+    Type: String
+    Default: ""
+
+  MaxCategoriesPerRun:
+    Type: String
+    Default: ""
+
+  MaxBrandsPerCategory:
+    Type: String
+    Default: ""
+
+  MaxModelsPerBrand:
+    Type: String
+    Default: ""
+
+  MaxTotalTokens:
+    Type: String
+    Default: ""
+
+  LambdaTimeoutBuffer:
+    Type: String
+    Default: ""
+
+  ApiCallDelay:
+    Type: String
+    Default: ""
+
+  CategoryLimit:
+    Type: String
+    Default: ""
+
+  BrandLimit:
+    Type: String
+    Default: ""
+
+  LogRetentionDays:
+    Type: String
+    Default: ""
+
+  YahooAuctionMaxPages:
+    Type: String
+    Default: ""
+
+  YahooAuctionRequestTimeout:
+    Type: String
+    Default: ""
+
+  YahooAuctionDebugLogHtml:
+    Type: String
+    Default: ""
+    AllowedValues: ["", "true", "false"]
+
+  YahooAuctionItemsPerPage:
+    Type: String
+    Default: ""
+
+  ModelParseBatchSize:
+    Type: String
+    Default: ""
+
+  ClosedParseBatchSize:
+    Type: String
+    Default: ""
+
+  MaxClosedPerModel:
+    Type: String
+    Default: ""
+
+  DefaultSearchCount:
+    Type: String
+    Default: ""
+
+  MaxActiveItems:
+    Type: String
+    Default: ""
+
+  AiRequestTimeout:
+    Type: String
+    Default: ""
+
+  AiMaxRetries:
+    Type: String
+    Default: ""
+
+  RequestInterval:
+    Type: String
+    Default: ""
+
+  ExpectedSellingFeeRate:
+    Type: String
+    Default: ""
+
+  DefaultShippingCost:
+    Type: String
+    Default: ""
+
+  DefaultRepairReserveRate:
+    Type: String
+    Default: ""
+
+  MinComparableCount:
+    Type: String
+    Default: ""
+
+  MaxPriceDeviation:
+    Type: String
+    Default: ""
+
+  RiskReserveRate:
+    Type: String
+    Default: ""
 
 Conditions:
   DeploySecretCondition: !Equals [!Ref DeploySecret, "true"]
@@ -116,13 +220,19 @@ Resources:
       TableName: !Sub "ProductCatalog-${Environment}"
       BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
-        - AttributeName: PK; AttributeType: S
-        - AttributeName: SK; AttributeType: S
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
       KeySchema:
-        - AttributeName: PK; KeyType: HASH
-        - AttributeName: SK; KeyType: RANGE
-      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
-      SSESpecification: { SSEEnabled: true }
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
 
   YahooAuctionClosedTable:
     Type: AWS::DynamoDB::Table
@@ -130,10 +240,17 @@ Resources:
     Properties:
       TableName: !Sub "YahooAuctionItems-${Environment}"
       BillingMode: PAY_PER_REQUEST
-      AttributeDefinitions: [{ AttributeName: itemID, AttributeType: S }]
-      KeySchema: [{ AttributeName: itemID, KeyType: HASH }]
-      TimeToLiveSpecification: { AttributeName: ttl, Enabled: true }
-      SSESpecification: { SSEEnabled: true }
+      AttributeDefinitions:
+        - AttributeName: itemID
+          AttributeType: S
+      KeySchema:
+        - AttributeName: itemID
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
 
   YahooAuctionActiveTable:
     Type: AWS::DynamoDB::Table
@@ -141,12 +258,17 @@ Resources:
     Properties:
       TableName: !Sub "YahooAuctionActiveItems-${Environment}"
       BillingMode: PAY_PER_REQUEST
-      AttributeDefinitions: [{ AttributeName: itemID, AttributeType: S }]
-      KeySchema: [{ AttributeName: itemID, KeyType: HASH }]
-      TimeToLiveSpecification: { AttributeName: ttl, Enabled: true }
-      SSESpecification: { SSEEnabled: true }
-
-  # ========== IAM Roles (省略详细 Policy，结构同前) ==========
+      AttributeDefinitions:
+        - AttributeName: itemID
+          AttributeType: S
+      KeySchema:
+        - AttributeName: itemID
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
 
   LambdaExecutionRole:
     Type: AWS::IAM::Role
@@ -157,7 +279,8 @@ Resources:
         Version: "2012-10-17"
         Statement:
           - Effect: Allow
-            Principal: { Service: lambda.amazonaws.com }
+            Principal:
+              Service: lambda.amazonaws.com
             Action: sts:AssumeRole
       Policies:
         - PolicyName: DiscoveryPolicy
@@ -165,13 +288,20 @@ Resources:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
-                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query, dynamodb:BatchWriteItem]
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:BatchWriteItem
                 Resource: !GetAtt ProductCatalogTable.Arn
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}/${Environment}-*"
               - Effect: Allow
-                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
                 Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/ProductCatalog-Discovery-${Environment}:*"
 
   YahooAuctionScraperRole:
@@ -183,7 +313,8 @@ Resources:
         Version: "2012-10-17"
         Statement:
           - Effect: Allow
-            Principal: { Service: lambda.amazonaws.com }
+            Principal:
+              Service: lambda.amazonaws.com
             Action: sts:AssumeRole
       Policies:
         - PolicyName: ScraperPolicy
@@ -191,11 +322,20 @@ Resources:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
-                Action: [dynamodb:PutItem, dynamodb:GetItem, dynamodb:Query, dynamodb:UpdateItem, dynamodb:Scan]
-                Resource: [!GetAtt YahooAuctionClosedTable.Arn, !GetAtt YahooAuctionActiveTable.Arn]
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:UpdateItem
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt YahooAuctionClosedTable.Arn
+                  - !GetAtt YahooAuctionActiveTable.Arn
               - Effect: Allow
-                Action: [logs:CreateLogStream, logs:PutLogEvents]
-                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/YahooAuction*:*
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/YahooAuction*:*"
 
   YahooAuctionAnalyzerRole:
     Type: AWS::IAM::Role
@@ -206,7 +346,8 @@ Resources:
         Version: "2012-10-17"
         Statement:
           - Effect: Allow
-            Principal: { Service: lambda.amazonaws.com }
+            Principal:
+              Service: lambda.amazonaws.com
             Action: sts:AssumeRole
       Policies:
         - PolicyName: AnalyzerPolicy
@@ -214,13 +355,22 @@ Resources:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
-                Action: [dynamodb:PutItem, dynamodb:GetItem, dynamodb:Query, dynamodb:UpdateItem, dynamodb:Scan]
-                Resource: [!GetAtt YahooAuctionClosedTable.Arn, !GetAtt YahooAuctionActiveTable.Arn]
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:UpdateItem
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt YahooAuctionClosedTable.Arn
+                  - !GetAtt YahooAuctionActiveTable.Arn
               - Effect: Allow
                 Action: secretsmanager:GetSecretValue
                 Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}/${Environment}-*"
               - Effect: Allow
-                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
                 Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/YahooAuction*:*"
 
   ModelAnalyzerRole:
@@ -232,7 +382,8 @@ Resources:
         Version: "2012-10-17"
         Statement:
           - Effect: Allow
-            Principal: { Service: lambda.amazonaws.com }
+            Principal:
+              Service: lambda.amazonaws.com
             Action: sts:AssumeRole
       Policies:
         - PolicyName: ModelAnalyzerPolicy
@@ -240,7 +391,12 @@ Resources:
             Version: "2012-10-17"
             Statement:
               - Effect: Allow
-                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query, dynamodb:Scan]
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
                 Resource:
                   - !If [DeployMainAppCondition, !GetAtt ProductCatalogTable.Arn, !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/ProductCatalog-${Environment}"]
                   - !If [DeployScraperCondition, !GetAtt YahooAuctionClosedTable.Arn, !Ref AWS::NoValue]
@@ -249,10 +405,10 @@ Resources:
                 Action: secretsmanager:GetSecretValue
                 Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}/${Environment}-*"
               - Effect: Allow
-                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
                 Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/ModelAnalyzer-${Environment}:*"
-
-  # ========== Lambda Functions ==========
 
   ProductCatalogDiscovery:
     Type: AWS::Lambda::Function
