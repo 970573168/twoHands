@@ -28,6 +28,41 @@ from yahoo_auction_scraper import scrape_auctions
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
+
+# ==================== 环境变量辅助函数 ====================
+
+def _env_int(key: str, default: int) -> int:
+    """读取环境变量并转为 int，空值或不存在时用默认值"""
+    value = os.getenv(key, "")
+    if not value:
+        return default
+    return int(value)
+
+
+def _env_float(key: str, default: float) -> float:
+    """读取环境变量并转为 float，空值或不存在时用默认值"""
+    value = os.getenv(key, "")
+    if not value:
+        return default
+    return float(value)
+
+
+def _env_decimal(key: str, default: str) -> Decimal:
+    """读取环境变量并转为 Decimal，空值或不存在时用默认值"""
+    value = os.getenv(key, "")
+    if not value:
+        return Decimal(default)
+    return Decimal(value)
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    """读取环境变量并转为 bool，空值或不存在时用默认值"""
+    value = os.getenv(key, "")
+    if not value:
+        return default
+    return value.lower() == "true"
+
+
 # ============ 环境变量 ============
 TABLE_NAME_ACTIVE = os.getenv("TABLE_NAME_ACTIVE", "YahooAuctionActiveItems")
 TABLE_NAME_CLOSED = os.getenv("TABLE_NAME_CLOSED", "YahooAuctionItems")
@@ -37,38 +72,38 @@ AI_API_KEY = os.getenv("AI_API_KEY", "")
 SECRET_NAME = os.getenv("SECRET_NAME", "yahoo-auction-ai-api-key")
 
 # active 和 closed 默认各抓取 100 条，并且每种类型只搜索一次
-DEFAULT_ACTIVE_COUNT = int(os.getenv("DEFAULT_ACTIVE_COUNT", "100"))
-DEFAULT_CLOSED_COUNT = int(os.getenv("DEFAULT_CLOSED_COUNT", "100"))
-MAX_ACTIVE_ITEMS = int(os.getenv("MAX_ACTIVE_ITEMS", "100"))
-MAX_CLOSED_ITEMS = int(os.getenv("MAX_CLOSED_ITEMS", "100"))
+DEFAULT_ACTIVE_COUNT = _env_int("DEFAULT_ACTIVE_COUNT", 100)
+DEFAULT_CLOSED_COUNT = _env_int("DEFAULT_CLOSED_COUNT", 100)
+MAX_ACTIVE_ITEMS = _env_int("MAX_ACTIVE_ITEMS", 100)
+MAX_CLOSED_ITEMS = _env_int("MAX_CLOSED_ITEMS", 100)
 
 # AI 仅用于型号和关键参数解析
-MODEL_PARSE_BATCH_SIZE = int(os.getenv("MODEL_PARSE_BATCH_SIZE", "15"))
-CLOSED_PARSE_BATCH_SIZE = int(os.getenv("CLOSED_PARSE_BATCH_SIZE", "15"))
-AI_MAX_OUTPUT_TOKENS = int(os.getenv("AI_MAX_OUTPUT_TOKENS", "6000"))
+MODEL_PARSE_BATCH_SIZE = _env_int("MODEL_PARSE_BATCH_SIZE", 15)
+CLOSED_PARSE_BATCH_SIZE = _env_int("CLOSED_PARSE_BATCH_SIZE", 15)
+AI_MAX_OUTPUT_TOKENS = _env_int("AI_MAX_OUTPUT_TOKENS", 6000)
 
 # 程序生成购买建议时的阈值
-BUY_MARGIN_THRESHOLD = Decimal(os.getenv("BUY_MARGIN_THRESHOLD", "0.20"))
-REVIEW_MARGIN_THRESHOLD = Decimal(os.getenv("REVIEW_MARGIN_THRESHOLD", "0.10"))
-HIGH_CONFIDENCE_COMPARABLE_COUNT = int(os.getenv("HIGH_CONFIDENCE_COMPARABLE_COUNT", "10"))
-MEDIUM_CONFIDENCE_COMPARABLE_COUNT = int(os.getenv("MEDIUM_CONFIDENCE_COMPARABLE_COUNT", "5"))
+BUY_MARGIN_THRESHOLD = _env_decimal("BUY_MARGIN_THRESHOLD", "0.20")
+REVIEW_MARGIN_THRESHOLD = _env_decimal("REVIEW_MARGIN_THRESHOLD", "0.10")
+HIGH_CONFIDENCE_COMPARABLE_COUNT = _env_int("HIGH_CONFIDENCE_COMPARABLE_COUNT", 10)
+MEDIUM_CONFIDENCE_COMPARABLE_COUNT = _env_int("MEDIUM_CONFIDENCE_COMPARABLE_COUNT", 5)
 
-AI_REQUEST_TIMEOUT = int(os.getenv("AI_REQUEST_TIMEOUT", "90"))
-AI_MAX_RETRIES = int(os.getenv("AI_MAX_RETRIES", "3"))
-REQUEST_INTERVAL = float(os.getenv("REQUEST_INTERVAL", "1.0"))
-INCLUDE_PAYPAY = os.getenv("INCLUDE_PAYPAY", "false").lower() == "true"
+AI_REQUEST_TIMEOUT = _env_int("AI_REQUEST_TIMEOUT", 90)
+AI_MAX_RETRIES = _env_int("AI_MAX_RETRIES", 3)
+REQUEST_INTERVAL = _env_float("REQUEST_INTERVAL", 1.0)
+INCLUDE_PAYPAY = _env_bool("INCLUDE_PAYPAY", False)
 
-MAX_TOTAL_TOKENS = int(os.getenv("MAX_TOTAL_TOKENS", "50000"))
-LAMBDA_TIMEOUT_SECONDS = int(os.getenv("LAMBDA_TIMEOUT_SECONDS", "840"))
-LAMBDA_TIMEOUT_BUFFER = int(os.getenv("LAMBDA_TIMEOUT_BUFFER", "30"))
+MAX_TOTAL_TOKENS = _env_int("MAX_TOTAL_TOKENS", 50000)
+LAMBDA_TIMEOUT_SECONDS = _env_int("LAMBDA_TIMEOUT_SECONDS", 840)
+LAMBDA_TIMEOUT_BUFFER = _env_int("LAMBDA_TIMEOUT_BUFFER", 30)
 
 # 定价参数
-EXPECTED_SELLING_FEE_RATE = Decimal(os.getenv("EXPECTED_SELLING_FEE_RATE", "0.10"))
-DEFAULT_SHIPPING_COST = Decimal(os.getenv("DEFAULT_SHIPPING_COST", "1500"))
-DEFAULT_REPAIR_RESERVE_RATE = Decimal(os.getenv("DEFAULT_REPAIR_RESERVE_RATE", "0.05"))
-MIN_COMPARABLE_COUNT = int(os.getenv("MIN_COMPARABLE_COUNT", "3"))
-MAX_PRICE_DEVIATION = Decimal(os.getenv("MAX_PRICE_DEVIATION", "1.5"))
-RISK_RESERVE_RATE = Decimal(os.getenv("RISK_RESERVE_RATE", "0.03"))
+EXPECTED_SELLING_FEE_RATE = _env_decimal("EXPECTED_SELLING_FEE_RATE", "0.10")
+DEFAULT_SHIPPING_COST = _env_decimal("DEFAULT_SHIPPING_COST", "1500")
+DEFAULT_REPAIR_RESERVE_RATE = _env_decimal("DEFAULT_REPAIR_RESERVE_RATE", "0.05")
+MIN_COMPARABLE_COUNT = _env_int("MIN_COMPARABLE_COUNT", 3)
+MAX_PRICE_DEVIATION = _env_decimal("MAX_PRICE_DEVIATION", "1.5")
+RISK_RESERVE_RATE = _env_decimal("RISK_RESERVE_RATE", "0.03")
 
 RETRYABLE_CODES = {408, 409, 429, 500, 502, 503, 504}
 
@@ -304,7 +339,6 @@ def generate_pricing_model_key(
         parts.append(normalized_brand)
     if normalized_model:
         parts.append(normalized_model)
-    # model名にvariantが既に含まれている場合は重複追加しない
     if normalized_variant and not model_contains_variant(normalized_model, normalized_variant):
         parts.append(normalized_variant)
     if normalized_storage:
@@ -748,7 +782,6 @@ def batch_parse_models(items: List[Dict]) -> Dict:
         
         logger.info(f"active モデル解析バッチ {batch_number}: {len(batch)} 商品")
         
-        # 必要最小限のフィールドのみ送信
         items_data = [
             {
                 "itemId": str(item["itemID"]),
@@ -854,10 +887,8 @@ def parse_ai_result_minimal(parsed: Dict) -> Tuple[List[Dict], str, str, bool, L
     if not isinstance(missing, list):
         missing = []
     
-    # プログラムでキーパラメータ完全性を判断
     has_all_critical = len(missing) == 0
     
-    # プログラムでモデルリストを生成
     models = []
     if brand and model_name:
         pricing_model_key = generate_pricing_model_key(
@@ -876,7 +907,6 @@ def parse_ai_result_minimal(parsed: Dict) -> Tuple[List[Dict], str, str, bool, L
             "confidence": str(confidence)
         })
     
-    # プログラムで除外理由を生成
     excluded_types = {"ACCESSORY", "PARTS", "BROKEN", "BOX_ONLY", "BUNDLE", "UNKNOWN"}
     exclusion_reasons = []
     
@@ -896,7 +926,6 @@ def save_active_models_minimal(item_id: str, parsed: Dict) -> str:
     """アクティブ商品モデルを保存（極簡AI結果使用）"""
     models, listing_type, condition, has_all_critical, missing, exclusion_reason = parse_ai_result_minimal(parsed)
     
-    # プログラムで分析可能か判断
     is_analysis_eligible = (
         listing_type == "MAIN_PRODUCT"
         and condition != "BROKEN"
@@ -904,7 +933,6 @@ def save_active_models_minimal(item_id: str, parsed: Dict) -> str:
         and len(models) > 0
     )
     
-    # ステータス判断
     if not models:
         status = "REVIEW_REQUIRED"
     elif not is_analysis_eligible:
@@ -1118,7 +1146,6 @@ def batch_parse_closed_models(items: List[Dict]) -> Dict:
         
         logger.info(f"closed モデル解析バッチ {batch_number}: {len(batch)} 商品")
         
-        # 必要最小限のフィールドのみ送信
         items_data = [
             {
                 "itemId": str(item["itemID"]),
@@ -1210,7 +1237,6 @@ def save_closed_models_minimal(item_id: str, parsed: Dict) -> str:
     """落札商品モデルを保存（極簡AI結果使用）"""
     models, listing_type, condition, has_all_critical, missing, exclusion_reason = parse_ai_result_minimal(parsed)
     
-    # プログラムで価格サンプルとして使用可能か判断
     is_comparable = (
         listing_type == "MAIN_PRODUCT"
         and condition != "BROKEN"
