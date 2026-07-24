@@ -12,11 +12,10 @@ import re
 import json
 import time
 import logging
-import hashlib
+import random
 import urllib.request
 import urllib.error
-import random
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import List, Dict, Optional, Any, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -27,6 +26,30 @@ from boto3.dynamodb.conditions import Key, Attr
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
+
+# ==================== 环境变量辅助函数 ====================
+
+def _env_int(key: str, default: int) -> int:
+    value = os.getenv(key, "")
+    if not value:
+        return default
+    return int(value)
+
+
+def _env_decimal(key: str, default: str) -> Decimal:
+    value = os.getenv(key, "")
+    if not value:
+        return Decimal(default)
+    return Decimal(value)
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    value = os.getenv(key, "")
+    if not value:
+        return default
+    return value.lower() == "true"
+
+
 # ============ 环境变量 ============
 TABLE_NAME = os.getenv("TABLE_NAME", "YahooAuctionModelCatalog")
 AI_API_URL = os.getenv("AI_API_URL", "https://ark.cn-beijing.volces.com/api/v3/chat/completions")
@@ -34,25 +57,21 @@ AI_MODEL = os.getenv("AI_MODEL", "doubao-seed-2-0-mini-260428")
 AI_API_KEY = os.getenv("AI_API_KEY", "")
 SECRET_NAME = os.getenv("SECRET_NAME", "yahoo-auction-ai-api-key")
 
-# 调度配置
-SCHEDULE_ENABLED = os.getenv("SCHEDULE_ENABLED", "false").lower() == "true"
-SCHEDULE_INTERVAL_HOURS = int(os.getenv("SCHEDULE_INTERVAL_HOURS", "12"))
-MAX_MODELS_PER_RUN = int(os.getenv("MAX_MODELS_PER_RUN", "6"))
-MAX_CONCURRENT_ANALYSIS = int(os.getenv("MAX_CONCURRENT_ANALYSIS", "3"))
+SCHEDULE_ENABLED = _env_bool("SCHEDULE_ENABLED", False)
+SCHEDULE_INTERVAL_HOURS = _env_int("SCHEDULE_INTERVAL_HOURS", 12)
+MAX_MODELS_PER_RUN = _env_int("MAX_MODELS_PER_RUN", 6)
+MAX_CONCURRENT_ANALYSIS = _env_int("MAX_CONCURRENT_ANALYSIS", 3)
 
-# AI 配置
-AI_REQUEST_TIMEOUT = int(os.getenv("AI_REQUEST_TIMEOUT", "90"))
-AI_MAX_RETRIES = int(os.getenv("AI_MAX_RETRIES", "3"))
-AI_MAX_OUTPUT_TOKENS = int(os.getenv("AI_MAX_OUTPUT_TOKENS", "4000"))
+AI_REQUEST_TIMEOUT = _env_int("AI_REQUEST_TIMEOUT", 90)
+AI_MAX_RETRIES = _env_int("AI_MAX_RETRIES", 3)
+AI_MAX_OUTPUT_TOKENS = _env_int("AI_MAX_OUTPUT_TOKENS", 4000)
 
-# 目录配置
 CATEGORIES_TO_SCAN = os.getenv("CATEGORIES_TO_SCAN", "スマートフォン,タブレット,ノートPC,ゲーム機,カメラ")
-MIN_CONFIDENCE_THRESHOLD = Decimal(os.getenv("MIN_CONFIDENCE_THRESHOLD", "0.5"))
+MIN_CONFIDENCE_THRESHOLD = _env_decimal("MIN_CONFIDENCE_THRESHOLD", "0.5")
 
-# Token 和超时控制
-MAX_TOTAL_TOKENS = int(os.getenv("MAX_TOTAL_TOKENS", "50000"))
-LAMBDA_TIMEOUT_SECONDS = int(os.getenv("LAMBDA_TIMEOUT_SECONDS", "840"))
-LAMBDA_TIMEOUT_BUFFER = int(os.getenv("LAMBDA_TIMEOUT_BUFFER", "60"))
+MAX_TOTAL_TOKENS = _env_int("MAX_TOTAL_TOKENS", 50000)
+LAMBDA_TIMEOUT_SECONDS = _env_int("LAMBDA_TIMEOUT_SECONDS", 840)
+LAMBDA_TIMEOUT_BUFFER = _env_int("LAMBDA_TIMEOUT_BUFFER", 60)
 
 RETRYABLE_CODES = {408, 409, 429, 500, 502, 503, 504}
 
@@ -68,7 +87,6 @@ _lambda_start_time = None
 # ==================== 密钥管理 ====================
 
 def get_api_key():
-    """APIキーの取得"""
     global _api_key_cache
     if _api_key_cache:
         return _api_key_cache
@@ -102,21 +120,18 @@ def get_api_key():
 # ==================== Token 和超时控制 ====================
 
 def get_elapsed_seconds():
-    """Lambda実行経過秒数を取得"""
     if _lambda_start_time is None:
         return 0
     return time.time() - _lambda_start_time
 
 
 def get_remaining_seconds():
-    """Lambdaの残り利用可能秒数を取得"""
     elapsed = get_elapsed_seconds()
     remaining = LAMBDA_TIMEOUT_SECONDS - elapsed - LAMBDA_TIMEOUT_BUFFER
     return max(0, remaining)
 
 
 def check_timeout():
-    """Lambdaがタイムアウトに近いかチェック"""
     remaining = get_remaining_seconds()
     if remaining <= 0:
         raise RuntimeError(
@@ -126,7 +141,6 @@ def check_timeout():
 
 
 def check_token_limit():
-    """Token使用量が制限を超えたかチェック"""
     if _total_tokens_used >= MAX_TOTAL_TOKENS:
         raise RuntimeError(
             f"Token使用量が上限に達しました: {_total_tokens_used}/{MAX_TOTAL_TOKENS}、実行中断"
@@ -134,13 +148,11 @@ def check_token_limit():
 
 
 def check_limits():
-    """Tokenとタイムアウトを同時にチェック"""
     check_token_limit()
     check_timeout()
 
 
 def update_token_usage(usage):
-    """Token使用統計を更新"""
     global _total_tokens_used
     if usage:
         total = usage.get("total_tokens", 0)
@@ -154,7 +166,6 @@ def update_token_usage(usage):
 # ==================== 工具函数 ====================
 
 def normalize(value: str) -> str:
-    """全角を半角に変換し、余分な空白を削除"""
     if not value:
         return ""
     value = str(value).strip()
@@ -170,7 +181,6 @@ def normalize(value: str) -> str:
 
 
 def safe_decimal(value: Any, default: Decimal = Decimal("0")) -> Decimal:
-    """安全にDecimalに変換"""
     try:
         if isinstance(value, Decimal):
             return value
@@ -180,7 +190,6 @@ def safe_decimal(value: Any, default: Decimal = Decimal("0")) -> Decimal:
 
 
 def parse_bool(value: Any) -> bool:
-    """安全にブール値に変換"""
     if isinstance(value, bool):
         return value
     if isinstance(value, str):
@@ -189,7 +198,6 @@ def parse_bool(value: Any) -> bool:
 
 
 def response(status_code: int, body: Dict) -> Dict:
-    """Lambdaレスポンスを構築"""
     return {
         "statusCode": status_code,
         "body": json.dumps(body, ensure_ascii=False, default=str)
@@ -199,15 +207,6 @@ def response(status_code: int, body: Dict) -> Dict:
 # ==================== 数据库操作 ====================
 
 def get_unanalyzed_models(categories: List[str], limit: int = 10) -> List[Dict]:
-    """
-    获取未分析的型号列表
-    
-    查询条件：
-    1. 属于指定品类
-    2. 没有分析时间戳 或 分析时间戳为空
-    3. 按发布日期倒序
-    4. 限制数量
-    """
     unanalyzed_models = []
     
     for category in categories:
@@ -215,7 +214,6 @@ def get_unanalyzed_models(categories: List[str], limit: int = 10) -> List[Dict]:
             break
         
         try:
-            # 查询该品类下的品牌
             response = table.query(
                 KeyConditionExpression=Key("PK").eq(f"CATEGORY#{category}"),
                 FilterExpression=Attr("entity_type").eq("BRAND_MODEL"),
@@ -228,7 +226,6 @@ def get_unanalyzed_models(categories: List[str], limit: int = 10) -> List[Dict]:
                 if len(unanalyzed_models) >= limit:
                     break
                 
-                # 检查是否已分析
                 last_analyzed = item.get("last_analyzed_at")
                 analysis_status = item.get("analysis_status", "PENDING")
                 
@@ -243,14 +240,10 @@ def get_unanalyzed_models(categories: List[str], limit: int = 10) -> List[Dict]:
 
 
 def update_model_analysis_result(model_pk: str, analysis_result: Dict):
-    """更新型号分析结果"""
     now = datetime.now(timezone.utc).isoformat()
     
     table.update_item(
-        Key={
-            "PK": model_pk,
-            "SK": "META"
-        },
+        Key={"PK": model_pk, "SK": "META"},
         UpdateExpression="""
             SET analysis_result = :result,
                 analysis_status = :status,
@@ -266,14 +259,10 @@ def update_model_analysis_result(model_pk: str, analysis_result: Dict):
 
 
 def mark_model_analysis_failed(model_pk: str, error: str):
-    """标记型号分析失败"""
     now = datetime.now(timezone.utc).isoformat()
     
     table.update_item(
-        Key={
-            "PK": model_pk,
-            "SK": "META"
-        },
+        Key={"PK": model_pk, "SK": "META"},
         UpdateExpression="""
             SET analysis_status = :status,
                 analysis_error = :error,
@@ -290,7 +279,6 @@ def mark_model_analysis_failed(model_pk: str, error: str):
 # ==================== AI 分析 ====================
 
 def build_model_analysis_prompt(model_info: Dict) -> str:
-    """构建型号分析 Prompt"""
     brand = model_info.get("brand", "")
     model = model_info.get("model", "")
     category = model_info.get("category", "")
@@ -337,11 +325,6 @@ def build_model_analysis_prompt(model_info: Dict) -> str:
 
 
 def analyze_single_model(model_info: Dict) -> Tuple[Dict, Optional[Dict]]:
-    """
-    分析单个型号
-    
-    返回：(model_info, analysis_result) 或 (model_info, None)
-    """
     model_pk = model_info.get("PK", "")
     brand = model_info.get("brand", "")
     model = model_info.get("model", "")
@@ -367,7 +350,6 @@ def analyze_single_model(model_info: Dict) -> Tuple[Dict, Optional[Dict]]:
 # ==================== AI 调用 ====================
 
 def call_ai_with_retry(prompt: str) -> Optional[Dict]:
-    """リトライ付きAI呼び出し"""
     for attempt in range(AI_MAX_RETRIES):
         try:
             check_limits()
@@ -403,7 +385,6 @@ def call_ai_with_retry(prompt: str) -> Optional[Dict]:
 
 
 def call_ai(prompt: str) -> Tuple[Optional[Dict], Optional[str]]:
-    """AI APIを呼び出す"""
     try:
         api_key = get_api_key()
     except Exception as e:
@@ -471,7 +452,6 @@ def call_ai(prompt: str) -> Tuple[Optional[Dict], Optional[str]]:
 
 
 def parse_ai_json(content: str) -> Optional[Dict]:
-    """AIが返したJSONを解析"""
     if not content:
         return None
     content = content.strip()
@@ -492,12 +472,6 @@ def parse_ai_json(content: str) -> Optional[Dict]:
 # ==================== 主处理逻辑 ====================
 
 def process_model_analysis(event: Dict = None) -> Dict:
-    """
-    主处理逻辑：
-    1. 获取未分析型号
-    2. 并发分析
-    3. 保存结果
-    """
     global _total_tokens_used, _lambda_start_time
     _total_tokens_used = 0
     _lambda_start_time = time.time()
@@ -516,11 +490,9 @@ def process_model_analysis(event: Dict = None) -> Dict:
     }
     
     try:
-        # 解析要扫描的品类
         categories = [cat.strip() for cat in CATEGORIES_TO_SCAN.split(",") if cat.strip()]
         logger.info(f"扫描品类: {categories}")
         
-        # 获取未分析的型号
         unanalyzed_models = get_unanalyzed_models(categories, MAX_MODELS_PER_RUN * 2)
         
         if not unanalyzed_models:
@@ -531,11 +503,9 @@ def process_model_analysis(event: Dict = None) -> Dict:
         
         logger.info(f"找到 {len(unanalyzed_models)} 个未分析型号，将处理最多 {MAX_MODELS_PER_RUN} 个")
         
-        # 限制处理数量
         models_to_analyze = unanalyzed_models[:MAX_MODELS_PER_RUN]
         result["models_scanned"] = len(unanalyzed_models)
         
-        # 并发分析
         analyzed_count = 0
         failed_count = 0
         
@@ -557,7 +527,6 @@ def process_model_analysis(event: Dict = None) -> Dict:
                     model_data, analysis_result = future.result()
                     
                     if analysis_result:
-                        # 保存分析结果
                         update_model_analysis_result(model_pk, analysis_result)
                         analyzed_count += 1
                         
@@ -570,7 +539,6 @@ def process_model_analysis(event: Dict = None) -> Dict:
                         
                         logger.info(f"型号分析成功: {brand} {model_name}")
                     else:
-                        # 标记失败
                         mark_model_analysis_failed(model_pk, "AI_RESPONSE_EMPTY")
                         failed_count += 1
                         
@@ -586,8 +554,6 @@ def process_model_analysis(event: Dict = None) -> Dict:
                     error_msg = str(e)
                     if "Token使用量が上限" in error_msg or "Lambdaタイムアウト" in error_msg:
                         logger.warning(f"分析中断: {error_msg}")
-                        
-                        # 标记剩余型号为跳过
                         mark_model_analysis_failed(model_pk, error_msg)
                         failed_count += 1
                         break
@@ -628,29 +594,23 @@ def process_model_analysis(event: Dict = None) -> Dict:
 # ==================== Lambda 入口 ====================
 
 def lambda_handler(event, context):
-    """Lambda エントリーポイント"""
     global _lambda_start_time
     _lambda_start_time = time.time()
     
     logger.info(f"Lambda执行开始: event={json.dumps(event, ensure_ascii=False, default=str)}")
     
     try:
-        # 检查是否启用定时调度
         if not SCHEDULE_ENABLED:
-            # 手动触发模式
             logger.info("定时调度已禁用，执行手动触发分析")
             result = process_model_analysis(event)
             return response(200, result)
         
-        # 定时触发模式
-        # 检查触发源
         source = event.get("source", "")
         if source == "aws.events":
             logger.info(f"定时触发执行 (间隔: {SCHEDULE_INTERVAL_HOURS}小时)")
             result = process_model_analysis()
             return response(200, result)
         else:
-            # 手动触发
             logger.info("手动触发执行")
             result = process_model_analysis(event)
             return response(200, result)
