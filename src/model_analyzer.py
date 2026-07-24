@@ -1,5 +1,5 @@
 """
-型号批量分析 Lambda (定时触发)
+型号批量分析 Lambda (定时触发) - 修复版
 功能：
 1. 定时扫描数据库中的型号目录
 2. 并发分析未处理的型号（默认3个并发）
@@ -51,7 +51,7 @@ def _env_bool(key: str, default: bool) -> bool:
 
 
 # ============ 环境变量 ============
-TABLE_NAME = os.getenv("TABLE_NAME", "YahooAuctionModelCatalog")
+TABLE_NAME = os.getenv("TABLE_NAME", "ProductCatalog-dev")
 AI_API_URL = os.getenv("AI_API_URL", "https://ark.cn-beijing.volces.com/api/v3/chat/completions")
 AI_MODEL = os.getenv("AI_MODEL", "doubao-seed-2-0-mini-260428")
 AI_API_KEY = os.getenv("AI_API_KEY", "")
@@ -180,6 +180,12 @@ def normalize(value: str) -> str:
     return re.sub(r"\s+", " ", value)
 
 
+def key_part(value):
+    value = normalize(value).upper()
+    value = re.sub(r"[^A-Z0-9\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]+", "-", value)
+    return value.strip("-")[:180]
+
+
 def safe_decimal(value: Any, default: Decimal = Decimal("0")) -> Decimal:
     try:
         if isinstance(value, Decimal):
@@ -207,6 +213,10 @@ def response(status_code: int, body: Dict) -> Dict:
 # ==================== 数据库操作 ====================
 
 def get_unanalyzed_models(categories: List[str], limit: int = 10) -> List[Dict]:
+    """
+    获取未分析的型号列表
+    使用 Scan 按 entity_type 和 category 过滤
+    """
     unanalyzed_models = []
     
     for category in categories:
@@ -214,36 +224,46 @@ def get_unanalyzed_models(categories: List[str], limit: int = 10) -> List[Dict]:
             break
         
         try:
-            response = table.query(
-                KeyConditionExpression=Key("PK").eq(f"CATEGORY#{category}"),
-                FilterExpression=Attr("entity_type").eq("BRAND_MODEL"),
+            # 使用 Scan + FilterExpression 查找 BRAND_MODEL 记录
+            response = table.scan(
+                FilterExpression=Attr("entity_type").eq("BRAND_MODEL") & Attr("category").eq(category),
                 Limit=50
             )
             
             brand_models = response.get("Items", [])
+            logger.info(f"品类 '{category}' 找到 {len(brand_models)} 个型号")
             
             for item in brand_models:
                 if len(unanalyzed_models) >= limit:
                     break
                 
+                # 检查是否已分析（字段可能不存在）
                 last_analyzed = item.get("last_analyzed_at")
                 analysis_status = item.get("analysis_status", "PENDING")
                 
                 if not last_analyzed or analysis_status == "PENDING":
                     unanalyzed_models.append(item)
+                    logger.info(f"  添加未分析型号: {item.get('brand')} {item.get('model')}")
                     
         except Exception as e:
-            logger.error(f"品类 {category} 查询失败: {e}")
+            logger.error(f"品类 {category} 查询失败: {e}", exc_info=True)
             continue
     
+    logger.info(f"共找到 {len(unanalyzed_models)} 个未分析型号")
     return unanalyzed_models[:limit]
 
 
-def update_model_analysis_result(model_pk: str, analysis_result: Dict):
+def update_model_analysis_result(model_pk: str, brand: str, model: str, analysis_result: Dict):
+    """更新型号分析结果到 GSI1 记录"""
     now = datetime.now(timezone.utc).isoformat()
+    brand_key = key_part(brand)
+    model_key = key_part(model)
     
     table.update_item(
-        Key={"PK": model_pk, "SK": "META"},
+        Key={
+            "PK": f"BRAND#{brand_key}",
+            "SK": f"MODEL#{model_key}"
+        },
         UpdateExpression="""
             SET analysis_result = :result,
                 analysis_status = :status,
@@ -258,11 +278,17 @@ def update_model_analysis_result(model_pk: str, analysis_result: Dict):
     )
 
 
-def mark_model_analysis_failed(model_pk: str, error: str):
+def mark_model_analysis_failed(model_pk: str, brand: str, model: str, error: str):
+    """标记型号分析失败"""
     now = datetime.now(timezone.utc).isoformat()
+    brand_key = key_part(brand)
+    model_key = key_part(model)
     
     table.update_item(
-        Key={"PK": model_pk, "SK": "META"},
+        Key={
+            "PK": f"BRAND#{brand_key}",
+            "SK": f"MODEL#{model_key}"
+        },
         UpdateExpression="""
             SET analysis_status = :status,
                 analysis_error = :error,
@@ -492,6 +518,7 @@ def process_model_analysis(event: Dict = None) -> Dict:
     try:
         categories = [cat.strip() for cat in CATEGORIES_TO_SCAN.split(",") if cat.strip()]
         logger.info(f"扫描品类: {categories}")
+        logger.info(f"使用表: {TABLE_NAME}")
         
         unanalyzed_models = get_unanalyzed_models(categories, MAX_MODELS_PER_RUN * 2)
         
@@ -527,7 +554,7 @@ def process_model_analysis(event: Dict = None) -> Dict:
                     model_data, analysis_result = future.result()
                     
                     if analysis_result:
-                        update_model_analysis_result(model_pk, analysis_result)
+                        update_model_analysis_result(model_pk, brand, model_name, analysis_result)
                         analyzed_count += 1
                         
                         result["details"].append({
@@ -539,7 +566,7 @@ def process_model_analysis(event: Dict = None) -> Dict:
                         
                         logger.info(f"型号分析成功: {brand} {model_name}")
                     else:
-                        mark_model_analysis_failed(model_pk, "AI_RESPONSE_EMPTY")
+                        mark_model_analysis_failed(model_pk, brand, model_name, "AI_RESPONSE_EMPTY")
                         failed_count += 1
                         
                         result["details"].append({
@@ -554,16 +581,16 @@ def process_model_analysis(event: Dict = None) -> Dict:
                     error_msg = str(e)
                     if "Token使用量が上限" in error_msg or "Lambdaタイムアウト" in error_msg:
                         logger.warning(f"分析中断: {error_msg}")
-                        mark_model_analysis_failed(model_pk, error_msg)
+                        mark_model_analysis_failed(model_pk, brand, model_name, error_msg)
                         failed_count += 1
                         break
                     else:
-                        mark_model_analysis_failed(model_pk, str(e))
+                        mark_model_analysis_failed(model_pk, brand, model_name, str(e))
                         failed_count += 1
                         
                 except Exception as e:
                     logger.error(f"型号分析异常 {brand} {model_name}: {e}")
-                    mark_model_analysis_failed(model_pk, str(e))
+                    mark_model_analysis_failed(model_pk, brand, model_name, str(e))
                     failed_count += 1
         
         result["models_analyzed"] = analyzed_count
@@ -598,6 +625,8 @@ def lambda_handler(event, context):
     _lambda_start_time = time.time()
     
     logger.info(f"Lambda执行开始: event={json.dumps(event, ensure_ascii=False, default=str)}")
+    logger.info(f"TABLE_NAME={TABLE_NAME}")
+    logger.info(f"CATEGORIES_TO_SCAN={CATEGORIES_TO_SCAN}")
     
     try:
         if not SCHEDULE_ENABLED:
