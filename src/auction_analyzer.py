@@ -10,7 +10,7 @@ Yahoo Auction 商品分析工作流 Lambda (最终修复版)
 7. 状态准确性
 8. 运费安全处理
 9. 修复第三步被跳过的问题
-10. 修复 DynamoDB 保留关键字 condition 冲突
+10. 修复 DynamoDB 保留关键字 condition 冲突 → 使用 parsedCondition
 """
 
 import os
@@ -1005,7 +1005,7 @@ def save_closed_models(
     condition: str = "UNKNOWN",
     exclusion_reason: str = ""
 ):
-    """保存闭拍商品型号（修复：condition 是 DynamoDB 保留关键字）"""
+    """保存闭拍商品型号（使用 parsedCondition 避免 DynamoDB 保留关键字冲突）"""
     normalized_models = []
     for model in models:
         brand = normalize(model.get("brand", ""))
@@ -1028,7 +1028,7 @@ def save_closed_models(
     
     now = datetime.now(timezone.utc).isoformat()
     
-    # 修复：用 #item_cond 替代保留关键字 condition
+    # 使用 parsedCondition 字段名，避免 DynamoDB 保留关键字 condition
     closed_table.update_item(
         Key={"itemID": item_id},
         UpdateExpression="""
@@ -1036,13 +1036,10 @@ def save_closed_models(
                 modelStatus = :status,
                 listingType = :listing_type,
                 isComparable = :is_comparable,
-                #item_cond = :condition_val,
+                parsedCondition = :condition_val,
                 exclusionReason = :exclusion_reason,
                 modelParsedAt = :now
         """,
-        ExpressionAttributeNames={
-            "#item_cond": "condition"  # 转义 DynamoDB 保留关键字
-        },
         ExpressionAttributeValues={
             ":models": normalized_models,
             ":status": status,
@@ -1294,6 +1291,7 @@ def build_pricing_prompt(active_item: Dict, comparable_items: List[Dict], stats:
         "models": active_item.get("models", [])
     }
     
+    # 修复：读取 parsedCondition 字段
     comparables_data = [
         {
             "itemId": item["itemID"],
@@ -1302,7 +1300,7 @@ def build_pricing_prompt(active_item: Dict, comparable_items: List[Dict], stats:
             "bidCount": safe_int(item.get("bidCount", 0)),
             "endTime": item.get("endTime", ""),
             "listingType": item.get("listingType", ""),
-            "condition": item.get("condition", "UNKNOWN"),
+            "condition": item.get("parsedCondition", "UNKNOWN"),
             "sellerRating": item.get("sellerRating", ""),
             "sellerType": item.get("sellerType", "personal"),
             "shippingStatus": item.get("shippingStatus", "UNKNOWN"),
