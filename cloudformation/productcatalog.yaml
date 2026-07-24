@@ -680,6 +680,7 @@ Resources:
         S3Key: !Ref LambdaCodeS3Key
       Environment:
         Variables:
+          SECRET_NAME: !Sub "${SecretName}/${Environment}"
           TABLE_NAME_ACTIVE: !Sub "YahooAuctionActiveItems-${Environment}"
           TABLE_NAME_CLOSED: !Sub "YahooAuctionItems-${Environment}"
           AI_API_URL: !Ref ApiUrl
