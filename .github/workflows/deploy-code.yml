@@ -34,13 +34,13 @@ on:
       update_catalog:
         description: '更新 ProductCatalog Discovery'
         required: true
-        default: false
+        default: true
         type: boolean
       
       update_model_analyzer:
         description: '更新 Model Analyzer（型号批量分析器）'
         required: true
-        default: false
+        default: true
         type: boolean
 
 permissions:
