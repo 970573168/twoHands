@@ -196,7 +196,7 @@ Parameters:
 
   YahooAuctionMaxPages:
     Type: Number
-    Default: 1
+    Default: 2
     MinValue: 1
     MaxValue: 10
     Description: 每次抓取的最大页数
