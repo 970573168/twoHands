@@ -10,6 +10,7 @@ Yahoo Auction 商品分析工作流 Lambda (最终修复版)
 7. 状态准确性
 8. 运费安全处理
 9. 修复第三步被跳过的问题
+10. 修复 DynamoDB 保留关键字 condition 冲突
 """
 
 import os
@@ -27,7 +28,6 @@ from typing import List, Dict, Optional, Any, Set, Tuple
 import boto3
 from boto3.dynamodb.conditions import Key, Attr
 
-# 导入现有的抓取函数
 from yahoo_auction_scraper import (
     scrape_auctions,
     parse_end_time
@@ -49,20 +49,15 @@ AI_REQUEST_TIMEOUT = int(os.getenv("AI_REQUEST_TIMEOUT", "60"))
 AI_MAX_RETRIES = int(os.getenv("AI_MAX_RETRIES", "3"))
 REQUEST_INTERVAL = float(os.getenv("REQUEST_INTERVAL", "1.0"))
 INCLUDE_PAYPAY = os.getenv("INCLUDE_PAYPAY", "false").lower() == "true"
-
-# Secrets Manager 配置（默认启用）
 SECRET_NAME = os.getenv("SECRET_NAME", "yahoo-auction-ai-api-key")
 
-# Token 和超时控制配置 - MAX_TOTAL_TOKENS 从环境变量读取，默认50000
 MAX_TOTAL_TOKENS = int(os.getenv("MAX_TOTAL_TOKENS", "50000"))
 LAMBDA_TIMEOUT_SECONDS = int(os.getenv("LAMBDA_TIMEOUT_SECONDS", "840"))
 LAMBDA_TIMEOUT_BUFFER = int(os.getenv("LAMBDA_TIMEOUT_BUFFER", "30"))
 
-# 批量解析配置
 MODEL_PARSE_BATCH_SIZE = int(os.getenv("MODEL_PARSE_BATCH_SIZE", "10"))
 CLOSED_PARSE_BATCH_SIZE = int(os.getenv("CLOSED_PARSE_BATCH_SIZE", "15"))
 
-# 估价配置
 EXPECTED_SELLING_FEE_RATE = Decimal(os.getenv("EXPECTED_SELLING_FEE_RATE", "0.10"))
 DEFAULT_SHIPPING_COST = Decimal(os.getenv("DEFAULT_SHIPPING_COST", "1500"))
 DEFAULT_REPAIR_RESERVE_RATE = Decimal(os.getenv("DEFAULT_REPAIR_RESERVE_RATE", "0.05"))
@@ -70,16 +65,13 @@ MIN_COMPARABLE_COUNT = int(os.getenv("MIN_COMPARABLE_COUNT", "3"))
 MAX_PRICE_DEVIATION = Decimal(os.getenv("MAX_PRICE_DEVIATION", "1.5"))
 RISK_RESERVE_RATE = Decimal(os.getenv("RISK_RESERVE_RATE", "0.03"))
 
-# 重试配置
 RETRYABLE_CODES = {408, 409, 429, 500, 502, 503, 504}
 
 dynamodb = boto3.resource("dynamodb")
 active_table = dynamodb.Table(TABLE_NAME_ACTIVE)
 closed_table = dynamodb.Table(TABLE_NAME_CLOSED)
-
 secretsmanager = boto3.client("secretsmanager")
 
-# 全局变量
 _api_key_cache = None
 _total_tokens_used = 0
 _lambda_start_time = None
@@ -89,23 +81,18 @@ _lambda_start_time = None
 
 def get_api_key():
     global _api_key_cache
-    
     if _api_key_cache:
         return _api_key_cache
-    
     if AI_API_KEY:
         _api_key_cache = AI_API_KEY
         logger.info("使用环境变量中的 API Key")
         return _api_key_cache
-    
     try:
         logger.info(f"从 Secrets Manager 获取密钥: {SECRET_NAME}")
         response = secretsmanager.get_secret_value(SecretId=SECRET_NAME)
         secret_string = response.get("SecretString")
-        
         if not secret_string:
             raise RuntimeError("Secret 中没有 SecretString 值")
-        
         try:
             secret_dict = json.loads(secret_string)
             api_key = (
@@ -119,10 +106,8 @@ def get_api_key():
             _api_key_cache = api_key
         except json.JSONDecodeError:
             _api_key_cache = secret_string
-        
         logger.info("成功从 Secrets Manager 获取 API Key")
         return _api_key_cache
-        
     except Exception as e:
         logger.error(f"从 Secrets Manager 获取密钥失败: {e}")
         raise RuntimeError(f"无法获取 API 密钥: {e}")
@@ -241,25 +226,18 @@ def safe_decimal(value: Any, default: Decimal = Decimal("0")) -> Decimal:
 
 
 def determine_shipping_status(shipping_text: str) -> Dict:
-    """
-    根据运费文本判断运费状态
-    空文本 → UNKNOWN（不假定包邮）
-    """
     if not shipping_text or not shipping_text.strip():
         return {
             "isFreeShipping": False,
             "shippingStatus": "UNKNOWN",
             "shippingText": ""
         }
-    
     text = shipping_text.strip().lower()
-    
     free_shipping_keywords = [
         "送料無料", "送料込み", "送料込", "送料無", "送料0", "送料ゼロ",
         "free shipping", "shipping free", "shipping included",
         "free", "0円", "0円送料", "出品者負担"
     ]
-    
     for keyword in free_shipping_keywords:
         if keyword.lower() in text.lower():
             return {
@@ -267,11 +245,17 @@ def determine_shipping_status(shipping_text: str) -> Dict:
                 "shippingStatus": "FREE",
                 "shippingText": shipping_text.strip()
             }
-    
     return {
         "isFreeShipping": False,
         "shippingStatus": "CHARGED",
         "shippingText": shipping_text.strip()
+    }
+
+
+def response(status_code: int, body: Dict) -> Dict:
+    return {
+        "statusCode": status_code,
+        "body": json.dumps(body, ensure_ascii=False, default=str)
     }
 
 
@@ -284,7 +268,6 @@ def lambda_handler(event, context):
     
     try:
         keyword = normalize(event.get("keyword", ""))
-        
         if not keyword:
             return response(400, {"error": "keyword 不能为空"})
         
@@ -335,7 +318,6 @@ def lambda_handler(event, context):
 
 
 def execute_workflow(keyword: str, count: int, force_reprocess: bool) -> Dict:
-    """执行完整工作流"""
     start_time = time.time()
     workflow_result = {
         "keyword": keyword,
@@ -356,7 +338,7 @@ def execute_workflow(keyword: str, count: int, force_reprocess: bool) -> Dict:
     try:
         check_limits()
         
-        # ========== 第一步：搜索并保存活跃商品 ==========
+        # ========== 第一步 ==========
         logger.info(f"第一步：搜索活跃商品: {keyword}, count={count}")
         active_item_ids = scrape_and_save_active(keyword, count)
         workflow_result["active_scraped"] = len(active_item_ids)
@@ -367,7 +349,6 @@ def execute_workflow(keyword: str, count: int, force_reprocess: bool) -> Dict:
             workflow_result["elapsed_seconds"] = round(time.time() - start_time, 1)
             return workflow_result
         
-        # 检查 API Key
         try:
             api_key = get_api_key()
             if not api_key:
@@ -381,7 +362,7 @@ def execute_workflow(keyword: str, count: int, force_reprocess: bool) -> Dict:
             workflow_result["elapsed_seconds"] = round(time.time() - start_time, 1)
             return workflow_result
         
-        # ========== 第二步：批量解析本次抓取的活跃商品型号 ==========
+        # ========== 第二步 ==========
         items_to_parse = get_active_items_by_ids(
             active_item_ids, 
             only_pending=(not force_reprocess)
@@ -389,31 +370,25 @@ def execute_workflow(keyword: str, count: int, force_reprocess: bool) -> Dict:
         
         if items_to_parse:
             check_limits()
-            
             logger.info(f"第二步：批量解析型号 ({len(items_to_parse)} 个商品)")
             parse_result = batch_parse_models(items_to_parse)
             workflow_result["active_parsed"] = parse_result["parsed"]
             workflow_result["active_parse_failed"] = parse_result["failed"]
             workflow_result["active_review_required"] = parse_result["review_required"]
             workflow_result["models_found"] = parse_result["models_found"]
-            
             if parse_result["errors"]:
                 workflow_result["errors"].extend(parse_result["errors"])
         
-        # ========== 第三步：搜索闭拍商品 ==========
-        # 修复：使用 get_all_active_items_by_ids 获取所有商品（不只是 PENDING）
+        # ========== 第三步 ==========
         all_processed_items = get_all_active_items_by_ids(active_item_ids)
         unique_models = get_unique_models(all_processed_items)
         
         if unique_models:
             check_limits()
-            
             logger.info(f"第三步：搜索闭拍商品 ({len(unique_models)} 个型号)")
             for i, (model_key, model_info) in enumerate(unique_models.items()):
                 check_limits()
-                
                 logger.info(f"  搜索型号 [{i+1}/{len(unique_models)}]: {model_info['brand']} {model_info['model']}")
-                
                 model_keyword = f'{model_info["brand"]} {model_info["model"]}'
                 closed_items = search_closed_for_model(
                     model_keyword, 
@@ -421,25 +396,23 @@ def execute_workflow(keyword: str, count: int, force_reprocess: bool) -> Dict:
                     MAX_CLOSED_PER_MODEL
                 )
                 workflow_result["closed_scraped"] += len(closed_items)
-                
                 if i < len(unique_models) - 1:
                     time.sleep(REQUEST_INTERVAL)
         else:
             logger.info("第三步：未找到已解析的型号，跳过闭拍搜索")
         
-        # ========== 第四步：AI 清洗闭拍商品型号 ==========
+        # ========== 第四步 ==========
         unparsed_closed = get_unparsed_closed_items(limit=100)
         
         if unparsed_closed:
             check_limits()
-            
             logger.info(f"第四步：清洗闭拍商品型号 ({len(unparsed_closed)} 个商品)")
             parsed_count = batch_parse_closed_models(unparsed_closed)
             workflow_result["closed_parsed"] = parsed_count
         else:
             logger.info("第四步：没有需要清洗的闭拍商品")
         
-        # ========== 第五步：估价分析 ==========
+        # ========== 第五步 ==========
         unpriced_items = get_unpriced_items_for_ids(
             active_item_ids,
             require_model_completed=True
@@ -447,7 +420,6 @@ def execute_workflow(keyword: str, count: int, force_reprocess: bool) -> Dict:
         
         if unpriced_items:
             check_limits()
-            
             logger.info(f"第五步：估价分析 ({len(unpriced_items)} 个商品)")
             pricing_result = batch_price_analysis(unpriced_items)
             workflow_result["pricing_attempted"] = pricing_result["attempted"]
@@ -457,11 +429,9 @@ def execute_workflow(keyword: str, count: int, force_reprocess: bool) -> Dict:
         else:
             logger.info("第五步：没有需要估价的商品（可能型号未解析或已估价）")
         
-        # 判断最终状态
         elapsed = time.time() - start_time
         workflow_result["elapsed_seconds"] = round(elapsed, 1)
         
-        # 状态判断
         if workflow_result["active_scraped"] == 0:
             workflow_result["status"] = "NO_RESULTS"
         elif workflow_result["active_parsed"] == 0 and workflow_result["active_parse_failed"] > 0:
@@ -471,7 +441,6 @@ def execute_workflow(keyword: str, count: int, force_reprocess: bool) -> Dict:
         elif workflow_result["pricing_completed"] > 0:
             workflow_result["status"] = "COMPLETED"
         elif workflow_result["pricing_insufficient_data"] == workflow_result["pricing_attempted"] and workflow_result["pricing_attempted"] > 0:
-            # 所有估价都因为数据不足而失败
             workflow_result["status"] = "PARTIAL_COMPLETED"
             workflow_result["errors"].append(
                 f"型号解析完成，但{workflow_result['pricing_insufficient_data']}个商品因闭拍数据不足无法估价"
@@ -505,19 +474,15 @@ def execute_workflow(keyword: str, count: int, force_reprocess: bool) -> Dict:
 # ==================== 第一步：搜索活跃商品 ====================
 
 def scrape_and_save_active(keyword: str, count: int) -> List[str]:
-    """搜索活跃商品并保存，返回 itemID 列表"""
     logger.info(f"开始抓取活跃商品: keyword='{keyword}', count={count}")
-    
     try:
         items = scrape_auctions(keyword, "active", INCLUDE_PAYPAY)
-        
         if len(items) > count:
             logger.warning(
                 f"抓取器返回 {len(items)} 个商品，超过请求的 {count} 个，"
                 f"将只处理前 {count} 个"
             )
             items = items[:count]
-        
         saved_ids = []
         for item in items:
             try:
@@ -525,23 +490,18 @@ def scrape_and_save_active(keyword: str, count: int) -> List[str]:
                 saved_ids.append(item["itemId"])
             except Exception as e:
                 logger.error(f"保存活跃商品失败 {item.get('itemId')}: {e}")
-        
         logger.info(f"成功抓取并保存 {len(saved_ids)} 个活跃商品")
         return saved_ids
-        
     except Exception as e:
         logger.error(f"抓取活跃商品失败: {e}")
         return []
 
 
 def upsert_active_item(item: Dict, keyword: str):
-    """更新或插入活跃商品"""
     now = datetime.now(timezone.utc)
-    
     buynow_price = item.get("buynowPrice")
     shipping_text = item.get("shippingText", "")
     shipping_info = determine_shipping_status(shipping_text)
-    
     seller_type = item.get("sellerType", "personal")
     item_condition = item.get("itemCondition")
     
@@ -592,11 +552,9 @@ def upsert_active_item(item: Dict, keyword: str):
     if buynow_price is not None:
         update_expr += ", buynowPrice = :buynow_price"
         expr_values[":buynow_price"] = buynow_price
-    
     if shipping_text:
         update_expr += ", shippingText = :shipping_text"
         expr_values[":shipping_text"] = shipping_text
-    
     if item_condition is not None:
         update_expr += ", itemCondition = :item_condition"
         expr_values[":item_condition"] = item_condition
@@ -615,12 +573,7 @@ def upsert_active_item(item: Dict, keyword: str):
 # ==================== 第二步：型号解析 ====================
 
 def get_active_items_by_ids(item_ids: List[str], only_pending: bool = True) -> List[Dict]:
-    """
-    根据 itemId 列表获取活跃商品
-    only_pending=True: 只返回 modelStatus == PENDING 的（用于解析）
-    """
     items = []
-    
     for item_id in item_ids:
         try:
             response = active_table.get_item(Key={"itemID": item_id})
@@ -630,17 +583,11 @@ def get_active_items_by_ids(item_ids: List[str], only_pending: bool = True) -> L
                     items.append(item)
         except Exception as e:
             logger.error(f"获取商品 {item_id} 失败: {e}")
-    
     return items
 
 
 def get_all_active_items_by_ids(item_ids: List[str]) -> List[Dict]:
-    """
-    获取所有指定 ID 的活跃商品（不管 modelStatus）
-    用于提取已解析的型号信息
-    """
     items = []
-    
     for item_id in item_ids:
         try:
             response = active_table.get_item(Key={"itemID": item_id})
@@ -649,44 +596,22 @@ def get_all_active_items_by_ids(item_ids: List[str]) -> List[Dict]:
                 items.append(item)
         except Exception as e:
             logger.error(f"获取商品 {item_id} 失败: {e}")
-    
     return items
 
 
 def batch_parse_models(items: List[Dict]) -> Dict:
-    """批量解析活跃商品型号"""
     if not items:
-        return {
-            "parsed": 0, 
-            "review_required": 0, 
-            "models_found": 0, 
-            "failed": 0,
-            "errors": []
-        }
+        return {"parsed": 0, "review_required": 0, "models_found": 0, "failed": 0, "errors": []}
     
     batch_size = MODEL_PARSE_BATCH_SIZE
-    totals = {
-        "parsed": 0,
-        "review_required": 0,
-        "models_found": 0,
-        "failed": 0,
-        "errors": []
-    }
+    totals = {"parsed": 0, "review_required": 0, "models_found": 0, "failed": 0, "errors": []}
     
     for start in range(0, len(items), batch_size):
         batch = items[start:start + batch_size]
-        
         check_limits()
-        
         logger.info(f"解析批次 {start//batch_size + 1}: {len(batch)} 个商品")
         
-        items_data = [
-            {
-                "itemId": item["itemID"],
-                "title": item.get("title", "")
-            }
-            for item in batch
-        ]
+        items_data = [{"itemId": item["itemID"], "title": item.get("title", "")} for item in batch]
         
         prompt = build_model_parsing_prompt(items_data)
         result = call_ai_with_retry(prompt)
@@ -696,9 +621,7 @@ def batch_parse_models(items: List[Dict]) -> Dict:
             for item in batch:
                 mark_active_model_failed(item["itemID"], "AI_RESPONSE_EMPTY")
             totals["failed"] += len(batch)
-            totals["errors"].append(
-                f"批次{start//batch_size + 1}({len(batch)}个商品) AI返回空结果"
-            )
+            totals["errors"].append(f"批次{start//batch_size + 1}({len(batch)}个商品) AI返回空结果")
             continue
         
         parsed_items = result.get("items", [])
@@ -707,7 +630,6 @@ def batch_parse_models(items: List[Dict]) -> Dict:
         for parsed in parsed_items:
             item_id = parsed.get("itemId")
             models = parsed.get("models", [])
-            
             if item_id:
                 returned_ids.add(item_id)
                 saved_status = save_active_models(item_id, models)
@@ -722,11 +644,8 @@ def batch_parse_models(items: List[Dict]) -> Dict:
         for missing_id in missing_ids:
             mark_active_model_failed(missing_id, "AI_NOT_RETURNED")
             totals["failed"] += 1
-        
         if missing_ids:
-            totals["errors"].append(
-                f"批次{start//batch_size + 1}: AI未返回{len(missing_ids)}个商品"
-            )
+            totals["errors"].append(f"批次{start//batch_size + 1}: AI未返回{len(missing_ids)}个商品")
         
         if start + batch_size < len(items):
             time.sleep(REQUEST_INTERVAL)
@@ -737,13 +656,11 @@ def batch_parse_models(items: List[Dict]) -> Dict:
         f"模型数={totals['models_found']}, "
         f"失败={totals['failed']}"
     )
-    
     return totals
 
 
 def build_model_parsing_prompt(items: List[Dict]) -> str:
     items_text = json.dumps(items, ensure_ascii=False, indent=2)
-    
     return f"""
 あなたは電子製品の専門家です。以下のYahooオークションの商品タイトルから、具体的な製品モデルを特定してください。
 
@@ -784,10 +701,8 @@ def save_active_models(item_id: str, models: List[Dict]) -> str:
     for model in models:
         brand = normalize(model.get("brand", ""))
         model_name = normalize(model.get("model", ""))
-        
         if not brand or not model_name:
             continue
-        
         normalized_models.append({
             "brand": brand,
             "model": model_name,
@@ -814,13 +729,11 @@ def save_active_models(item_id: str, models: List[Dict]) -> str:
             ":workflow": "MODEL_PARSED"
         }
     )
-    
     return status
 
 
 def mark_active_model_failed(item_id: str, error: str):
     now = datetime.now(timezone.utc).isoformat()
-    
     active_table.update_item(
         Key={"itemID": item_id},
         UpdateExpression="""
@@ -840,24 +753,18 @@ def mark_active_model_failed(item_id: str, error: str):
 
 
 def get_unique_models(active_items: List[Dict]) -> Dict[str, Dict]:
-    """获取唯一定型号列表（只返回 modelStatus == COMPLETED 的）"""
     unique = {}
-    
     for item in active_items:
-        # 只处理型号解析完成的
         if item.get("modelStatus") != "COMPLETED":
             continue
-        
         models = item.get("models", [])
         if isinstance(models, str):
             try:
                 models = json.loads(models)
             except json.JSONDecodeError:
                 continue
-        
         if not isinstance(models, list):
             continue
-        
         for model in models:
             if not isinstance(model, dict):
                 continue
@@ -868,22 +775,17 @@ def get_unique_models(active_items: List[Dict]) -> Dict[str, Dict]:
                     "model": model.get("model", ""),
                     "normalizedModel": key
                 }
-    
     return unique
 
 
 # ==================== 第三步：搜索闭拍商品 ====================
 
 def search_closed_for_model(keyword: str, model_info: Dict, max_items: int) -> List[Dict]:
-    """搜索指定型号的闭拍商品"""
     logger.info(f"  搜索闭拍商品: {keyword}")
-    
     try:
         items = scrape_auctions(keyword, "closed", False)
         items = items[:max_items]
-        
         logger.info(f"  找到 {len(items)} 个闭拍商品")
-        
         saved_items = []
         for item in items:
             try:
@@ -891,7 +793,6 @@ def search_closed_for_model(keyword: str, model_info: Dict, max_items: int) -> L
                 saved_items.append(item)
             except Exception as e:
                 logger.error(f"  保存闭拍商品失败 {item.get('itemId')}: {e}")
-        
         return saved_items
     except Exception as e:
         logger.error(f"  搜索闭拍商品失败: {e}")
@@ -899,14 +800,11 @@ def search_closed_for_model(keyword: str, model_info: Dict, max_items: int) -> L
 
 
 def upsert_closed_item(item: Dict, model_info: Dict):
-    """更新或插入闭拍商品"""
     now = datetime.now(timezone.utc)
     model_key = model_info.get("normalizedModel", "")
-    
     buynow_price = item.get("buynowPrice")
     shipping_text = item.get("shippingText", "")
     shipping_info = determine_shipping_status(shipping_text)
-    
     seller_type = item.get("sellerType", "personal")
     item_condition = item.get("itemCondition")
     
@@ -955,11 +853,9 @@ def upsert_closed_item(item: Dict, model_info: Dict):
     if buynow_price is not None:
         update_expr += ", buynowPrice = :buynow_price"
         expr_values[":buynow_price"] = buynow_price
-    
     if shipping_text:
         update_expr += ", shippingText = :shipping_text"
         expr_values[":shipping_text"] = shipping_text
-    
     if item_condition is not None:
         update_expr += ", itemCondition = :item_condition"
         expr_values[":item_condition"] = item_condition
@@ -978,10 +874,8 @@ def upsert_closed_item(item: Dict, model_info: Dict):
 # ==================== 第四步：AI 清洗闭拍型号 ====================
 
 def get_unparsed_closed_items(limit: int = 100) -> List[Dict]:
-    """获取未解析型号的闭拍商品"""
     all_items = []
     last_key = None
-    
     while len(all_items) < limit:
         params = {
             "FilterExpression": Attr("modelStatus").eq("PENDING"),
@@ -989,30 +883,22 @@ def get_unparsed_closed_items(limit: int = 100) -> List[Dict]:
         }
         if last_key:
             params["ExclusiveStartKey"] = last_key
-        
         response = closed_table.scan(**params)
         all_items.extend(response.get("Items", []))
-        
         last_key = response.get("LastEvaluatedKey")
         if not last_key:
             break
-    
     return all_items[:limit]
 
 
 def batch_parse_closed_models(items: List[Dict]) -> int:
-    """批量解析闭拍商品型号"""
     if not items:
         return 0
-    
     batch_size = CLOSED_PARSE_BATCH_SIZE
     total_parsed = 0
-    
     for i in range(0, len(items), batch_size):
         check_limits()
-        
         batch = items[i:i + batch_size]
-        
         items_data = [
             {
                 "itemId": item["itemID"],
@@ -1024,57 +910,44 @@ def batch_parse_closed_models(items: List[Dict]) -> int:
             }
             for item in batch
         ]
-        
         prompt = build_closed_model_parsing_prompt(items_data)
         result = call_ai_with_retry(prompt)
-        
         if not result:
             continue
-        
         parsed_items = result.get("items", [])
         returned_ids = set()
-        
         for parsed in parsed_items:
             item_id = parsed.get("itemId")
-            
             if not item_id:
                 continue
-            
             returned_ids.add(item_id)
-            
             models = parsed.get("models", [])
             listing_type = parsed.get("listingType", "UNKNOWN")
             is_comparable = parsed.get("isComparable", False)
             condition = parsed.get("condition", "UNKNOWN")
             exclusion_reason = parsed.get("exclusionReason", "")
-            
             excluded_types = {"ACCESSORY", "PARTS", "BROKEN", "BOX_ONLY", "BUNDLE", "UNKNOWN"}
             effective_comparable = (
                 bool(models)
                 and listing_type not in excluded_types
                 and is_comparable
             )
-            
             save_closed_models(
                 item_id, models, listing_type, 
                 effective_comparable, condition, exclusion_reason
             )
             total_parsed += 1
-        
         input_ids = {item["itemID"] for item in batch}
         missing_ids = input_ids - returned_ids
         for missing_id in missing_ids:
             mark_closed_parse_failed(missing_id, "AI_NOT_RETURNED")
-        
         if i + batch_size < len(items):
             time.sleep(REQUEST_INTERVAL)
-    
     return total_parsed
 
 
 def build_closed_model_parsing_prompt(items: List[Dict]) -> str:
     items_text = json.dumps(items, ensure_ascii=False, indent=2)
-    
     return f"""
 あなたは中古電子製品の専門家です。以下のYahooオークションの落札商品が、検索対象モデルと一致するか判定してください。
 
@@ -1132,14 +1005,13 @@ def save_closed_models(
     condition: str = "UNKNOWN",
     exclusion_reason: str = ""
 ):
+    """保存闭拍商品型号（修复：condition 是 DynamoDB 保留关键字）"""
     normalized_models = []
     for model in models:
         brand = normalize(model.get("brand", ""))
         model_name = normalize(model.get("model", ""))
-        
         if not brand or not model_name:
             continue
-        
         normalized_models.append({
             "brand": brand,
             "model": model_name,
@@ -1156,6 +1028,7 @@ def save_closed_models(
     
     now = datetime.now(timezone.utc).isoformat()
     
+    # 修复：用 #item_cond 替代保留关键字 condition
     closed_table.update_item(
         Key={"itemID": item_id},
         UpdateExpression="""
@@ -1163,16 +1036,19 @@ def save_closed_models(
                 modelStatus = :status,
                 listingType = :listing_type,
                 isComparable = :is_comparable,
-                condition = :condition,
+                #item_cond = :condition_val,
                 exclusionReason = :exclusion_reason,
                 modelParsedAt = :now
         """,
+        ExpressionAttributeNames={
+            "#item_cond": "condition"  # 转义 DynamoDB 保留关键字
+        },
         ExpressionAttributeValues={
             ":models": normalized_models,
             ":status": status,
             ":listing_type": listing_type,
             ":is_comparable": is_comparable,
-            ":condition": condition,
+            ":condition_val": condition,
             ":exclusion_reason": exclusion_reason,
             ":now": now
         }
@@ -1181,7 +1057,6 @@ def save_closed_models(
 
 def mark_closed_parse_failed(item_id: str, error: str):
     now = datetime.now(timezone.utc).isoformat()
-    
     closed_table.update_item(
         Key={"itemID": item_id},
         UpdateExpression="""
@@ -1204,64 +1079,42 @@ def get_unpriced_items_for_ids(
     require_model_completed: bool = True,
     limit: int = 50
 ) -> List[Dict]:
-    """获取指定 ID 列表中未定价的活跃商品"""
     items = []
-    
     for item_id in item_ids:
         try:
             response = active_table.get_item(Key={"itemID": item_id})
             item = response.get("Item")
             if not item:
                 continue
-            
             if item.get("pricingStatus") != "PENDING":
                 continue
-            
             if require_model_completed and item.get("modelStatus") != "COMPLETED":
                 continue
-            
             models = item.get("models", [])
             if isinstance(models, str):
                 try:
                     models = json.loads(models)
                 except json.JSONDecodeError:
                     models = []
-            
             if not models:
                 continue
-            
             items.append(item)
-            
             if len(items) >= limit:
                 break
-                
         except Exception as e:
             logger.error(f"获取商品 {item_id} 失败: {e}")
-    
     return items
 
 
 def batch_price_analysis(items: List[Dict]) -> Dict:
-    """批量估价分析"""
     if not items:
-        return {
-            "attempted": 0,
-            "completed": 0,
-            "insufficient_data": 0,
-            "failed": 0
-        }
+        return {"attempted": 0, "completed": 0, "insufficient_data": 0, "failed": 0}
     
-    totals = {
-        "attempted": 0,
-        "completed": 0,
-        "insufficient_data": 0,
-        "failed": 0
-    }
+    totals = {"attempted": 0, "completed": 0, "insufficient_data": 0, "failed": 0}
     
     for item in items:
         try:
             check_limits()
-            
             totals["attempted"] += 1
             
             comparable_items = get_comparable_closed_items(item)
@@ -1273,7 +1126,6 @@ def batch_price_analysis(items: List[Dict]) -> Dict:
                 ai_analysis = {}
             
             purchase_price = safe_decimal(item.get("price", 0))
-            
             shipping_status = item.get("shippingStatus", "UNKNOWN")
             is_free_shipping = item.get("isFreeShipping", False)
             
@@ -1318,14 +1170,12 @@ def batch_price_analysis(items: List[Dict]) -> Dict:
 
 
 def get_comparable_closed_items(active_item: Dict) -> List[Dict]:
-    """获取可比闭拍商品"""
     models = active_item.get("models", [])
     if isinstance(models, str):
         try:
             models = json.loads(models)
         except json.JSONDecodeError:
             return []
-    
     if not isinstance(models, list):
         return []
     
@@ -1338,7 +1188,6 @@ def get_comparable_closed_items(active_item: Dict) -> List[Dict]:
         model_key = model.get("normalizedModel")
         if not model_key:
             continue
-        
         try:
             response = closed_table.scan(
                 FilterExpression=(
@@ -1348,37 +1197,30 @@ def get_comparable_closed_items(active_item: Dict) -> List[Dict]:
                 ),
                 Limit=200
             )
-            
             for closed_item in response.get("Items", []):
                 if closed_item["itemID"] in seen_ids:
                     continue
-                    
                 item_models = closed_item.get("models", [])
                 if isinstance(item_models, str):
                     try:
                         item_models = json.loads(item_models)
                     except json.JSONDecodeError:
                         continue
-                
                 if not isinstance(item_models, list):
                     continue
-                
                 for item_model in item_models:
                     if isinstance(item_model, dict) and item_model.get("normalizedModel") == model_key:
                         comparable.append(closed_item)
                         seen_ids.add(closed_item["itemID"])
                         break
-                        
         except Exception as e:
             logger.error(f"查询闭拍商品失败: {e}")
     
     comparable.sort(key=lambda x: x.get("endTime", ""), reverse=True)
-    
     return comparable
 
 
 def calculate_price_statistics(comparable_items: List[Dict]) -> Dict:
-    """计算价格统计"""
     prices = []
     for item in comparable_items:
         try:
@@ -1387,16 +1229,11 @@ def calculate_price_statistics(comparable_items: List[Dict]) -> Dict:
                 prices.append(price)
         except:
             continue
-    
     prices.sort()
     n = len(prices)
     
     if n < MIN_COMPARABLE_COUNT:
-        return {
-            "count": n,
-            "is_sufficient": False,
-            "prices": [int(p) for p in prices]
-        }
+        return {"count": n, "is_sufficient": False, "prices": [int(p) for p in prices]}
     
     def percentile(data: List[Decimal], p: float) -> Decimal:
         k = (len(data) - 1) * p
@@ -1413,7 +1250,6 @@ def calculate_price_statistics(comparable_items: List[Dict]) -> Dict:
     
     lower_bound = q1 - MAX_PRICE_DEVIATION * iqr
     upper_bound = q3 + MAX_PRICE_DEVIATION * iqr
-    
     filtered_prices = [p for p in prices if lower_bound <= p <= upper_bound]
     
     return {
@@ -1437,10 +1273,8 @@ def calculate_price_statistics(comparable_items: List[Dict]) -> Dict:
 def ai_price_analysis(active_item: Dict, comparable_items: List[Dict], stats: Dict) -> Dict:
     max_comparables = 20
     selected_comparables = comparable_items[:max_comparables]
-    
     prompt = build_pricing_prompt(active_item, selected_comparables, stats)
     result = call_ai_with_retry(prompt)
-    
     return result or {}
 
 
@@ -1619,7 +1453,6 @@ def merge_pricing_result(
 
 def save_pricing_result(item_id: str, pricing_result: Dict):
     now = datetime.now(timezone.utc).isoformat()
-    
     active_table.update_item(
         Key={"itemID": item_id},
         UpdateExpression="""
@@ -1639,7 +1472,6 @@ def save_pricing_result(item_id: str, pricing_result: Dict):
 
 def mark_pricing_failed(item_id: str, error: str):
     now = datetime.now(timezone.utc).isoformat()
-    
     active_table.update_item(
         Key={"itemID": item_id},
         UpdateExpression="""
@@ -1658,16 +1490,12 @@ def mark_pricing_failed(item_id: str, error: str):
 # ==================== AI 调用 ====================
 
 def call_ai_with_retry(prompt: str) -> Optional[Dict]:
-    """调用 AI API（带重试）"""
     for attempt in range(AI_MAX_RETRIES):
         try:
             check_limits()
-            
             remaining = get_remaining_seconds()
             if remaining < AI_REQUEST_TIMEOUT + 10:
-                raise RuntimeError(
-                    f"剩余时间不足: 剩余{remaining:.1f}秒"
-                )
+                raise RuntimeError(f"剩余时间不足: 剩余{remaining:.1f}秒")
             
             result, finish_reason = call_ai(prompt)
             
@@ -1698,7 +1526,6 @@ def call_ai_with_retry(prompt: str) -> Optional[Dict]:
 
 
 def call_ai(prompt: str) -> Tuple[Optional[Dict], Optional[str]]:
-    """调用 AI API，返回 (result, finish_reason)"""
     try:
         api_key = get_api_key()
     except Exception as e:
@@ -1766,7 +1593,6 @@ def call_ai(prompt: str) -> Tuple[Optional[Dict], Optional[str]]:
     except urllib.error.HTTPError as e:
         error_body = e.read().decode("utf-8", errors="replace")
         logger.error(f"AI API HTTP {e.code}: {error_body[:500]}")
-        
         if e.code in RETRYABLE_CODES:
             raise
         return None, f"http_{e.code}"
@@ -1779,27 +1605,16 @@ def call_ai(prompt: str) -> Tuple[Optional[Dict], Optional[str]]:
 def parse_ai_json(content: str) -> Optional[Dict]:
     if not content:
         return None
-    
     content = content.strip()
-    
     parse_attempts = [
         lambda c: json.loads(c),
         lambda c: json.loads(re.sub(r"```(?:json)?\s*|\s*```", "", c)),
         lambda c: json.loads(re.search(r"\{[\s\S]*\}", c).group(0)),
     ]
-    
     for attempt in parse_attempts:
         try:
             return attempt(content)
         except (json.JSONDecodeError, AttributeError):
             continue
-    
     logger.error(f"无法解析 AI 响应: {content[:500]}")
     return None
-
-
-def response(status_code: int, body: Dict) -> Dict:
-    return {
-        "statusCode": status_code,
-        "body": json.dumps(body, ensure_ascii=False, default=str)
-    }
