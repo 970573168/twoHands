@@ -138,6 +138,7 @@ jobs:
             "DeploySecret=${{ github.event.inputs.deploy_secret }}"
             "DeployMainApp=${{ github.event.inputs.deploy_main_app }}"
             "DeployScraper=${{ github.event.inputs.deploy_scraper }}"
+            "DeployModelAnalyzer=true"
             "LambdaCodeS3Bucket=$S3_BUCKET"
             "LambdaCodeS3Key=${S3_KEY:-productcatalog/lambda.zip}"
           )
