@@ -947,4 +947,733 @@ def batch_parse_closed_models(items: List[Dict]) -> int:
         parsed_items = result.get("items", [])
         returned_ids = set()
         
-       
+        for parsed in parsed_items:
+            item_id = parsed.get("itemId")
+            
+            if not item_id:
+                continue
+            
+            returned_ids.add(item_id)
+            
+            models = parsed.get("models", [])
+            listing_type = parsed.get("listingType", "UNKNOWN")
+            is_comparable = parsed.get("isComparable", False)
+            condition = parsed.get("condition", "UNKNOWN")
+            exclusion_reason = parsed.get("exclusionReason", "")
+            
+            excluded_types = {"ACCESSORY", "PARTS", "BROKEN", "BOX_ONLY", "BUNDLE", "UNKNOWN"}
+            effective_comparable = (
+                bool(models)
+                and listing_type not in excluded_types
+                and is_comparable
+            )
+            
+            save_closed_models(
+                item_id, models, listing_type, 
+                effective_comparable, condition, exclusion_reason
+            )
+            total_parsed += 1
+        
+        input_ids = {item["itemID"] for item in batch}
+        missing_ids = input_ids - returned_ids
+        for missing_id in missing_ids:
+            mark_closed_parse_failed(missing_id, "AI_NOT_RETURNED")
+        
+        if i + batch_size < len(items):
+            time.sleep(REQUEST_INTERVAL)
+    
+    return total_parsed
+
+
+def build_closed_model_parsing_prompt(items: List[Dict]) -> str:
+    """构建闭拍型号解析提示词"""
+    items_text = json.dumps(items, ensure_ascii=False, indent=2)
+    
+    return f"""
+あなたは中古電子製品の専門家です。以下のYahooオークションの落札商品が、検索対象モデルと一致するか判定してください。
+
+商品リスト：
+{items_text}
+
+以下のJSON形式で返してください：
+{{
+  "items": [
+    {{
+      "itemId": "商品ID",
+      "models": [
+        {{
+          "brand": "ブランド名",
+          "model": "モデル名",
+          "confidence": 0.95
+        }}
+      ],
+      "listingType": "MAIN_PRODUCT",
+      "condition": "USED",
+      "isComparable": true,
+      "exclusionReason": ""
+    }}
+  ]
+}}
+
+listingType:
+- MAIN_PRODUCT: 本体
+- ACCESSORY: アクセサリ
+- PARTS: 部品
+- BROKEN: ジャンク
+- BOX_ONLY: 箱のみ
+- BUNDLE: 複数セット
+- UNKNOWN: 不明
+
+condition:
+- NEW: 新品
+- USED: 中古
+- BROKEN: 故障
+- UNKNOWN: 不明
+
+ルール：
+1. アクセサリ、部品、箱のみは isComparable = false
+2. ジャンク品は isComparable = false
+3. 全ての入力商品IDを含めてください
+4. 必ず有効なJSON形式のみを返してください
+"""
+
+
+def save_closed_models(
+    item_id: str, 
+    models: List[Dict], 
+    listing_type: str, 
+    is_comparable: bool,
+    condition: str = "UNKNOWN",
+    exclusion_reason: str = ""
+):
+    """保存闭拍商品型号"""
+    normalized_models = []
+    for model in models:
+        brand = normalize(model.get("brand", ""))
+        model_name = normalize(model.get("model", ""))
+        
+        if not brand or not model_name:
+            continue
+        
+        normalized_models.append({
+            "brand": brand,
+            "model": model_name,
+            "normalizedModel": normalize_model_key(brand, model_name),
+            "confidence": str(model.get("confidence", 0))
+        })
+    
+    if not normalized_models:
+        status = "REVIEW_REQUIRED"
+    elif any(float(m.get("confidence", 0)) < 0.7 for m in normalized_models):
+        status = "REVIEW_REQUIRED"
+    else:
+        status = "COMPLETED"
+    
+    now = datetime.now(timezone.utc).isoformat()
+    
+    closed_table.update_item(
+        Key={"itemID": item_id},
+        UpdateExpression="""
+            SET models = :models,
+                modelStatus = :status,
+                listingType = :listing_type,
+                isComparable = :is_comparable,
+                condition = :condition,
+                exclusionReason = :exclusion_reason,
+                modelParsedAt = :now
+        """,
+        ExpressionAttributeValues={
+            ":models": normalized_models,
+            ":status": status,
+            ":listing_type": listing_type,
+            ":is_comparable": is_comparable,
+            ":condition": condition,
+            ":exclusion_reason": exclusion_reason,
+            ":now": now
+        }
+    )
+
+
+def mark_closed_parse_failed(item_id: str, error: str):
+    """标记闭拍商品解析失败"""
+    now = datetime.now(timezone.utc).isoformat()
+    
+    closed_table.update_item(
+        Key={"itemID": item_id},
+        UpdateExpression="""
+            SET modelStatus = :status,
+                modelError = :error,
+                modelParsedAt = :now
+        """,
+        ExpressionAttributeValues={
+            ":status": "FAILED",
+            ":error": error,
+            ":now": now
+        }
+    )
+
+
+# ==================== 第五步：估价分析 ====================
+
+def get_unpriced_active_items(limit: int = 50) -> List[Dict]:
+    """获取未定价的活跃商品"""
+    all_items = []
+    last_key = None
+    
+    while len(all_items) < limit:
+        params = {
+            "FilterExpression": Attr("pricingStatus").eq("PENDING"),
+            "Limit": min(limit - len(all_items), 100)
+        }
+        if last_key:
+            params["ExclusiveStartKey"] = last_key
+        
+        response = active_table.scan(**params)
+        all_items.extend(response.get("Items", []))
+        
+        last_key = response.get("LastEvaluatedKey")
+        if not last_key:
+            break
+    
+    return all_items[:limit]
+
+
+def batch_price_analysis(items: List[Dict]) -> int:
+    """批量估价分析"""
+    if not items:
+        return 0
+    
+    total_priced = 0
+    
+    for item in items:
+        try:
+            # 检查限制条件
+            check_limits()
+            
+            comparable_items = get_comparable_closed_items(item)
+            stats = calculate_price_statistics(comparable_items)
+            
+            if stats["is_sufficient"]:
+                ai_analysis = ai_price_analysis(item, comparable_items, stats)
+            else:
+                ai_analysis = {}
+            
+            # 计算实际成本
+            purchase_price = safe_decimal(item.get("price", 0))
+            
+            # 考虑运费
+            actual_shipping = safe_decimal(item.get("shippingFee"), DEFAULT_SHIPPING_COST)
+            if item.get("isFreeShipping", False) or actual_shipping == 0:
+                actual_shipping = Decimal("0")
+            
+            # 考虑即决价格
+            buynow_price = safe_decimal(item.get("buynowPrice")) if item.get("buynowPrice") else None
+            
+            pricing_result = merge_pricing_result(
+                stats, ai_analysis, purchase_price, 
+                actual_shipping, buynow_price
+            )
+            save_pricing_result(item["itemID"], pricing_result)
+            
+            total_priced += 1
+            
+            time.sleep(REQUEST_INTERVAL)
+            
+        except RuntimeError as e:
+            error_msg = str(e)
+            if "Token用量已达上限" in error_msg or "Lambda超时倒计时" in error_msg:
+                logger.warning(f"估价分析中断: {error_msg}")
+                break
+            raise
+        except Exception as e:
+            logger.error(f"估价失败 {item.get('itemID')}: {e}")
+            mark_pricing_failed(item["itemID"], str(e))
+    
+    return total_priced
+
+
+def get_comparable_closed_items(active_item: Dict) -> List[Dict]:
+    """获取可比闭拍商品"""
+    models = active_item.get("models", [])
+    if isinstance(models, str):
+        try:
+            models = json.loads(models)
+        except json.JSONDecodeError:
+            return []
+    
+    if not isinstance(models, list):
+        return []
+    
+    comparable = []
+    seen_ids = set()
+    
+    for model in models:
+        if not isinstance(model, dict):
+            continue
+        model_key = model.get("normalizedModel")
+        if not model_key:
+            continue
+        
+        try:
+            response = closed_table.scan(
+                FilterExpression=(
+                    Attr("modelStatus").eq("COMPLETED") &
+                    Attr("isComparable").eq(True) &
+                    Attr("price").gt(0)
+                ),
+                Limit=200
+            )
+            
+            for closed_item in response.get("Items", []):
+                if closed_item["itemID"] in seen_ids:
+                    continue
+                    
+                item_models = closed_item.get("models", [])
+                if isinstance(item_models, str):
+                    try:
+                        item_models = json.loads(item_models)
+                    except json.JSONDecodeError:
+                        continue
+                
+                if not isinstance(item_models, list):
+                    continue
+                
+                for item_model in item_models:
+                    if isinstance(item_model, dict) and item_model.get("normalizedModel") == model_key:
+                        comparable.append(closed_item)
+                        seen_ids.add(closed_item["itemID"])
+                        break
+                        
+        except Exception as e:
+            logger.error(f"查询闭拍商品失败: {e}")
+    
+    comparable.sort(key=lambda x: x.get("endTime", ""), reverse=True)
+    
+    return comparable
+
+
+def calculate_price_statistics(comparable_items: List[Dict]) -> Dict:
+    """计算价格统计"""
+    prices = []
+    for item in comparable_items:
+        try:
+            price = safe_decimal(item.get("price", 0))
+            if price > 0:
+                prices.append(price)
+        except:
+            continue
+    
+    prices.sort()
+    n = len(prices)
+    
+    if n < MIN_COMPARABLE_COUNT:
+        return {
+            "count": n,
+            "is_sufficient": False,
+            "prices": [int(p) for p in prices]
+        }
+    
+    def percentile(data: List[Decimal], p: float) -> Decimal:
+        k = (len(data) - 1) * p
+        f = int(k)
+        c = k - f
+        if f + 1 < len(data):
+            return data[f] + (data[f + 1] - data[f]) * Decimal(str(c))
+        return data[f]
+    
+    q1 = percentile(prices, 0.25)
+    median = percentile(prices, 0.50)
+    q3 = percentile(prices, 0.75)
+    iqr = q3 - q1
+    
+    lower_bound = q1 - MAX_PRICE_DEVIATION * iqr
+    upper_bound = q3 + MAX_PRICE_DEVIATION * iqr
+    
+    filtered_prices = [p for p in prices if lower_bound <= p <= upper_bound]
+    
+    return {
+        "count": n,
+        "filtered_count": len(filtered_prices),
+        "is_sufficient": len(filtered_prices) >= MIN_COMPARABLE_COUNT,
+        "min": int(min(prices)),
+        "max": int(max(prices)),
+        "q1": int(q1),
+        "median": int(median),
+        "q3": int(q3),
+        "iqr": int(iqr),
+        "filtered_min": int(min(filtered_prices)) if filtered_prices else None,
+        "filtered_max": int(max(filtered_prices)) if filtered_prices else None,
+        "filtered_median": int(sorted(filtered_prices)[len(filtered_prices)//2]) if filtered_prices else None,
+        "prices": [int(p) for p in prices],
+        "filtered_prices": [int(p) for p in filtered_prices]
+    }
+
+
+def ai_price_analysis(active_item: Dict, comparable_items: List[Dict], stats: Dict) -> Dict:
+    """AI 深度估价分析"""
+    max_comparables = 20
+    selected_comparables = comparable_items[:max_comparables]
+    
+    prompt = build_pricing_prompt(active_item, selected_comparables, stats)
+    result = call_ai_with_retry(prompt)
+    
+    return result or {}
+
+
+def build_pricing_prompt(active_item: Dict, comparable_items: List[Dict], stats: Dict) -> str:
+    """构建估价提示词"""
+    active_data = {
+        "itemId": active_item["itemID"],
+        "title": active_item.get("title", ""),
+        "currentBid": safe_int(active_item.get("price", 0)),
+        "buynowPrice": safe_int(active_item.get("buynowPrice")) if active_item.get("buynowPrice") else None,
+        "bidCount": safe_int(active_item.get("bidCount", 0)),
+        "sellerRating": active_item.get("sellerRating", ""),
+        "sellerType": active_item.get("sellerType", "personal"),
+        "itemCondition": active_item.get("itemCondition", ""),
+        "shippingFee": safe_int(active_item.get("shippingFee")) if active_item.get("shippingFee") is not None else None,
+        "isFreeShipping": active_item.get("isFreeShipping", False),
+        "prefecture": active_item.get("prefecture", ""),
+        "models": active_item.get("models", [])
+    }
+    
+    comparables_data = [
+        {
+            "itemId": item["itemID"],
+            "title": item.get("title", ""),
+            "price": safe_int(item.get("price", 0)),
+            "bidCount": safe_int(item.get("bidCount", 0)),
+            "endTime": item.get("endTime", ""),
+            "listingType": item.get("listingType", ""),
+            "condition": item.get("condition", "UNKNOWN"),
+            "sellerRating": item.get("sellerRating", ""),
+            "sellerType": item.get("sellerType", "personal"),
+            "shippingFee": safe_int(item.get("shippingFee")) if item.get("shippingFee") is not None else None,
+            "itemCondition": item.get("itemCondition", "")
+        }
+        for item in comparable_items[:20]
+    ]
+    
+    return f"""
+あなたは中古電子製品の価格分析の専門家です。以下の情報を基に、商品のリスク評価を行ってください。
+
+【分析対象商品】
+{json.dumps(active_data, ensure_ascii=False, indent=2)}
+
+【落札相場データ】
+{json.dumps(comparables_data, ensure_ascii=False, indent=2)}
+
+【統計データ】
+{json.dumps(stats, ensure_ascii=False, indent=2)}
+
+以下のJSON形式で返してください（金額計算は不要です）：
+{{
+  "pricingConfidence": 0.8,
+  "riskLevel": "LOW",
+  "decisionSignal": "REVIEW",
+  "reasons": ["理由1", "理由2"],
+  "riskFactors": ["リスク要因1", "リスク要因2"],
+  "conditionAdjustment": "NONE",
+  "usableComparableItemIds": ["ID1", "ID2"]
+}}
+
+riskLevel: LOW/MEDIUM/HIGH
+decisionSignal: BUY_CANDIDATE/REVIEW/AVOID/INSUFFICIENT_DATA
+conditionAdjustment: NONE/NEEDS_CHECK/MAJOR_DIFFERENCE
+
+分析ルール：
+1. 商品状態の違いを評価（新品/中古/ジャンク）
+2. 出品者タイプ（個人/ストア）と評価を考慮
+3. 送料の有無を考慮
+4. 即決価格がある場合はその妥当性も評価
+5. 必ず有効なJSON形式のみを返してください
+"""
+
+
+def merge_pricing_result(
+    stats: Dict, 
+    ai_analysis: Dict, 
+    purchase_price: Decimal,
+    actual_shipping: Decimal = Decimal("0"),
+    buynow_price: Optional[Decimal] = None
+) -> Dict:
+    """合并统计和AI分析结果，代码计算所有金额"""
+    if not stats.get("is_sufficient"):
+        return to_decimal({
+            "pricingStatus": "INSUFFICIENT_DATA",
+            "pricingConfidence": 0.2,
+            "reasons": ["可比数据不足（需要至少3个可比样本）"],
+            "comparableCount": stats.get("count", 0)
+        })
+    
+    estimated_price = Decimal(str(stats["filtered_median"]))
+    estimated_low = Decimal(str(stats["filtered_min"]))
+    estimated_high = Decimal(str(stats["filtered_max"]))
+    
+    # 代码计算所有费用
+    platform_fee = (estimated_price * EXPECTED_SELLING_FEE_RATE).quantize(Decimal("1"), ROUND_HALF_UP)
+    repair_reserve = (estimated_price * DEFAULT_REPAIR_RESERVE_RATE).quantize(Decimal("1"), ROUND_HALF_UP)
+    risk_reserve = (estimated_price * RISK_RESERVE_RATE).quantize(Decimal("1"), ROUND_HALF_UP)
+    
+    # 总成本（含运费）
+    total_costs = platform_fee + actual_shipping + repair_reserve + risk_reserve
+    
+    # 当前出价利润
+    net_profit_at_bid = estimated_price - purchase_price - total_costs
+    profit_margin_at_bid = (net_profit_at_bid / estimated_price).quantize(Decimal("0.001"), ROUND_HALF_UP) if estimated_price > 0 else Decimal("0")
+    
+    # 即决价格利润（如果有）
+    net_profit_buynow = None
+    profit_margin_buynow = None
+    if buynow_price and buynow_price > 0:
+        net_profit_buynow = estimated_price - buynow_price - total_costs
+        profit_margin_buynow = (net_profit_buynow / estimated_price).quantize(Decimal("0.001"), ROUND_HALF_UP) if estimated_price > 0 else Decimal("0")
+    
+    # 计算不同利润目标下的购入价格
+    target_margin_20 = Decimal("0.20")
+    target_margin_10 = Decimal("0.10")
+    
+    break_even_price = (
+        estimated_price * (Decimal("1") - EXPECTED_SELLING_FEE_RATE - DEFAULT_REPAIR_RESERVE_RATE - RISK_RESERVE_RATE)
+        - actual_shipping
+    ).quantize(Decimal("1"), ROUND_HALF_UP)
+    
+    target_price_20 = (
+        estimated_price * (Decimal("1") - EXPECTED_SELLING_FEE_RATE - DEFAULT_REPAIR_RESERVE_RATE - RISK_RESERVE_RATE - target_margin_20)
+        - actual_shipping
+    ).quantize(Decimal("1"), ROUND_HALF_UP)
+    
+    target_price_10 = (
+        estimated_price * (Decimal("1") - EXPECTED_SELLING_FEE_RATE - DEFAULT_REPAIR_RESERVE_RATE - RISK_RESERVE_RATE - target_margin_10)
+        - actual_shipping
+    ).quantize(Decimal("1"), ROUND_HALF_UP)
+    
+    # 决策逻辑
+    risk_level = ai_analysis.get("riskLevel", "MEDIUM")
+    pricing_confidence = Decimal(str(ai_analysis.get("pricingConfidence", 0.7)))
+    
+    if buynow_price and net_profit_buynow and net_profit_buynow > 0 and profit_margin_buynow >= Decimal("0.15"):
+        decision = "BUY_CANDIDATE"
+    elif net_profit_at_bid <= 0:
+        decision = "AVOID"
+    elif risk_level == "HIGH" or pricing_confidence < Decimal("0.5"):
+        decision = "REVIEW"
+    elif profit_margin_at_bid >= Decimal("0.20") and pricing_confidence >= Decimal("0.75") and risk_level == "LOW":
+        decision = "BUY_CANDIDATE"
+    else:
+        decision = "REVIEW"
+    
+    result = {
+        "pricingStatus": "COMPLETED",
+        "estimatedMarketPrice": int(estimated_price),
+        "estimatedLow": int(estimated_low),
+        "estimatedHigh": int(estimated_high),
+        "currentBidPrice": int(purchase_price),
+        "breakEvenPurchasePrice": int(break_even_price),
+        "targetPurchasePrice20Margin": int(target_price_20),
+        "targetPurchasePrice10Margin": int(target_price_10),
+        "netProfitAtCurrentBid": int(net_profit_at_bid),
+        "profitMarginAtCurrentBid": float(profit_margin_at_bid),
+        "pricingConfidence": float(pricing_confidence),
+        "riskLevel": risk_level,
+        "decisionSignal": decision,
+        "reasons": ai_analysis.get("reasons", []),
+        "riskFactors": ai_analysis.get("riskFactors", []),
+        "conditionAdjustment": ai_analysis.get("conditionAdjustment", "NONE"),
+        "comparableItemIds": ai_analysis.get("usableComparableItemIds", []),
+        "comparableCount": stats.get("filtered_count", 0),
+        "priceBreakdown": {
+            "estimatedSellingPrice": int(estimated_price),
+            "currentBidPrice": int(purchase_price),
+            "platformFee": int(platform_fee),
+            "shippingCost": int(actual_shipping),
+            "repairReserve": int(repair_reserve),
+            "riskReserve": int(risk_reserve),
+            "netProfit": int(net_profit_at_bid)
+        }
+    }
+    
+    # 添加即决价格信息
+    if buynow_price and buynow_price > 0:
+        result["buynowPrice"] = int(buynow_price)
+        result["netProfitAtBuynow"] = int(net_profit_buynow) if net_profit_buynow else None
+        result["profitMarginAtBuynow"] = float(profit_margin_buynow) if profit_margin_buynow else None
+    
+    return to_decimal(result)
+
+
+def save_pricing_result(item_id: str, pricing_result: Dict):
+    """保存估价结果"""
+    now = datetime.now(timezone.utc).isoformat()
+    
+    active_table.update_item(
+        Key={"itemID": item_id},
+        UpdateExpression="""
+            SET pricingResult = :result,
+                pricingStatus = :status,
+                pricedAt = :now,
+                workflowStatus = :workflow
+        """,
+        ExpressionAttributeValues={
+            ":result": pricing_result,
+            ":status": pricing_result.get("pricingStatus", "FAILED"),
+            ":now": now,
+            ":workflow": "PRICING_COMPLETED"
+        }
+    )
+
+
+def mark_pricing_failed(item_id: str, error: str):
+    """标记估价失败"""
+    now = datetime.now(timezone.utc).isoformat()
+    
+    active_table.update_item(
+        Key={"itemID": item_id},
+        UpdateExpression="""
+            SET pricingStatus = :status,
+                pricingError = :error,
+                pricedAt = :now
+        """,
+        ExpressionAttributeValues={
+            ":status": "FAILED",
+            ":error": error[:500],
+            ":now": now
+        }
+    )
+
+
+# ==================== AI 调用（默认使用 Secrets Manager 获取密钥）====================
+
+def call_ai_with_retry(prompt: str) -> Optional[Dict]:
+    """调用 AI API（带重试、Token 控制和超时检查）"""
+    for attempt in range(AI_MAX_RETRIES):
+        try:
+            # 检查限制条件
+            check_limits()
+            
+            # 检查剩余时间是否足够
+            remaining = get_remaining_seconds()
+            if remaining < AI_REQUEST_TIMEOUT + 10:
+                raise RuntimeError(
+                    f"剩余时间不足，无法完成API调用: 剩余{remaining:.1f}秒, "
+                    f"请求超时{AI_REQUEST_TIMEOUT}秒"
+                )
+            
+            result = call_ai(prompt)
+            if result is not None:
+                return result
+            
+            logger.warning(f"AI 返回空结果，重试 {attempt + 1}/{AI_MAX_RETRIES}")
+            
+        except RuntimeError as e:
+            error_msg = str(e)
+            if "Token用量已达上限" in error_msg or "Lambda超时倒计时" in error_msg or "剩余时间不足" in error_msg:
+                logger.warning(f"AI调用中断: {error_msg}")
+                raise
+            logger.error(f"AI 调用异常 (尝试 {attempt + 1}): {e}")
+        except Exception as e:
+            logger.error(f"AI 调用异常 (尝试 {attempt + 1}): {e}")
+        
+        if attempt < AI_MAX_RETRIES - 1:
+            delay = (2 ** attempt) + random.uniform(0, 1)
+            time.sleep(delay)
+    
+    logger.error(f"AI 调用失败，已重试 {AI_MAX_RETRIES} 次")
+    return None
+
+
+def call_ai(prompt: str) -> Optional[Dict]:
+    """调用 AI API（优先使用环境变量，否则从 Secrets Manager 获取密钥）"""
+    try:
+        api_key = get_api_key()
+    except Exception as e:
+        logger.error(f"获取 API Key 失败: {e}")
+        raise
+    
+    body = {
+        "model": AI_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": "あなたは電子製品の専門家です。必ず有効なJSON形式のみを返してください。説明文は一切不要です。"
+            },
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ],
+        "temperature": 0.3,
+        "max_tokens": 4000,
+        "response_format": {"type": "json_object"}
+    }
+    
+    encoded_body = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    
+    request = urllib.request.Request(
+        AI_API_URL,
+        data=encoded_body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        },
+        method="POST"
+    )
+    
+    try:
+        with urllib.request.urlopen(request, timeout=AI_REQUEST_TIMEOUT) as response:
+            result = json.loads(response.read().decode("utf-8"))
+            
+            # 提取并更新 Token 使用量
+            usage = result.get("usage", {})
+            if usage:
+                update_token_usage(usage)
+            
+            if "choices" in result and len(result["choices"]) > 0:
+                content = result["choices"][0]["message"]["content"]
+            else:
+                content = result.get("content", "")
+            
+            return parse_ai_json(content)
+            
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="replace")
+        logger.error(f"AI API HTTP {e.code}: {error_body[:500]}")
+        
+        if e.code in RETRYABLE_CODES:
+            raise
+        return None
+        
+    except Exception as e:
+        logger.error(f"AI API 调用失败: {e}")
+        return None
+
+
+def parse_ai_json(content: str) -> Optional[Dict]:
+    """解析 AI 返回的 JSON"""
+    if not content:
+        return None
+    
+    content = content.strip()
+    
+    parse_attempts = [
+        lambda c: json.loads(c),
+        lambda c: json.loads(re.sub(r"```(?:json)?\s*|\s*```", "", c)),
+        lambda c: json.loads(re.search(r"\{[\s\S]*\}", c).group(0)),
+    ]
+    
+    for attempt in parse_attempts:
+        try:
+            return attempt(content)
+        except (json.JSONDecodeError, AttributeError):
+            continue
+    
+    logger.error(f"无法解析 AI 响应: {content[:500]}")
+    return None
+
+
+def response(status_code: int, body: Dict) -> Dict:
+    """构建 Lambda 响应"""
+    return {
+        "statusCode": status_code,
+        "body": json.dumps(body, ensure_ascii=False, default=str)
+    }
