@@ -1,0 +1,369 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  Yahoo Auction 型号批量分析 Lambda 定时触发器
+  功能：定时扫描数据库中未处理的型号，进行并发分析，并记录时间戳
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - prod
+    Description: 环境名称
+
+  LambdaCodeS3Bucket:
+    Type: String
+    Description: S3 Bucket 名称，用于存储 Lambda 代码
+
+  LambdaCodeS3Key:
+    Type: String
+    Default: "productcatalog/lambda.zip"
+    Description: S3 中 Lambda 代码的对象键
+
+  SecretName:
+    Type: String
+    Default: "yahoo-auction-ai-api-key"
+    Description: Secrets Manager 中的 Secret 名称
+
+  # ============ 调度配置 ============
+  ScheduleEnabled:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: 是否启用定时调度
+
+  ScheduleIntervalHours:
+    Type: Number
+    Default: 12
+    MinValue: 1
+    MaxValue: 24
+    Description: 定时触发间隔（小时）
+
+  # ============ 分析配置 ============
+  MaxModelsPerRun:
+    Type: Number
+    Default: 6
+    MinValue: 1
+    MaxValue: 20
+    Description: 单次执行最多分析的型号数
+
+  MaxConcurrentAnalysis:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 10
+    Description: 最大并发分析数
+
+  # ============ AI 配置 ============
+  AiApiUrl:
+    Type: String
+    Default: "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+    Description: AI API URL
+
+  AiModel:
+    Type: String
+    Default: "doubao-seed-2-0-mini-260428"
+    Description: AI 模型名称
+
+  AiRequestTimeout:
+    Type: Number
+    Default: 90
+    MinValue: 30
+    MaxValue: 300
+    Description: AI 请求超时（秒）
+
+  AiMaxRetries:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 5
+    Description: AI 最大重试次数
+
+  AiMaxOutputTokens:
+    Type: Number
+    Default: 4000
+    MinValue: 1000
+    MaxValue: 8000
+    Description: AI 最大输出 Token 数
+
+  # ============ 品类配置 ============
+  CategoriesToScan:
+    Type: String
+    Default: "スマートフォン,タブレット,ノートPC,ゲーム機,カメラ"
+    Description: 要扫描的品类列表（逗号分隔）
+
+  # ============ Token 和超时控制 ============
+  MaxTotalTokens:
+    Type: Number
+    Default: 50000
+    MinValue: 10000
+    MaxValue: 500000
+    Description: 每次运行的最大 Token 用量
+
+  LambdaTimeoutSeconds:
+    Type: Number
+    Default: 840
+    MinValue: 60
+    MaxValue: 900
+    Description: Lambda 超时时间（秒）
+
+  LambdaTimeoutBuffer:
+    Type: Number
+    Default: 60
+    MinValue: 10
+    MaxValue: 300
+    Description: Lambda 超时缓冲时间（秒）
+
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    MinValue: 1
+    MaxValue: 3653
+    Description: CloudWatch 日志保留天数
+
+  # ============ DynamoDB 表 ============
+  DynamoDbTableName:
+    Type: String
+    Default: "YahooAuctionModelCatalog"
+    Description: DynamoDB 表名称
+
+Conditions:
+  ScheduleEnabledCondition: !Equals [!Ref ScheduleEnabled, "true"]
+
+Resources:
+  # ============================================
+  # DynamoDB 表（模型目录）
+  # ============================================
+  ModelCatalogTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref DynamoDbTableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Application
+          Value: ModelAnalyzer
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================
+  # CloudWatch Logs
+  # ============================================
+  ModelAnalyzerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/model-analyzer-${Environment}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ============================================
+  # Lambda 执行角色
+  # ============================================
+  ModelAnalyzerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "ModelAnalyzer-Role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: ModelAnalyzerPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: DynamoDBAccess
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchGetItem
+                Resource: !GetAtt ModelCatalogTable.Arn
+
+              - Sid: ReadApiSecret
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}-*"
+
+              - Sid: WriteLambdaLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${ModelAnalyzerLogGroup.Arn}:*"
+
+  # ============================================
+  # Lambda 函数
+  # ============================================
+  ModelAnalyzerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - ModelAnalyzerLogGroup
+      - ModelAnalyzerRole
+    Properties:
+      FunctionName: !Sub "model-analyzer-${Environment}"
+      Description: "Yahoo Auction 型号批量分析 Lambda（定时触发）"
+      Runtime: python3.12
+      Architectures:
+        - arm64
+      Handler: model_analyzer.lambda_handler
+      Timeout: !Ref LambdaTimeoutSeconds
+      MemorySize: 1024
+      Role: !GetAtt ModelAnalyzerRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: !Ref LambdaCodeS3Key
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref DynamoDbTableName
+          AI_API_URL: !Ref AiApiUrl
+          AI_MODEL: !Ref AiModel
+          SECRET_NAME: !Ref SecretName
+          SCHEDULE_ENABLED: !Ref ScheduleEnabled
+          SCHEDULE_INTERVAL_HOURS: !Ref ScheduleIntervalHours
+          MAX_MODELS_PER_RUN: !Ref MaxModelsPerRun
+          MAX_CONCURRENT_ANALYSIS: !Ref MaxConcurrentAnalysis
+          AI_REQUEST_TIMEOUT: !Ref AiRequestTimeout
+          AI_MAX_RETRIES: !Ref AiMaxRetries
+          AI_MAX_OUTPUT_TOKENS: !Ref AiMaxOutputTokens
+          CATEGORIES_TO_SCAN: !Ref CategoriesToScan
+          MIN_CONFIDENCE_THRESHOLD: "0.5"
+          MAX_TOTAL_TOKENS: !Ref MaxTotalTokens
+          LAMBDA_TIMEOUT_SECONDS: !Ref LambdaTimeoutSeconds
+          LAMBDA_TIMEOUT_BUFFER: !Ref LambdaTimeoutBuffer
+      Tags:
+        - Key: Application
+          Value: ModelAnalyzer
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================
+  # EventBridge 规则（定时触发）
+  # ============================================
+  ModelAnalyzerScheduleRule:
+    Type: AWS::Events::Rule
+    Condition: ScheduleEnabledCondition
+    Properties:
+      Name: !Sub "model-analyzer-schedule-${Environment}"
+      Description: "定时触发型号批量分析 Lambda"
+      ScheduleExpression: !Sub "rate(${ScheduleIntervalHours} hours)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ModelAnalyzerFunction.Arn
+          Id: ModelAnalyzerTarget
+          RoleArn: !GetAtt EventBridgeRole.Arn
+
+  # EventBridge 执行角色
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Condition: ScheduleEnabledCondition
+    Properties:
+      RoleName: !Sub "ModelAnalyzer-EventBridge-Role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambdaPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt ModelAnalyzerFunction.Arn
+
+  # Lambda 权限（允许 EventBridge 调用）
+  ModelAnalyzerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: ScheduleEnabledCondition
+    Properties:
+      FunctionName: !Ref ModelAnalyzerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ModelAnalyzerScheduleRule.Arn
+
+Outputs:
+  ModelCatalogTableName:
+    Description: DynamoDB 模型目录表名称
+    Value: !Ref ModelCatalogTable
+    Export:
+      Name: !Sub "${Environment}-ModelCatalogTable"
+
+  ModelCatalogTableArn:
+    Description: DynamoDB 模型目录表 ARN
+    Value: !GetAtt ModelCatalogTable.Arn
+    Export:
+      Name: !Sub "${Environment}-ModelCatalogTableArn"
+
+  ModelAnalyzerFunctionName:
+    Description: Lambda 函数名称
+    Value: !Ref ModelAnalyzerFunction
+    Export:
+      Name: !Sub "${Environment}-ModelAnalyzerFunction"
+
+  ModelAnalyzerFunctionArn:
+    Description: Lambda 函数 ARN
+    Value: !GetAtt ModelAnalyzerFunction.Arn
+    Export:
+      Name: !Sub "${Environment}-ModelAnalyzerFunctionArn"
+
+  ModelAnalyzerRoleArn:
+    Description: Lambda 执行角色 ARN
+    Value: !GetAtt ModelAnalyzerRole.Arn
+    Export:
+      Name: !Sub "${Environment}-ModelAnalyzerRole"
+
+  ModelAnalyzerLogGroupName:
+    Description: CloudWatch 日志组名称
+    Value: !Ref ModelAnalyzerLogGroup
+    Export:
+      Name: !Sub "${Environment}-ModelAnalyzerLogGroup"
+
+  ScheduleRuleArn:
+    Description: EventBridge 定时规则 ARN
+    Condition: ScheduleEnabledCondition
+    Value: !GetAtt ModelAnalyzerScheduleRule.Arn
+    Export:
+      Name: !Sub "${Environment}-ModelAnalyzerScheduleRule"
+
+  ScheduleRuleName:
+    Description: EventBridge 定时规则名称
+    Condition: ScheduleEnabledCondition
+    Value: !Ref ModelAnalyzerScheduleRule
+    Export:
+      Name: !Sub "${Environment}-ModelAnalyzerScheduleRuleName"
