@@ -218,7 +218,17 @@ def lambda_handler(event, context):
 
 def scrape_auctions(keyword, search_type, include_paypay=True, exclude_keywords="", include_keywords=""):
     """抓取所有页面"""
+    
+    # ✅ 如果调用方没传过滤词，自动使用默认词库
+    if not exclude_keywords and USE_DEFAULT_EXCLUDE:
+        exclude_keywords = os.getenv("CUSTOM_EXCLUDE_KEYWORDS", DEFAULT_EXCLUDE_KEYWORDS)
+        logger.info(f"自动启用默认排除关键词（前100字）: {exclude_keywords[:100]}...")
+    
+    if not include_keywords:
+        include_keywords = DEFAULT_INCLUDE_KEYWORDS
+    
     all_items = []
+    # ... 其余代码不变
 
     for page in range(1, MAX_PAGES + 1):
         url = build_url(keyword, page, search_type, exclude_keywords, include_keywords)
