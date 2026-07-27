@@ -72,7 +72,7 @@ AI_MODE = _env_str("AI_MODE", "gemini")  # gemini / doubao / openai
 # Gemini 配置（默认首选）
 GEMINI_API_KEY = _env_str("GEMINI_API_KEY", "")
 GEMINI_MODEL = _env_str("GEMINI_MODEL", "gemini-2.0-flash-latest")
-GEMINI_URL = _env_str("GEMINI_URL", "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-latest:generateContent")
+GEMINI_URL = _env_str("GEMINI_URL", "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent")
 GEMINI_TIMEOUT = _env_int("GEMINI_TIMEOUT", 60)
 GEMINI_MAX_TOKENS = _env_int("GEMINI_MAX_TOKENS", 4000)
 
