@@ -338,62 +338,6 @@ def response(status_code: int, body: Dict) -> Dict:
     }
 
 
-# ==================== Lambda 入口 ====================
-
-def lambda_handler(event, context):
-    """Lambda エントリーポイント"""
-    global _total_tokens_used, _lambda_start_time
-    _total_tokens_used = 0
-    _lambda_start_time = time.time()
-    
-    try:
-        keyword = normalize(event.get("keyword", ""))
-        if not keyword:
-            return response(400, {"error": "keywordは必須です"})
-        
-        try:
-            active_count = int(event.get("active_count", event.get("count", DEFAULT_ACTIVE_COUNT)))
-            closed_count = int(event.get("closed_count", DEFAULT_CLOSED_COUNT))
-        except (ValueError, TypeError):
-            return response(400, {"error": "active_count、closed_countは有効な整数である必要があります"})
-        
-        force_reprocess = parse_bool(event.get("force_reprocess", False))
-        
-        active_count = max(1, min(active_count, MAX_ACTIVE_ITEMS))
-        closed_count = max(1, min(closed_count, MAX_CLOSED_ITEMS))
-        
-        logger.info(
-            f"商品分析ワークフロー開始: keyword='{keyword}', "
-            f"active_count={active_count}, closed_count={closed_count}, "
-            f"force_reprocess={force_reprocess}"
-        )
-        
-        result = execute_workflow(
-            keyword=keyword,
-            active_count=active_count,
-            closed_count=closed_count,
-            force_reprocess=force_reprocess
-        )
-        
-        result["execution_stats"] = {
-            "total_tokens_used": _total_tokens_used,
-            "token_limit": MAX_TOTAL_TOKENS,
-            "elapsed_seconds": get_elapsed_seconds(),
-            "remaining_seconds": get_remaining_seconds()
-        }
-        
-        return response(200, result)
-        
-    except Exception as e:
-        logger.error(f"ワークフロー実行失敗: {e}", exc_info=True)
-        return response(500, {
-            "error": "内部エラー",
-            "details": str(e),
-            "total_tokens_used": _total_tokens_used,
-            "elapsed_seconds": get_elapsed_seconds()
-        })
-# 在 auction_analyzer.py 的 lambda_handler 末尾添加
-
 def update_product_status(product_pk: str, status: str, error: str = None):
     """
     更新 ProductCatalog 表中的产品分析状态。
