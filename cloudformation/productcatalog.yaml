@@ -460,6 +460,9 @@ Conditions:
   DeployMainAppCondition: !Equals [!Ref DeployMainApp, "true"]
   HasApiKey: !Not [!Equals [!Ref ApiKey, ""]]
   DeployScraperCondition: !Equals [!Ref DeployScraper, "true"]
+  CatalogScannerEnabledCondition: !Equals
+    - !Ref CatalogScannerEnabled
+    - "true"
   DeployCatalogScannerCondition: !And
     - !Equals [!Ref DeployCatalogScanner, "true"]
     - !Condition DeployMainAppCondition
@@ -1020,14 +1023,15 @@ Resources:
       Name: !Sub "CatalogScanner-Schedule-${Environment}"
       Description: "定期触发目录扫描器"
       ScheduleExpression: !Sub "rate(${CatalogScannerIntervalMinutes} minutes)"
-      State: !If 
-        - !Equals [!Ref CatalogScannerEnabled, "true"]
+      State: !If
+        - CatalogScannerEnabledCondition
         - ENABLED
         - DISABLED
       Targets:
         - Arn: !GetAtt CatalogScannerFunction.Arn
           Id: "CatalogScannerTarget"
-          Input: '{"source":"aws.events","max_models":3}'
+          Input: !Sub '{"source":"aws.events","max_models":${CatalogScannerMaxModels}}'
+
   # ---------- Lambda Permission for CloudWatch Events ----------
   CatalogScannerInvokePermission:
     Type: AWS::Lambda::Permission
