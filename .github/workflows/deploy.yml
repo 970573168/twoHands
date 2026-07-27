@@ -199,16 +199,23 @@ jobs:
             PARAMS+=("DeployCatalogScanner=false")
           fi
           
-          [ "${{ github.event.inputs.deploy_secret }}" = "true" ] && [ -n "${{ github.event.inputs.api_key }}" ] && \
-            PARAMS+=("ParameterKey=ApiKey,ParameterValue=${{ github.event.inputs.api_key }}")
+          # 🔧 修复: ApiKey 使用 Key=Value 格式
+          if [ "${{ github.event.inputs.deploy_secret }}" = "true" ] && [ -n "${{ github.event.inputs.api_key }}" ]; then
+            PARAMS+=("ApiKey=${{ github.event.inputs.api_key }}")
+          fi
           
-          # 合并额外的 stack_params JSON
+          # 🔧 修复: stack_params 使用 Key=Value 格式
           EXTRA_PARAMS='${{ github.event.inputs.stack_params }}'
           if [ "$EXTRA_PARAMS" != "{}" ]; then
             while IFS="=" read -r k v; do
-              [ -n "$k" ] && PARAMS+=("ParameterKey=$k,ParameterValue=$v")
+              [ -n "$k" ] && PARAMS+=("$k=$v")
             done < <(echo "$EXTRA_PARAMS" | jq -r 'to_entries[] | "\(.key)=\(.value)"')
           fi
+          
+          # 🔍 调试: 打印所有参数
+          echo "========== Deployment Parameters =========="
+          printf '%s\n' "${PARAMS[@]}"
+          echo "==========================================="
           
           aws cloudformation deploy \
             --template-file cloudformation/productcatalog.yaml \
