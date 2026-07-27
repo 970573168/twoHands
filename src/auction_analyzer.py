@@ -392,7 +392,74 @@ def lambda_handler(event, context):
             "total_tokens_used": _total_tokens_used,
             "elapsed_seconds": get_elapsed_seconds()
         })
+# 在 auction_analyzer.py 的 lambda_handler 末尾添加
 
+def update_product_status(product_pk: str, status: str, error: str = None):
+    """
+    更新 ProductCatalog 表中的产品分析状态。
+    这个函数由 Analyzer 在完成分析后调用。
+    """
+    if not product_pk:
+        logger.info("product_pk 为空，跳过 PRODUCT 状态更新")
+        return
+    
+    try:
+        product_table = dynamodb.Table(os.environ.get("PRODUCT_TABLE_NAME", "ProductCatalog-dev"))
+        now = int(time.time())
+        today = datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d")
+        
+        update_parts = [
+            "last_analysis_status = :status",
+            "last_scanned_date = :today",
+            "last_scanned_at = :now"
+        ]
+        values = {
+            ":status": status,
+            ":today": today,
+            ":now": now
+        }
+        
+        if error:
+            update_parts.append("last_analysis_error = :error")
+            values[":error"] = str(error)[:500]
+        
+        product_table.update_item(
+            Key={
+                "PK": product_pk,
+                "SK": "META"
+            },
+            UpdateExpression="SET " + ", ".join(update_parts),
+            ExpressionAttributeValues=values
+        )
+        
+        logger.info(f"PRODUCT 状态已更新: {product_pk} -> {status}")
+        
+    except Exception as e:
+        logger.error(f"PRODUCT 状态更新失败: {product_pk} -> {e}")
+
+
+# 在 lambda_handler 中，完成分析后调用
+def lambda_handler(event, context):
+    # ... 现有的分析逻辑 ...
+    
+    product_pk = event.get("product_pk", "")
+    
+    try:
+        result = execute_workflow(...)
+        
+        # 分析完成后更新 PRODUCT 状态
+        if result.get("status") == "COMPLETED":
+            update_product_status(product_pk, "COMPLETED")
+        elif result.get("status") in ("PARTIAL_COMPLETED", "PARTIAL_FAILED"):
+            update_product_status(product_pk, "PARTIAL", str(result.get("errors", [])))
+        else:
+            update_product_status(product_pk, "FAILED", result.get("interrupt_reason", "Unknown error"))
+        
+        return response(200, result)
+        
+    except Exception as e:
+        update_product_status(product_pk, "FAILED", str(e))
+        raise
 
 def execute_workflow(
     keyword: str,
