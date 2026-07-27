@@ -871,6 +871,174 @@ Resources:
         - Key: Environment
           Value: !Ref Environment
 
+# ============================================
+# 产品目录定期扫描器 CloudFormation 资源
+# 追加到现有的 template.yaml 中
+# ============================================
+
+# ============ 参数 ============
+CatalogScannerEnabled:
+  Type: String
+  Default: "false"
+  AllowedValues:
+    - "true"
+    - "false"
+  Description: 是否启用目录扫描器定时触发（默认关闭）
+
+CatalogScannerIntervalMinutes:
+  Type: Number
+  Default: 120
+  MinValue: 30
+  MaxValue: 1440
+  Description: 扫描间隔（分钟），默认120分钟（2小时）
+
+CatalogScannerMaxModels:
+  Type: Number
+  Default: 3
+  MinValue: 1
+  MaxValue: 10
+  Description: 每次扫描最多分析的型号数
+
+# ============ 条件 ============
+DeployCatalogScannerCondition: !And
+  - !Condition DeployMainAppCondition
+  - !Condition DeployScraperCondition
+
+# ============ CloudWatch Logs ============
+CatalogScannerLogGroup:
+  Type: AWS::Logs::LogGroup
+  Condition: DeployCatalogScannerCondition
+  Properties:
+    LogGroupName: !Sub "/aws/lambda/CatalogScanner-${Environment}"
+    RetentionInDays: !Ref LogRetentionDays
+
+# ============ IAM Role ============
+CatalogScannerRole:
+  Type: AWS::IAM::Role
+  Condition: DeployCatalogScannerCondition
+  Properties:
+    RoleName: !Sub "CatalogScanner-Role-${Environment}"
+    AssumeRolePolicyDocument:
+      Version: "2012-10-17"
+      Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+              - lambda.amazonaws.com
+          Action:
+            - sts:AssumeRole
+    Policies:
+      - PolicyName: CatalogScannerPolicy
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Sid: DynamoDBAccess
+              Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:Query
+                - dynamodb:Scan
+                - dynamodb:UpdateItem
+              Resource:
+                - !GetAtt ProductCatalogTable.Arn
+                - !Sub "${ProductCatalogTable.Arn}/index/*"
+
+            - Sid: InvokeAnalyzerLambda
+              Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource: !GetAtt AuctionAnalyzerFunction.Arn
+
+            - Sid: WriteLogs
+              Effect: Allow
+              Action:
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: !Sub "${CatalogScannerLogGroup.Arn}:*"
+
+# ============ Lambda Function ============
+CatalogScannerFunction:
+  Type: AWS::Lambda::Function
+  Condition: DeployCatalogScannerCondition
+  DependsOn:
+    - CatalogScannerLogGroup
+    - CatalogScannerRole
+  Properties:
+    FunctionName: !Sub "CatalogScanner-${Environment}"
+    Description: "定期扫描产品目录，将未分析的型号发送到分析器"
+    Runtime: python3.12
+    Architectures:
+      - arm64
+    Handler: catalog_scanner.lambda_handler
+    Timeout: 900
+    MemorySize: 256
+    Role: !GetAtt CatalogScannerRole.Arn
+    Code:
+      S3Bucket: !Ref LambdaCodeS3Bucket
+      S3Key: !Ref LambdaCodeS3Key
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref ProductCatalogTable
+        ANALYZER_FUNCTION_NAME: !Ref AuctionAnalyzerFunction
+        SCAN_INTERVAL_MINUTES: !Ref CatalogScannerIntervalMinutes
+        MAX_MODELS_PER_RUN: !Ref CatalogScannerMaxModels
+        MAX_ACTIVE_COUNT: !Ref MaxActiveItems
+        MAX_CLOSED_COUNT: !Ref MaxClosedPerModel
+        ENABLE_SCHEDULED_SCAN: !Ref CatalogScannerEnabled
+        TODAY_TAG_KEY: "last_scanned_date"
+        DATA_SOURCE: "AI_DISCOVERY"
+    Tags:
+      - Key: Application
+        Value: CatalogScanner
+      - Key: Environment
+        Value: !Ref Environment
+
+# ============ CloudWatch Events Rule (定时触发) ============
+CatalogScannerScheduleRule:
+  Type: AWS::Events::Rule
+  Condition: DeployCatalogScannerCondition
+  Properties:
+    Name: !Sub "CatalogScanner-Schedule-${Environment}"
+    Description: "定期触发目录扫描器"
+    ScheduleExpression: !Sub "rate(${CatalogScannerIntervalMinutes} minutes)"
+    State: !If 
+      - !Equals [!Ref CatalogScannerEnabled, "true"]
+      - ENABLED
+      - DISABLED
+    Targets:
+      - Arn: !GetAtt CatalogScannerFunction.Arn
+        Id: "CatalogScannerTarget"
+        Input: json.encode({
+          "source": "aws.events",
+          "max_models": !Ref CatalogScannerMaxModels
+        })
+
+# ============ Lambda Permission for CloudWatch Events ============
+CatalogScannerInvokePermission:
+  Type: AWS::Lambda::Permission
+  Condition: DeployCatalogScannerCondition
+  Properties:
+    Action: lambda:InvokeFunction
+    FunctionName: !Ref CatalogScannerFunction
+    Principal: events.amazonaws.com
+    SourceArn: !GetAtt CatalogScannerScheduleRule.Arn
+
+# ============ Outputs ============
+CatalogScannerFunctionName:
+  Description: 目录扫描器 Lambda 函数名称
+  Condition: DeployCatalogScannerCondition
+  Value: !Ref CatalogScannerFunction
+
+CatalogScannerFunctionArn:
+  Description: 目录扫描器 Lambda 函数 ARN
+  Condition: DeployCatalogScannerCondition
+  Value: !GetAtt CatalogScannerFunction.Arn
+
+CatalogScannerScheduleRuleName:
+  Description: 定时触发规则名称
+  Condition: DeployCatalogScannerCondition
+  Value: !Ref CatalogScannerScheduleRule
+
 Outputs:
   # ============ S3 输出 ============
   LambdaCodeBucketName:
