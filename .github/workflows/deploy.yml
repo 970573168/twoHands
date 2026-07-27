@@ -43,7 +43,7 @@ on:
       deploy_catalog_scanner:
         description: "Deploy Catalog Scanner?"
         required: true
-        default: "false"
+        default: "true"
         type: choice
         options:
           - "true"
