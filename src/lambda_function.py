@@ -22,8 +22,7 @@ secretsmanager = boto3.client("secretsmanager")
 # API 配置
 API_URL = os.environ.get("API_URL", "https://ark.cn-beijing.volces.com/api/v3/bots/chat/completions")
 MODEL = os.environ.get("AI_MODEL", "doubao-seed-2-1-pro-260628")
-SECRET_NAME = os.environ.get("SECRET_NAME", "")
-API_KEY = os.environ.get("API_KEY", "")
+SECRET_NAME = os.environ["SECRET_NAME"]  # 强制要求，不再支持 API_KEY 环境变量
 
 # API 调用参数配置
 TEMPERATURE = float(os.environ.get("TEMPERATURE", "0.7"))
@@ -348,31 +347,31 @@ def check_limits():
 
 
 def get_api_key():
+    """从 Secrets Manager 获取 API Key"""
     global _api_key_cache
+    
+    # 如果已缓存，直接返回
     if _api_key_cache:
         return _api_key_cache
-
-    if API_KEY:
-        _api_key_cache = API_KEY
-        return _api_key_cache
-
-    if not SECRET_NAME:
-        raise RuntimeError("未配置 SECRET_NAME 或 API_KEY 环境变量")
-
+    
+    # 从 Secrets Manager 获取
     response = secretsmanager.get_secret_value(SecretId=SECRET_NAME)
     secret_string = response.get("SecretString")
+    
     if not secret_string:
-        raise RuntimeError("API secret has no SecretString value")
-
+        raise RuntimeError(f"Secret {SECRET_NAME} 没有 SecretString")
+    
+    # 解析 JSON 格式的 Secret
     try:
-        value = json.loads(secret_string)
-        api_key = value.get("apiKey") or value.get("api_key") or value.get("key")
+        secret_data = json.loads(secret_string)
+        api_key = secret_data.get("apiKey") or secret_data.get("api_key") or secret_data.get("key")
     except json.JSONDecodeError:
+        # 如果不是 JSON，直接使用整个字符串
         api_key = secret_string
-
+    
     if not api_key:
-        raise RuntimeError("API secret does not contain apiKey")
-
+        raise RuntimeError(f"Secret {SECRET_NAME} 不包含 apiKey")
+    
     _api_key_cache = api_key
     return _api_key_cache
 
