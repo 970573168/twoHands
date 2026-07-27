@@ -2,6 +2,7 @@
 Yahoo Auction 商品分析工作流 Lambda (多API模式切换版)
 支持通过环境变量 AI_MODE 切换 gemini / doubao / openai
 默认使用 Gemini，故障时自动切换到豆包
+包含详细的 API 调用日志和阶段计时
 """
 
 import os
@@ -15,7 +16,8 @@ import urllib.error
 import socket
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_HALF_UP
-from typing import List, Dict, Optional, Any, Set, Tuple
+from typing import List, Dict, Optional, Any, Set, Tuple, Union
+from collections import OrderedDict
 
 import boto3
 
@@ -62,24 +64,25 @@ def _env_bool(key: str, default: bool) -> bool:
 
 
 # ============ 基础环境变量 ============
+ENVIRONMENT = _env_str("ENVIRONMENT", "dev")
 TABLE_NAME_ACTIVE = _env_str("TABLE_NAME_ACTIVE", "YahooAuctionActiveItems")
 TABLE_NAME_CLOSED = _env_str("TABLE_NAME_CLOSED", "YahooAuctionItems")
 PRODUCT_TABLE_NAME = _env_str("PRODUCT_TABLE_NAME", "ProductCatalog-dev")
 
 # ============ AI 模式切换配置 ============
-AI_MODE = _env_str("AI_MODE", "doubao")  # gemini / doubao / openai
+AI_MODE = _env_str("AI_MODE", "gemini")  # gemini / doubao / openai
 
 # Gemini 配置（默认首选）
 GEMINI_API_KEY = _env_str("GEMINI_API_KEY", "")
 GEMINI_MODEL = _env_str("GEMINI_MODEL", "gemini-2.0-flash-latest")
-GEMINI_URL = _env_str("GEMINI_URL", "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent")
+GEMINI_URL = _env_str("GEMINI_URL", "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-latest:generateContent")
 GEMINI_TIMEOUT = _env_int("GEMINI_TIMEOUT", 60)
 GEMINI_MAX_TOKENS = _env_int("GEMINI_MAX_TOKENS", 4000)
 
 # 豆包配置（备用）
 DOUBAO_API_KEY = _env_str("DOUBAO_API_KEY", "")
-DOUBAO_MODEL = _env_str("DOUBAO_MODEL", "qwen3.6-flash")
-DOUBAO_URL = _env_str("DOUBAO_URL", "https://ws-8lxmxlbemcgcus5u.ap-northeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions")
+DOUBAO_MODEL = _env_str("DOUBAO_MODEL", "doubao-seed-2-0-mini-260428")
+DOUBAO_URL = _env_str("DOUBAO_URL", "https://ark.cn-beijing.volces.com/api/v3/chat/completions")
 DOUBAO_TIMEOUT = _env_int("DOUBAO_TIMEOUT", 90)
 DOUBAO_MAX_TOKENS = _env_int("DOUBAO_MAX_TOKENS", 6000)
 
@@ -141,40 +144,285 @@ _ai_mode_state = {
 }
 
 
+# ==================== API 调用日志记录器 ====================
+
+class APILogger:
+    """记录每次 API 调用的请求和响应"""
+    
+    def __init__(self):
+        self.calls: List[Dict] = []
+        self.sequence = 0
+    
+    def log_request(self, api_name: str, model: str, url: str, request_body: Dict, timeout: int) -> int:
+        """记录请求，返回序列号"""
+        self.sequence += 1
+        call_log = {
+            "sequence": self.sequence,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "api_name": api_name,
+            "model": model,
+            "url": url[:150],
+            "timeout": timeout,
+            "request": {
+                "prompt_length": self._get_prompt_length(request_body),
+                "max_tokens": request_body.get("generationConfig", {}).get("maxOutputTokens") or request_body.get("max_tokens", 0),
+                "body_preview": self._truncate_body(request_body)
+            },
+            "response": None,
+            "status": "pending"
+        }
+        self.calls.append(call_log)
+        return self.sequence
+    
+    def _get_prompt_length(self, body: Dict) -> int:
+        """获取提示词长度"""
+        if "contents" in body:
+            parts = body.get("contents", [{}])[0].get("parts", [{}])
+            return len(parts[0].get("text", "")) if parts else 0
+        elif "messages" in body:
+            messages = body.get("messages", [])
+            return sum(len(m.get("content", "")) for m in messages)
+        return 0
+    
+    def log_response(self, seq: int, status_code: int, response_body: Optional[Dict], 
+                     tokens_used: int, duration_ms: float, error: str = None,
+                     finish_reason: str = None, content_length: int = 0):
+        """记录响应"""
+        for call in self.calls:
+            if call["sequence"] == seq:
+                call["status"] = "success" if error is None else "failed"
+                call["response"] = {
+                    "status_code": status_code,
+                    "tokens_used": tokens_used,
+                    "duration_ms": round(duration_ms, 2),
+                    "finish_reason": finish_reason,
+                    "content_length": content_length,
+                    "error": error,
+                    "response_preview": self._truncate_response(response_body) if response_body else None
+                }
+                break
+    
+    def _truncate_body(self, body: Dict) -> Dict:
+        """截断请求体用于日志"""
+        truncated = {}
+        for key in body:
+            if key == "contents":
+                items = body[key]
+                if isinstance(items, list):
+                    truncated[key] = [{
+                        "parts": [{
+                            "text": (str(p.get("text", ""))[:200] + "...") if len(str(p.get("text", ""))) > 200 else str(p.get("text", ""))
+                        } for p in item.get("parts", [])]
+                    } for item in items[:2]]
+            elif key == "messages":
+                truncated[key] = [{
+                    "role": m.get("role"),
+                    "content": (str(m.get("content", ""))[:200] + "...") if len(str(m.get("content", ""))) > 200 else str(m.get("content", ""))
+                } for m in body[key][-2:]]
+            elif key in ("generationConfig", "model", "temperature", "max_tokens", "response_format"):
+                truncated[key] = body[key]
+        return truncated
+    
+    def _truncate_response(self, response: Dict) -> Dict:
+        """截断响应体用于日志"""
+        truncated = {}
+        if "candidates" in response:
+            truncated["candidates_count"] = len(response.get("candidates", []))
+            if response.get("candidates"):
+                first = response["candidates"][0]
+                truncated["finishReason"] = first.get("finishReason")
+                parts = first.get("content", {}).get("parts", [{}])
+                content = parts[0].get("text", "") if parts else ""
+                truncated["content_preview"] = (content[:300] + "...") if len(content) > 300 else content
+        elif "choices" in response:
+            truncated["choices_count"] = len(response.get("choices", []))
+            if response.get("choices"):
+                first = response["choices"][0]
+                truncated["finish_reason"] = first.get("finish_reason")
+                content = first.get("message", {}).get("content", "")
+                truncated["content_preview"] = (content[:300] + "...") if len(content) > 300 else content
+        if "usageMetadata" in response:
+            truncated["usage"] = response["usageMetadata"]
+        if "usage" in response:
+            truncated["usage"] = response["usage"]
+        return truncated
+    
+    def get_summary(self) -> Dict:
+        """获取 API 调用汇总"""
+        total = len(self.calls)
+        success = sum(1 for c in self.calls if c["status"] == "success")
+        failed = sum(1 for c in self.calls if c["status"] == "failed")
+        total_tokens = sum(c.get("response", {}).get("tokens_used", 0) for c in self.calls if c.get("response"))
+        total_duration = sum(c.get("response", {}).get("duration_ms", 0) for c in self.calls if c.get("response"))
+        
+        by_api = {}
+        for call in self.calls:
+            api_name = call["api_name"]
+            if api_name not in by_api:
+                by_api[api_name] = {"total": 0, "success": 0, "failed": 0, "tokens": 0, "duration_ms": 0}
+            by_api[api_name]["total"] += 1
+            if call["status"] == "success":
+                by_api[api_name]["success"] += 1
+            else:
+                by_api[api_name]["failed"] += 1
+            resp = call.get("response") or {}
+            by_api[api_name]["tokens"] += resp.get("tokens_used", 0)
+            by_api[api_name]["duration_ms"] += resp.get("duration_ms", 0)
+        
+        return {
+            "total_calls": total,
+            "success": success,
+            "failed": failed,
+            "total_tokens": total_tokens,
+            "total_duration_ms": round(total_duration, 2),
+            "total_duration_seconds": round(total_duration / 1000, 2),
+            "by_api": {
+                name: {
+                    "total": stats["total"],
+                    "success": stats["success"],
+                    "failed": stats["failed"],
+                    "tokens": stats["tokens"],
+                    "duration_ms": round(stats["duration_ms"], 2),
+                    "avg_duration_ms": round(stats["duration_ms"] / stats["total"], 2) if stats["total"] > 0 else 0
+                } for name, stats in by_api.items()
+            }
+        }
+    
+    def get_detailed_logs(self) -> List[Dict]:
+        """获取详细日志"""
+        return self.calls
+
+
+# ==================== 阶段计时器 ====================
+
+class StageTimer:
+    """记录各阶段耗时"""
+    
+    def __init__(self):
+        self.stages: Dict[str, Dict] = OrderedDict()
+        self.current_stage = None
+        self.stage_start = None
+        self.overall_start = time.time()
+    
+    def start(self, stage_name: str):
+        """开始新阶段"""
+        if self.current_stage:
+            self.end()
+        self.current_stage = stage_name
+        self.stage_start = time.time()
+        logger.info(f"⏱️ 阶段开始: {stage_name}")
+    
+    def end(self):
+        """结束当前阶段"""
+        if not self.current_stage:
+            return
+        elapsed = time.time() - self.stage_start
+        if self.current_stage not in self.stages:
+            self.stages[self.current_stage] = {
+                "count": 0,
+                "total_seconds": 0,
+                "min_seconds": float('inf'),
+                "max_seconds": 0,
+                "instances": []
+            }
+        stage = self.stages[self.current_stage]
+        stage["count"] += 1
+        stage["total_seconds"] += elapsed
+        stage["min_seconds"] = min(stage["min_seconds"], elapsed)
+        stage["max_seconds"] = max(stage["max_seconds"], elapsed)
+        stage["instances"].append({
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "duration_seconds": round(elapsed, 3)
+        })
+        logger.info(f"⏱️ 阶段结束: {self.current_stage} - 耗时 {elapsed:.2f}秒")
+        self.current_stage = None
+        self.stage_start = None
+    
+    def get_summary(self) -> Dict:
+        """获取各阶段汇总"""
+        if self.current_stage:
+            self.end()
+        total_elapsed = time.time() - self.overall_start
+        stage_summary = {}
+        for name, stats in self.stages.items():
+            stage_summary[name] = {
+                "count": stats["count"],
+                "total_seconds": round(stats["total_seconds"], 2),
+                "avg_seconds": round(stats["total_seconds"] / stats["count"], 2) if stats["count"] > 0 else 0,
+                "min_seconds": round(stats["min_seconds"], 2) if stats["min_seconds"] != float('inf') else 0,
+                "max_seconds": round(stats["max_seconds"], 2)
+            }
+        return {
+            "total_elapsed_seconds": round(total_elapsed, 2),
+            "stages": stage_summary,
+            "stage_percentages": {
+                name: round((stats["total_seconds"] / total_elapsed * 100), 1) if total_elapsed > 0 else 0
+                for name, stats in self.stages.items()
+            }
+        }
+
+
+# ==================== 全局实例 ====================
+
+_api_logger: Optional[APILogger] = None
+_stage_timer: Optional[StageTimer] = None
+
+def get_api_logger() -> APILogger:
+    global _api_logger
+    if _api_logger is None:
+        _api_logger = APILogger()
+    return _api_logger
+
+def get_stage_timer() -> StageTimer:
+    global _stage_timer
+    if _stage_timer is None:
+        _stage_timer = StageTimer()
+    return _stage_timer
+
+
 # ==================== AI 配置管理 ====================
 
 def _get_api_key_from_secrets(mode: str) -> str:
-    """从 Secrets Manager 获取 API Key"""
-    secret_name_map = {
-        "gemini": "gemini-api-key",
-        "doubao": "doubao-api-key",
-        "openai": "openai-api-key",
-    }
+    """从 Secrets Manager 获取 API Key，支持带/不带环境后缀的名称"""
+    env = ENVIRONMENT
     
-    secret_name = secret_name_map.get(mode, f"{mode}-api-key")
+    secret_names = [
+        f"{mode}-api-key-{env}",
+        f"{mode}-api-key",
+        f"{mode}/api-key/{env}",
+    ]
     
-    try:
-        response = secretsmanager.get_secret_value(SecretId=secret_name)
-        secret_string = response.get("SecretString", "")
-        if not secret_string:
-            return ""
-        
+    for secret_name in secret_names:
         try:
-            secret_dict = json.loads(secret_string)
-            return (
-                secret_dict.get("apiKey") or 
-                secret_dict.get("api_key") or 
-                secret_dict.get("key") or
-                secret_dict.get("GEMINI_API_KEY") or
-                secret_dict.get("DOUBAO_API_KEY") or
-                secret_dict.get("OPENAI_API_KEY") or
-                ""
-            )
-        except json.JSONDecodeError:
-            return secret_string.strip()
-    except Exception as e:
-        logger.warning(f"Secrets Manager 获取 {secret_name} 失败: {e}")
-        return ""
+            response = secretsmanager.get_secret_value(SecretId=secret_name)
+            secret_string = response.get("SecretString", "")
+            if not secret_string:
+                continue
+            
+            try:
+                secret_dict = json.loads(secret_string)
+                key = (
+                    secret_dict.get("apiKey") or 
+                    secret_dict.get("api_key") or 
+                    secret_dict.get("key") or
+                    secret_dict.get("GEMINI_API_KEY") or
+                    secret_dict.get("DOUBAO_API_KEY") or
+                    secret_dict.get("OPENAI_API_KEY") or
+                    ""
+                )
+                if key:
+                    logger.info(f"✅ 成功从 Secret '{secret_name}' 获取 Key (mode={mode})")
+                    return key
+            except json.JSONDecodeError:
+                key = secret_string.strip()
+                if key:
+                    logger.info(f"✅ 成功从 Secret '{secret_name}' 获取 Key (mode={mode})")
+                    return key
+        except Exception as e:
+            logger.debug(f"Secret '{secret_name}' 获取失败: {type(e).__name__}")
+    
+    logger.warning(f"⚠️ 无法从任何 Secret 获取 mode '{mode}' 的 Key (尝试了: {secret_names})")
+    return ""
 
 
 def get_ai_config(mode: str = None) -> Dict:
@@ -223,7 +471,6 @@ def get_available_ai_config() -> Optional[Dict]:
     """获取可用的 AI 配置，考虑故障切换"""
     fallback_order = ["gemini", "doubao", "openai"]
     
-    # 优先使用配置的模式
     if AI_MODE in fallback_order:
         ordered_modes = [AI_MODE] + [m for m in fallback_order if m != AI_MODE]
     else:
@@ -232,7 +479,6 @@ def get_available_ai_config() -> Optional[Dict]:
     now = time.time()
     
     for mode in ordered_modes:
-        # 检查冷却时间
         if mode in _ai_mode_state["failed_modes"]:
             fail_time = _ai_mode_state["failed_modes"][mode]
             if now - fail_time < AI_FAILOVER_COOLDOWN:
@@ -244,17 +490,19 @@ def get_available_ai_config() -> Optional[Dict]:
         
         config = get_ai_config(mode)
         if config["key"]:
-            logger.info(f"选择 AI 模式: '{mode}'")
+            logger.info(f"✅ 选择 AI 模式: '{mode}' (model={config['model']})")
             return config
+        else:
+            logger.warning(f"AI 模式 '{mode}' 没有可用的 API Key")
     
-    logger.error("所有 AI 模式均不可用")
+    logger.error("❌ 所有 AI 模式均不可用")
     return None
 
 
 def mark_ai_mode_failed(mode: str, error: str = ""):
     """标记 AI 模式故障"""
     _ai_mode_state["failed_modes"][mode] = time.time()
-    logger.warning(f"AI 模式 '{mode}' 标记为故障，冷却 {AI_FAILOVER_COOLDOWN}秒。错误: {error[:100]}")
+    logger.warning(f"❌ AI 模式 '{mode}' 标记为故障，冷却 {AI_FAILOVER_COOLDOWN}秒。错误: {error[:100]}")
 
 
 def reset_ai_state():
@@ -280,9 +528,7 @@ def get_remaining_seconds():
 def check_timeout():
     remaining = get_remaining_seconds()
     if remaining <= 0:
-        raise RuntimeError(
-            f"Lambdaタイムアウトカウントダウン: 実行時間{get_elapsed_seconds():.1f}秒"
-        )
+        raise RuntimeError(f"Lambdaタイムアウトカウントダウン: 実行時間{get_elapsed_seconds():.1f}秒")
 
 
 def check_token_limit():
@@ -455,9 +701,11 @@ def update_product_status(product_pk: str, status: str, error: str = None):
 # ==================== Lambda 入口 ====================
 
 def lambda_handler(event, context):
-    global _total_tokens_used, _lambda_start_time
+    global _total_tokens_used, _lambda_start_time, _api_logger, _stage_timer
     _total_tokens_used = 0
     _lambda_start_time = time.time()
+    _api_logger = None
+    _stage_timer = None
     reset_ai_state()
     
     try:
@@ -477,7 +725,7 @@ def lambda_handler(event, context):
         active_count = max(1, min(active_count, MAX_ACTIVE_ITEMS))
         closed_count = max(1, min(closed_count, MAX_CLOSED_ITEMS))
         
-        logger.info(f"商品分析ワークフロー開始: keyword='{keyword}', AI_MODE='{AI_MODE}'")
+        logger.info(f"商品分析ワークフロー開始: keyword='{keyword}', AI_MODE='{AI_MODE}', ENV='{ENVIRONMENT}'")
         
         result = execute_workflow(
             keyword=keyword,
@@ -494,6 +742,11 @@ def lambda_handler(event, context):
             "ai_mode": AI_MODE,
             "ai_failed_modes": list(_ai_mode_state["failed_modes"].keys()),
         }
+        
+        if _api_logger:
+            result["api_call_logs_summary"] = _api_logger.get_summary()
+        if _stage_timer:
+            result["stage_times"] = _stage_timer.get_summary()
         
         if product_pk:
             if result.get("status") == "COMPLETED":
@@ -520,8 +773,12 @@ def lambda_handler(event, context):
 
 
 def execute_workflow(keyword: str, active_count: int, closed_count: int, force_reprocess: bool) -> Dict:
+    global _api_logger, _stage_timer
+    
+    _api_logger = APILogger()
+    _stage_timer = StageTimer()
+    
     start_time = time.time()
-    stage_times = {}
     
     workflow_result = {
         "keyword": keyword,
@@ -536,19 +793,20 @@ def execute_workflow(keyword: str, active_count: int, closed_count: int, force_r
         check_limits()
         
         # 第一步：active 搜索
-        stage_start = time.time()
+        _stage_timer.start("01_active_search")
         active_item_ids = scrape_and_save_active(keyword=keyword, count=active_count, force_reprocess=force_reprocess)
         workflow_result["active_search_count"] = len(active_item_ids)
-        stage_times["active_search"] = round(time.time() - stage_start, 1)
+        _stage_timer.end()
         
         if not active_item_ids:
             workflow_result["status"] = "NO_ACTIVE_RESULTS"
             workflow_result["elapsed_seconds"] = round(time.time() - start_time, 1)
-            workflow_result["stage_times"] = stage_times
+            workflow_result["stage_times"] = _stage_timer.get_summary()
+            workflow_result["api_call_logs_summary"] = _api_logger.get_summary()
             return workflow_result
         
         # 第二步：active AI 解析
-        stage_start = time.time()
+        _stage_timer.start("02_active_ai_parse")
         active_items = get_active_items_by_ids(active_item_ids, only_pending=not force_reprocess)
         if active_items:
             active_parse_result = batch_parse_models(active_items)
@@ -557,17 +815,17 @@ def execute_workflow(keyword: str, active_count: int, closed_count: int, force_r
             workflow_result["active_review_required"] = active_parse_result["review_required"]
             workflow_result["active_parse_failed"] = active_parse_result["failed"]
             workflow_result["errors"].extend(active_parse_result.get("errors", []))
-        stage_times["active_parse"] = round(time.time() - stage_start, 1)
+        _stage_timer.end()
         
         # 第三步：closed 搜索
-        stage_start = time.time()
+        _stage_timer.start("03_closed_search")
         check_limits()
         closed_item_ids = scrape_and_save_closed_once(keyword=keyword, count=closed_count, force_reprocess=force_reprocess)
         workflow_result["closed_search_count"] = len(closed_item_ids)
-        stage_times["closed_search"] = round(time.time() - stage_start, 1)
+        _stage_timer.end()
         
         # 第四步：closed AI 解析
-        stage_start = time.time()
+        _stage_timer.start("04_closed_ai_parse")
         if closed_item_ids:
             closed_items = get_closed_items_by_ids(closed_item_ids, only_pending=not force_reprocess)
             if closed_items:
@@ -577,10 +835,10 @@ def execute_workflow(keyword: str, active_count: int, closed_count: int, force_r
                 workflow_result["closed_review_required"] = closed_parse_result["review_required"]
                 workflow_result["closed_parse_failed"] = closed_parse_result["failed"]
                 workflow_result["errors"].extend(closed_parse_result.get("errors", []))
-        stage_times["closed_parse"] = round(time.time() - stage_start, 1)
+        _stage_timer.end()
         
         # 第五步：价格评估
-        stage_start = time.time()
+        _stage_timer.start("05_price_analysis")
         active_items_for_pricing = get_unpriced_items_for_ids(active_item_ids, require_model_completed=True, include_completed=force_reprocess, limit=active_count)
         if active_items_for_pricing:
             pricing_result = batch_price_analysis(active_items_for_pricing, allowed_closed_item_ids=set(closed_item_ids))
@@ -588,7 +846,7 @@ def execute_workflow(keyword: str, active_count: int, closed_count: int, force_r
             workflow_result["pricing_completed"] = pricing_result["completed"]
             workflow_result["pricing_insufficient_data"] = pricing_result["insufficient_data"]
             workflow_result["pricing_failed"] = pricing_result["failed"]
-        stage_times["pricing"] = round(time.time() - stage_start, 1)
+        _stage_timer.end()
         
         # 最终状态
         if workflow_result["pricing_completed"] > 0:
@@ -602,7 +860,8 @@ def execute_workflow(keyword: str, active_count: int, closed_count: int, force_r
         
         workflow_result["status"] = final_status
         workflow_result["elapsed_seconds"] = round(time.time() - start_time, 1)
-        workflow_result["stage_times"] = stage_times
+        workflow_result["stage_times"] = _stage_timer.get_summary()
+        workflow_result["api_call_logs_summary"] = _api_logger.get_summary()
         
         logger.info("ワークフロー完了: %s", json.dumps(workflow_result, ensure_ascii=False, default=str))
         return workflow_result
@@ -613,7 +872,8 @@ def execute_workflow(keyword: str, active_count: int, closed_count: int, force_r
             workflow_result["status"] = "INTERRUPTED"
             workflow_result["interrupt_reason"] = error_message
             workflow_result["elapsed_seconds"] = round(time.time() - start_time, 1)
-            workflow_result["stage_times"] = stage_times
+            workflow_result["stage_times"] = _stage_timer.get_summary() if _stage_timer else {}
+            workflow_result["api_call_logs_summary"] = _api_logger.get_summary() if _api_logger else {}
             return workflow_result
         raise
     except Exception as exc:
@@ -621,7 +881,8 @@ def execute_workflow(keyword: str, active_count: int, closed_count: int, force_r
         workflow_result["status"] = "FAILED"
         workflow_result["errors"].append(str(exc))
         workflow_result["elapsed_seconds"] = round(time.time() - start_time, 1)
-        workflow_result["stage_times"] = stage_times
+        workflow_result["stage_times"] = _stage_timer.get_summary() if _stage_timer else {}
+        workflow_result["api_call_logs_summary"] = _api_logger.get_summary() if _api_logger else {}
         return workflow_result
 
 
@@ -1101,7 +1362,7 @@ def mark_closed_parse_failed(item_id: str, error: str):
     )
 
 
-# ==================== 步骤5：价格评估（原有代码保持不变） ====================
+# ==================== 步骤5：价格评估 ====================
 
 def get_unpriced_items_for_ids(item_ids: List[str], require_model_completed: bool = True, include_completed: bool = False, limit: int = 100) -> List[Dict]:
     items = []
@@ -1635,7 +1896,6 @@ def call_ai_with_retry(prompt: str) -> Tuple[Optional[Dict], Optional[str]]:
         mode_name = config["name"]
         timeout = config["timeout"]
         
-        # 单个模式重试
         for retry in range(AI_MAX_RETRIES):
             try:
                 check_limits()
@@ -1674,7 +1934,6 @@ def call_ai_with_retry(prompt: str) -> Tuple[Optional[Dict], Optional[str]]:
                 delay = (2 ** retry) + random.uniform(0, 1)
                 time.sleep(delay)
         
-        # 当前模式所有重试失败，切换
         logger.warning(f"[{mode_name}] 所有重试失败，切换到备用模式")
         mark_ai_mode_failed(mode_name, f"ALL_RETRIES_FAILED ({AI_MAX_RETRIES})")
     
@@ -1683,6 +1942,9 @@ def call_ai_with_retry(prompt: str) -> Tuple[Optional[Dict], Optional[str]]:
 
 def call_gemini_api(config: Dict, prompt: str) -> Tuple[Optional[Dict], Optional[str]]:
     """调用 Gemini API"""
+    api_logger = get_api_logger()
+    stage_timer = get_stage_timer()
+    
     api_key = config["key"]
     api_url = config["url"]
     timeout = config["timeout"]
@@ -1693,18 +1955,27 @@ def call_gemini_api(config: Dict, prompt: str) -> Tuple[Optional[Dict], Optional
         "generationConfig": {"temperature": 0.0, "maxOutputTokens": max_tokens}
     }
     
+    seq = api_logger.log_request(config["name"], config.get("model", ""), api_url, body, timeout)
     encoded_body = json.dumps(body, ensure_ascii=False).encode("utf-8")
     
-    request = urllib.request.Request(
-        api_url, data=encoded_body,
-        headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
-        method="POST"
-    )
+    stage_timer.start(f"api_call_{config['name']}_{seq}")
+    start_time = time.time()
     
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        result = json.loads(response.read().decode("utf-8"))
+    try:
+        request = urllib.request.Request(
+            api_url, data=encoded_body,
+            headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+            method="POST"
+        )
+        
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            duration_ms = (time.time() - start_time) * 1000
+            result = json.loads(response.read().decode("utf-8"))
+        
+        stage_timer.end()
         
         usage = result.get("usageMetadata", {})
+        total_tokens = 0
         if usage:
             total_tokens = usage.get("promptTokenCount", 0) + usage.get("candidatesTokenCount", 0)
             update_token_usage({"total_tokens": total_tokens})
@@ -1719,17 +1990,35 @@ def call_gemini_api(config: Dict, prompt: str) -> Tuple[Optional[Dict], Optional
                 parts = candidate["content"]["parts"]
                 content = "".join(part.get("text", "") for part in parts)
         
+        api_logger.log_response(seq, 200, result, total_tokens, duration_ms,
+                                finish_reason=finish_reason, content_length=len(content))
+        
         if finish_reason == "SAFETY":
             logger.error("Gemini 安全过滤触发")
             return None, "safety_blocked"
         
-        logger.info(f"Gemini 返回内容长度: {len(content)}, finish_reason: {finish_reason}")
+        logger.info(f"Gemini 返回内容长度: {len(content)}, finish_reason: {finish_reason}, 耗时: {duration_ms:.0f}ms")
         parsed = parse_ai_json(content)
         return parsed, finish_reason
+        
+    except urllib.error.HTTPError as e:
+        duration_ms = (time.time() - start_time) * 1000
+        stage_timer.end()
+        error_body = e.read().decode("utf-8", errors="replace")
+        api_logger.log_response(seq, e.code, None, 0, duration_ms, error=f"HTTP {e.code}: {error_body[:200]}")
+        raise
+    except Exception as e:
+        duration_ms = (time.time() - start_time) * 1000
+        stage_timer.end()
+        api_logger.log_response(seq, 0, None, 0, duration_ms, error=str(e)[:200])
+        raise
 
 
 def call_openai_compatible_api(config: Dict, prompt: str) -> Tuple[Optional[Dict], Optional[str]]:
     """调用 OpenAI 兼容 API（豆包、OpenAI 等）"""
+    api_logger = get_api_logger()
+    stage_timer = get_stage_timer()
+    
     api_key = config["key"]
     api_url = config["url"]
     timeout = config["timeout"]
@@ -1746,22 +2035,30 @@ def call_openai_compatible_api(config: Dict, prompt: str) -> Tuple[Optional[Dict
         "max_tokens": max_tokens
     }
     
-    # 豆包支持 response_format
     if config["name"] == "doubao":
         body["response_format"] = {"type": "json_object"}
     
+    seq = api_logger.log_request(config["name"], model, api_url, body, timeout)
     encoded_body = json.dumps(body, ensure_ascii=False).encode("utf-8")
     
-    request = urllib.request.Request(
-        api_url, data=encoded_body,
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        method="POST"
-    )
+    stage_timer.start(f"api_call_{config['name']}_{seq}")
+    start_time = time.time()
     
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        result = json.loads(response.read().decode("utf-8"))
+    try:
+        request = urllib.request.Request(
+            api_url, data=encoded_body,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            method="POST"
+        )
+        
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            duration_ms = (time.time() - start_time) * 1000
+            result = json.loads(response.read().decode("utf-8"))
+        
+        stage_timer.end()
         
         usage = result.get("usage", {})
+        total_tokens = usage.get("total_tokens", 0)
         if usage:
             update_token_usage(usage)
         
@@ -1773,9 +2070,24 @@ def call_openai_compatible_api(config: Dict, prompt: str) -> Tuple[Optional[Dict
             content = choice["message"]["content"]
             finish_reason = choice.get("finish_reason", "unknown")
         
-        logger.info(f"[{config['name']}] 返回内容长度: {len(content)}, finish_reason: {finish_reason}")
+        api_logger.log_response(seq, 200, result, total_tokens, duration_ms,
+                                finish_reason=finish_reason, content_length=len(content))
+        
+        logger.info(f"[{config['name']}] 返回内容长度: {len(content)}, finish_reason: {finish_reason}, 耗时: {duration_ms:.0f}ms")
         parsed = parse_ai_json(content)
         return parsed, finish_reason
+        
+    except urllib.error.HTTPError as e:
+        duration_ms = (time.time() - start_time) * 1000
+        stage_timer.end()
+        error_body = e.read().decode("utf-8", errors="replace")
+        api_logger.log_response(seq, e.code, None, 0, duration_ms, error=f"HTTP {e.code}: {error_body[:200]}")
+        raise
+    except Exception as e:
+        duration_ms = (time.time() - start_time) * 1000
+        stage_timer.end()
+        api_logger.log_response(seq, 0, None, 0, duration_ms, error=str(e)[:200])
+        raise
 
 
 def parse_ai_json(content: str) -> Optional[Dict]:
