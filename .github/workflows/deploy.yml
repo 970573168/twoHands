@@ -185,6 +185,7 @@ jobs:
             "LambdaCodeS3Key=${S3_KEY:-productcatalog/lambda.zip}"
             "YahooAuctionMaxPages=${{ github.event.inputs.max_pages }}"
             "LogRetentionDays=${{ github.event.inputs.log_retention }}"
+            "AiMaxRetries=3"
           )
           
           # 添加 Catalog Scanner 参数
