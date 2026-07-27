@@ -1027,7 +1027,7 @@ Resources:
       Targets:
         - Arn: !GetAtt CatalogScannerFunction.Arn
           Id: "CatalogScannerTarget"
-          Input: !Sub '{"source":"aws.events","max_models":${CatalogScannerMaxModels}}'
+          Input: '{"source":"aws.events","max_models":3}'
 
   # ---------- Lambda Permission for CloudWatch Events ----------
   CatalogScannerInvokePermission:
