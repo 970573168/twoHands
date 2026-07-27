@@ -28,53 +28,97 @@ from yahoo_auction_scraper import scrape_auctions
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 
+
+# ==================== 环境变量辅助函数 ====================
+
+def _env_str(key: str, default: str) -> str:
+    """读取环境变量字符串"""
+    value = os.getenv(key, "")
+    return value if value else default
+
+
+def _env_int(key: str, default: int) -> int:
+    """读取环境变量并转为 int"""
+    try:
+        value = os.getenv(key, "")
+        if not value:
+            return default
+        return int(value)
+    except (ValueError, TypeError):
+        logger.warning(f"环境变量 {key} 值无效: {os.getenv(key)}，使用默认值 {default}")
+        return default
+
+
+def _env_decimal(key: str, default: str) -> Decimal:
+    """读取环境变量并转为 Decimal"""
+    try:
+        value = os.getenv(key, "")
+        if not value:
+            return Decimal(default)
+        return Decimal(value)
+    except Exception:
+        logger.warning(f"环境变量 {key} 值无效: {os.getenv(key)}，使用默认值 {default}")
+        return Decimal(default)
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    """读取环境变量并转为 bool"""
+    value = os.getenv(key, "")
+    if not value:
+        return default
+    return value.lower() in ("true", "1", "yes", "y")
+
+
 # ============ 环境变量 ============
-TABLE_NAME_ACTIVE = os.getenv("TABLE_NAME_ACTIVE", "YahooAuctionActiveItems")
-TABLE_NAME_CLOSED = os.getenv("TABLE_NAME_CLOSED", "YahooAuctionItems")
-AI_API_URL = os.getenv("AI_API_URL", "https://ark.cn-beijing.volces.com/api/v3/chat/completions")
-AI_MODEL = os.getenv("AI_MODEL", "doubao-seed-2-0-mini-260428")
-AI_API_KEY = os.getenv("AI_API_KEY", "")
-SECRET_NAME = os.getenv("SECRET_NAME", "yahoo-auction-ai-api-key")
+TABLE_NAME_ACTIVE = _env_str("TABLE_NAME_ACTIVE", "YahooAuctionActiveItems")
+TABLE_NAME_CLOSED = _env_str("TABLE_NAME_CLOSED", "YahooAuctionItems")
+PRODUCT_TABLE_NAME = _env_str("PRODUCT_TABLE_NAME", "ProductCatalog-dev")
+
+AI_API_URL = _env_str("AI_API_URL", "https://ark.cn-beijing.volces.com/api/v3/chat/completions")
+AI_MODEL = _env_str("AI_MODEL", "doubao-seed-2-0-mini-260428")
+AI_API_KEY = _env_str("AI_API_KEY", "")
+SECRET_NAME = _env_str("SECRET_NAME", "yahoo-auction-ai-api-key")
 
 # active 和 closed 默认各抓取 100 条，并且每种类型只搜索一次
-DEFAULT_ACTIVE_COUNT = int(os.getenv("DEFAULT_ACTIVE_COUNT", "100"))
-DEFAULT_CLOSED_COUNT = int(os.getenv("DEFAULT_CLOSED_COUNT", "100"))
-MAX_ACTIVE_ITEMS = int(os.getenv("MAX_ACTIVE_ITEMS", "100"))
-MAX_CLOSED_ITEMS = int(os.getenv("MAX_CLOSED_ITEMS", "100"))
+DEFAULT_ACTIVE_COUNT = _env_int("DEFAULT_ACTIVE_COUNT", 100)
+DEFAULT_CLOSED_COUNT = _env_int("DEFAULT_CLOSED_COUNT", 100)
+MAX_ACTIVE_ITEMS = _env_int("MAX_ACTIVE_ITEMS", 100)
+MAX_CLOSED_ITEMS = _env_int("MAX_CLOSED_ITEMS", 100)
 
 # AI 仅用于型号和关键参数解析
-MODEL_PARSE_BATCH_SIZE = int(os.getenv("MODEL_PARSE_BATCH_SIZE", "15"))
-CLOSED_PARSE_BATCH_SIZE = int(os.getenv("CLOSED_PARSE_BATCH_SIZE", "15"))
-AI_MAX_OUTPUT_TOKENS = int(os.getenv("AI_MAX_OUTPUT_TOKENS", "6000"))
+MODEL_PARSE_BATCH_SIZE = _env_int("MODEL_PARSE_BATCH_SIZE", 15)
+CLOSED_PARSE_BATCH_SIZE = _env_int("CLOSED_PARSE_BATCH_SIZE", 15)
+AI_MAX_OUTPUT_TOKENS = _env_int("AI_MAX_OUTPUT_TOKENS", 6000)
 
 # 程序生成购买建议时的阈值
-BUY_MARGIN_THRESHOLD = Decimal(os.getenv("BUY_MARGIN_THRESHOLD", "0.20"))
-REVIEW_MARGIN_THRESHOLD = Decimal(os.getenv("REVIEW_MARGIN_THRESHOLD", "0.10"))
-HIGH_CONFIDENCE_COMPARABLE_COUNT = int(os.getenv("HIGH_CONFIDENCE_COMPARABLE_COUNT", "10"))
-MEDIUM_CONFIDENCE_COMPARABLE_COUNT = int(os.getenv("MEDIUM_CONFIDENCE_COMPARABLE_COUNT", "5"))
+BUY_MARGIN_THRESHOLD = _env_decimal("BUY_MARGIN_THRESHOLD", "0.20")
+REVIEW_MARGIN_THRESHOLD = _env_decimal("REVIEW_MARGIN_THRESHOLD", "0.10")
+HIGH_CONFIDENCE_COMPARABLE_COUNT = _env_int("HIGH_CONFIDENCE_COMPARABLE_COUNT", 10)
+MEDIUM_CONFIDENCE_COMPARABLE_COUNT = _env_int("MEDIUM_CONFIDENCE_COMPARABLE_COUNT", 5)
 
-AI_REQUEST_TIMEOUT = int(os.getenv("AI_REQUEST_TIMEOUT", "90"))
-AI_MAX_RETRIES = int(os.getenv("AI_MAX_RETRIES", "3"))
-REQUEST_INTERVAL = float(os.getenv("REQUEST_INTERVAL", "1.0"))
-INCLUDE_PAYPAY = os.getenv("INCLUDE_PAYPAY", "false").lower() == "true"
+AI_REQUEST_TIMEOUT = _env_int("AI_REQUEST_TIMEOUT", 90)
+AI_MAX_RETRIES = _env_int("AI_MAX_RETRIES", 3)
+REQUEST_INTERVAL = float(_env_str("REQUEST_INTERVAL", "1.0"))
+INCLUDE_PAYPAY = _env_bool("INCLUDE_PAYPAY", False)
 
-MAX_TOTAL_TOKENS = int(os.getenv("MAX_TOTAL_TOKENS", "50000"))
-LAMBDA_TIMEOUT_SECONDS = int(os.getenv("LAMBDA_TIMEOUT_SECONDS", "840"))
-LAMBDA_TIMEOUT_BUFFER = int(os.getenv("LAMBDA_TIMEOUT_BUFFER", "30"))
+MAX_TOTAL_TOKENS = _env_int("MAX_TOTAL_TOKENS", 50000)
+LAMBDA_TIMEOUT_SECONDS = _env_int("LAMBDA_TIMEOUT_SECONDS", 840)
+LAMBDA_TIMEOUT_BUFFER = _env_int("LAMBDA_TIMEOUT_BUFFER", 30)
 
 # 定价参数
-EXPECTED_SELLING_FEE_RATE = Decimal(os.getenv("EXPECTED_SELLING_FEE_RATE", "0.10"))
-DEFAULT_SHIPPING_COST = Decimal(os.getenv("DEFAULT_SHIPPING_COST", "1500"))
-DEFAULT_REPAIR_RESERVE_RATE = Decimal(os.getenv("DEFAULT_REPAIR_RESERVE_RATE", "0.05"))
-MIN_COMPARABLE_COUNT = int(os.getenv("MIN_COMPARABLE_COUNT", "3"))
-MAX_PRICE_DEVIATION = Decimal(os.getenv("MAX_PRICE_DEVIATION", "1.5"))
-RISK_RESERVE_RATE = Decimal(os.getenv("RISK_RESERVE_RATE", "0.03"))
+EXPECTED_SELLING_FEE_RATE = _env_decimal("EXPECTED_SELLING_FEE_RATE", "0.10")
+DEFAULT_SHIPPING_COST = _env_decimal("DEFAULT_SHIPPING_COST", "1500")
+DEFAULT_REPAIR_RESERVE_RATE = _env_decimal("DEFAULT_REPAIR_RESERVE_RATE", "0.05")
+MIN_COMPARABLE_COUNT = _env_int("MIN_COMPARABLE_COUNT", 3)
+MAX_PRICE_DEVIATION = _env_decimal("MAX_PRICE_DEVIATION", "1.5")
+RISK_RESERVE_RATE = _env_decimal("RISK_RESERVE_RATE", "0.03")
 
 RETRYABLE_CODES = {408, 409, 429, 500, 502, 503, 504}
 
 dynamodb = boto3.resource("dynamodb")
 active_table = dynamodb.Table(TABLE_NAME_ACTIVE)
 closed_table = dynamodb.Table(TABLE_NAME_CLOSED)
+product_table = dynamodb.Table(PRODUCT_TABLE_NAME)
 secretsmanager = boto3.client("secretsmanager")
 
 _api_key_cache = None
@@ -304,7 +348,6 @@ def generate_pricing_model_key(
         parts.append(normalized_brand)
     if normalized_model:
         parts.append(normalized_model)
-    # model名にvariantが既に含まれている場合は重複追加しない
     if normalized_variant and not model_contains_variant(normalized_model, normalized_variant):
         parts.append(normalized_variant)
     if normalized_storage:
@@ -348,7 +391,6 @@ def update_product_status(product_pk: str, status: str, error: str = None):
         return
     
     try:
-        product_table = dynamodb.Table(os.environ.get("PRODUCT_TABLE_NAME", "ProductCatalog-dev"))
         now = int(time.time())
         today = datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d")
         
@@ -382,28 +424,82 @@ def update_product_status(product_pk: str, status: str, error: str = None):
         logger.error(f"PRODUCT 状态更新失败: {product_pk} -> {e}")
 
 
-# 在 lambda_handler 中，完成分析后调用
+# ==================== Lambda 入口 ====================
+
 def lambda_handler(event, context):
-    # ... 现有的分析逻辑 ...
-    
-    product_pk = event.get("product_pk", "")
+    """Lambda エントリーポイント"""
+    global _total_tokens_used, _lambda_start_time
+    _total_tokens_used = 0
+    _lambda_start_time = time.time()
     
     try:
-        result = execute_workflow(...)
+        keyword = normalize(event.get("keyword", ""))
+        if not keyword:
+            return response(400, {"error": "keywordは必須です"})
+        
+        try:
+            active_count = int(event.get("active_count", DEFAULT_ACTIVE_COUNT))
+            closed_count = int(event.get("closed_count", DEFAULT_CLOSED_COUNT))
+        except (ValueError, TypeError):
+            return response(400, {"error": "active_count、closed_countは有効な整数である必要があります"})
+        
+        force_reprocess = parse_bool(event.get("force_reprocess", False))
+        product_pk = event.get("product_pk", "")
+        
+        active_count = max(1, min(active_count, MAX_ACTIVE_ITEMS))
+        closed_count = max(1, min(closed_count, MAX_CLOSED_ITEMS))
+        
+        logger.info(
+            f"商品分析ワークフロー開始: keyword='{keyword}', "
+            f"active_count={active_count}, closed_count={closed_count}, "
+            f"force_reprocess={force_reprocess}, product_pk='{product_pk}'"
+        )
+        
+        result = execute_workflow(
+            keyword=keyword,
+            active_count=active_count,
+            closed_count=closed_count,
+            force_reprocess=force_reprocess
+        )
+        
+        result["execution_stats"] = {
+            "total_tokens_used": _total_tokens_used,
+            "token_limit": MAX_TOTAL_TOKENS,
+            "elapsed_seconds": get_elapsed_seconds(),
+            "remaining_seconds": get_remaining_seconds()
+        }
         
         # 分析完成后更新 PRODUCT 状态
-        if result.get("status") == "COMPLETED":
-            update_product_status(product_pk, "COMPLETED")
-        elif result.get("status") in ("PARTIAL_COMPLETED", "PARTIAL_FAILED"):
-            update_product_status(product_pk, "PARTIAL", str(result.get("errors", [])))
-        else:
-            update_product_status(product_pk, "FAILED", result.get("interrupt_reason", "Unknown error"))
+        if product_pk:
+            if result.get("status") == "COMPLETED":
+                update_product_status(product_pk, "COMPLETED")
+            elif result.get("status") in ("PARTIAL_COMPLETED", "PARTIAL_FAILED"):
+                update_product_status(product_pk, "PARTIAL", str(result.get("errors", [])))
+            elif result.get("status") == "INTERRUPTED":
+                update_product_status(product_pk, "INTERRUPTED", result.get("interrupt_reason", "Unknown"))
+            elif result.get("status") == "NO_ACTIVE_RESULTS":
+                update_product_status(product_pk, "NO_RESULTS", "没有找到活跃商品")
+            elif result.get("status") == "SCRAPED_ONLY":
+                update_product_status(product_pk, "SCRAPED_ONLY", "AI API密钥不可用，仅完成抓取")
+            else:
+                update_product_status(product_pk, "FAILED", str(result.get("errors", [])))
         
         return response(200, result)
         
     except Exception as e:
-        update_product_status(product_pk, "FAILED", str(e))
-        raise
+        logger.error(f"ワークフロー実行失敗: {e}", exc_info=True)
+        
+        product_pk = event.get("product_pk", "")
+        if product_pk:
+            update_product_status(product_pk, "FAILED", str(e))
+        
+        return response(500, {
+            "error": "内部エラー",
+            "details": str(e),
+            "total_tokens_used": _total_tokens_used,
+            "elapsed_seconds": get_elapsed_seconds()
+        })
+
 
 def execute_workflow(
     keyword: str,
@@ -759,7 +855,6 @@ def batch_parse_models(items: List[Dict]) -> Dict:
         
         logger.info(f"active モデル解析バッチ {batch_number}: {len(batch)} 商品")
         
-        # 必要最小限のフィールドのみ送信
         items_data = [
             {
                 "itemId": str(item["itemID"]),
@@ -865,10 +960,8 @@ def parse_ai_result_minimal(parsed: Dict) -> Tuple[List[Dict], str, str, bool, L
     if not isinstance(missing, list):
         missing = []
     
-    # プログラムでキーパラメータ完全性を判断
     has_all_critical = len(missing) == 0
     
-    # プログラムでモデルリストを生成
     models = []
     if brand and model_name:
         pricing_model_key = generate_pricing_model_key(
@@ -887,7 +980,6 @@ def parse_ai_result_minimal(parsed: Dict) -> Tuple[List[Dict], str, str, bool, L
             "confidence": str(confidence)
         })
     
-    # プログラムで除外理由を生成
     excluded_types = {"ACCESSORY", "PARTS", "BROKEN", "BOX_ONLY", "BUNDLE", "UNKNOWN"}
     exclusion_reasons = []
     
@@ -907,7 +999,6 @@ def save_active_models_minimal(item_id: str, parsed: Dict) -> str:
     """アクティブ商品モデルを保存（極簡AI結果使用）"""
     models, listing_type, condition, has_all_critical, missing, exclusion_reason = parse_ai_result_minimal(parsed)
     
-    # プログラムで分析可能か判断
     is_analysis_eligible = (
         listing_type == "MAIN_PRODUCT"
         and condition != "BROKEN"
@@ -915,7 +1006,6 @@ def save_active_models_minimal(item_id: str, parsed: Dict) -> str:
         and len(models) > 0
     )
     
-    # ステータス判断
     if not models:
         status = "REVIEW_REQUIRED"
     elif not is_analysis_eligible:
@@ -1129,7 +1219,6 @@ def batch_parse_closed_models(items: List[Dict]) -> Dict:
         
         logger.info(f"closed モデル解析バッチ {batch_number}: {len(batch)} 商品")
         
-        # 必要最小限のフィールドのみ送信
         items_data = [
             {
                 "itemId": str(item["itemID"]),
@@ -1221,7 +1310,6 @@ def save_closed_models_minimal(item_id: str, parsed: Dict) -> str:
     """落札商品モデルを保存（極簡AI結果使用）"""
     models, listing_type, condition, has_all_critical, missing, exclusion_reason = parse_ai_result_minimal(parsed)
     
-    # プログラムで価格サンプルとして使用可能か判断
     is_comparable = (
         listing_type == "MAIN_PRODUCT"
         and condition != "BROKEN"
