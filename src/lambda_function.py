@@ -21,7 +21,7 @@ secretsmanager = boto3.client("secretsmanager")
 # ============================================
 
 # ========== AI 模式配置 ==========
-AI_MODE = os.environ.get("AI_MODE", "gemini")
+AI_MODE = os.environ.get("AI_MODE", "doubao")
 
 # Gemini 配置
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
