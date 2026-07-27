@@ -26,7 +26,7 @@ AI_MODE = os.environ.get("AI_MODE", "gemini")
 # Gemini 配置
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash-latest")
-GEMINI_URL = os.environ.get("GEMINI_URL", "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-latest:generateContent")
+GEMINI_URL = os.environ.get("GEMINI_URL", "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent")
 GEMINI_TIMEOUT = int(os.environ.get("GEMINI_TIMEOUT", "60"))
 GEMINI_MAX_TOKENS = int(os.environ.get("GEMINI_MAX_TOKENS", "4000"))
 
