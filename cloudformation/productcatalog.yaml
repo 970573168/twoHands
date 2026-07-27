@@ -2,7 +2,8 @@ AWSTemplateFormatVersion: "2010-09-09"
 
 Description: >
   电子产品目录采集器 + AI API Secret + Yahoo Auction 抓取器 + 分析工作流 + 目录定期扫描器
-  Lambda 代码通过已有 S3 Bucket 部署
+  支持多 AI 模式切换（Gemini / 豆包 / OpenAI）
+  Secret 已存在时不会重复创建
 
 Parameters:
   # ============ 通用参数 ============
@@ -25,27 +26,138 @@ Parameters:
     Default: "productcatalog/lambda.zip"
     Description: S3 中 Lambda 代码的对象键
 
-  # ============ Secret 控制参数 ============
+  # ============ AI 模式选择 ============
+  AiMode:
+    Type: String
+    Default: "gemini"
+    AllowedValues:
+      - gemini
+      - doubao
+      - openai
+    Description: AI 模式选择（gemini / doubao / openai），默认 gemini
+
+  # ============ Gemini 配置 ============
+  GeminiApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: Gemini API Key（留空则使用已存在的 Secret，不创建新的）
+
+  GeminiModel:
+    Type: String
+    Default: "gemini-2.0-flash-latest"
+    Description: Gemini 模型名称
+
+  GeminiUrl:
+    Type: String
+    Default: "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-latest:generateContent"
+    Description: Gemini API URL
+
+  GeminiTimeout:
+    Type: Number
+    Default: 60
+    MinValue: 10
+    MaxValue: 300
+    Description: Gemini API 请求超时（秒）
+
+  GeminiMaxTokens:
+    Type: Number
+    Default: 4000
+    MinValue: 100
+    MaxValue: 8192
+    Description: Gemini 最大输出 Token 数
+
+  # ============ 豆包配置 ============
+  DoubaoApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: 豆包 API Key（留空则使用已存在的 Secret，不创建新的）
+
+  DoubaoModel:
+    Type: String
+    Default: "doubao-seed-2-0-mini-260428"
+    Description: 豆包模型名称
+
+  DoubaoUrl:
+    Type: String
+    Default: "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+    Description: 豆包 API URL
+
+  DoubaoTimeout:
+    Type: Number
+    Default: 90
+    MinValue: 10
+    MaxValue: 300
+    Description: 豆包 API 请求超时（秒）
+
+  DoubaoMaxTokens:
+    Type: Number
+    Default: 6000
+    MinValue: 100
+    MaxValue: 8192
+    Description: 豆包最大输出 Token 数
+
+  # ============ OpenAI 配置 ============
+  OpenaiApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: OpenAI API Key（留空则使用已存在的 Secret，不创建新的）
+
+  OpenaiModel:
+    Type: String
+    Default: "gpt-4o-mini"
+    Description: OpenAI 模型名称
+
+  OpenaiUrl:
+    Type: String
+    Default: "https://api.openai.com/v1/chat/completions"
+    Description: OpenAI API URL
+
+  OpenaiTimeout:
+    Type: Number
+    Default: 60
+    MinValue: 10
+    MaxValue: 300
+    Description: OpenAI API 请求超时（秒）
+
+  OpenaiMaxTokens:
+    Type: Number
+    Default: 4000
+    MinValue: 100
+    MaxValue: 16384
+    Description: OpenAI 最大输出 Token 数
+
+  # ============ 故障切换配置 ============
+  AiFailoverCooldown:
+    Type: Number
+    Default: 300
+    MinValue: 60
+    MaxValue: 3600
+    Description: AI 模式故障切换冷却时间（秒）
+
+  # ============ 旧版 Secret 参数（向后兼容） ============
   DeploySecret:
     Type: String
-    Default: "true"
+    Default: "false"
     AllowedValues:
       - "true"
       - "false"
-    Description: 是否部署 AI API Secret
+    Description: 是否部署旧版 AI API Secret（向后兼容，建议使用各 AI 的独立 Secret）
 
   ApiKey:
     Type: String
     NoEcho: true
     Default: ""
-    Description: API Key（仅在 DeploySecret=true 时需要）
+    Description: 旧版 API Key（仅在 DeploySecret=true 且需要创建旧版 Secret 时使用）
 
   SecretName:
     Type: String
     Default: "ProductCatalog/ApiSecret"
-    Description: Secrets Manager 中的 Secret 名称前缀
+    Description: 旧版 Secrets Manager 中的 Secret 名称前缀
 
-  # ============ 主应用参数 ============
+  # ============ 主应用参数（向后兼容） ============
   DeployMainApp:
     Type: String
     Default: "true"
@@ -54,81 +166,59 @@ Parameters:
       - "false"
     Description: 是否部署主应用
 
-  AiModel:
-    Type: String
-    Default: "doubao-seed-2-0-mini-260428"
-    Description: AI 模型名称
-
-  ApiUrl:
-    Type: String
-    Default: "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
-    Description: API URL
-
   MaxCategoriesPerRun:
     Type: Number
     Default: 20
     MinValue: 1
     MaxValue: 100
-    Description: 每次运行发现的最大品类数
 
   MaxBrandsPerCategory:
     Type: Number
     Default: 20
     MinValue: 1
     MaxValue: 100
-    Description: 每个品类发现的最大品牌数
 
   MaxModelsPerBrand:
     Type: Number
     Default: 50
     MinValue: 1
     MaxValue: 100
-    Description: 每个品牌发现的最大型号数
 
-  # ============ Token 和超时控制 ============
   MaxTotalTokens:
     Type: Number
     Default: 50000
     MinValue: 10000
     MaxValue: 1000000
-    Description: 每次运行的最大 Token 用量（Analyzer 默认50000，ProductCatalog 默认100000）
 
   LambdaTimeoutBuffer:
     Type: Number
     Default: 30
     MinValue: 10
     MaxValue: 300
-    Description: Lambda 超时缓冲时间（秒）
 
-  # ============ 处理流程控制 ============
   ApiCallDelay:
     Type: Number
     Default: 1
     MinValue: 0
     MaxValue: 10
-    Description: API 调用间隔（秒）
 
   CategoryLimit:
     Type: Number
     Default: 5
     MinValue: 1
     MaxValue: 20
-    Description: 每次处理的最大品类数
 
   BrandLimit:
     Type: Number
     Default: 3
     MinValue: 1
     MaxValue: 10
-    Description: 每个品类处理的最大品牌数
 
-  # ============ 其他配置 ============
   LogRetentionDays:
     Type: Number
     Default: 14
     MinValue: 1
     MaxValue: 3653
-    Description: CloudWatch 日志保留天数
 
   # ============ Yahoo Auction 抓取器参数 ============
   DeployScraper:
@@ -137,21 +227,18 @@ Parameters:
     AllowedValues:
       - "true"
       - "false"
-    Description: 是否部署 Yahoo Auction 抓取器和分析器
 
   YahooAuctionMaxPages:
     Type: Number
     Default: 1
     MinValue: 1
     MaxValue: 10
-    Description: 每次抓取的最大页数
 
   YahooAuctionRequestTimeout:
     Type: Number
     Default: 30
     MinValue: 5
     MaxValue: 120
-    Description: HTTP 请求超时（秒）
 
   YahooAuctionDebugLogHtml:
     Type: String
@@ -159,270 +246,192 @@ Parameters:
     AllowedValues:
       - "true"
       - "false"
-    Description: 是否记录调试 HTML 日志
 
   YahooAuctionItemsPerPage:
     Type: Number
     Default: 50
     MinValue: 10
     MaxValue: 100
-    Description: 每页显示的商品数量
 
-  # ============ Yahoo Auction Analyzer 特定参数 ============
+  # ============ Yahoo Auction Analyzer 参数 ============
   ModelParseBatchSize:
     Type: Number
     Default: 10
     MinValue: 1
     MaxValue: 50
-    Description: 活跃商品型号解析批次大小（每批最多处理的商品数）
 
   ClosedParseBatchSize:
     Type: Number
     Default: 15
     MinValue: 1
     MaxValue: 50
-    Description: 闭拍商品型号解析批次大小
 
   MaxClosedPerModel:
     Type: Number
     Default: 50
     MinValue: 10
     MaxValue: 200
-    Description: 每个型号搜索的最多闭拍商品数
 
   DefaultSearchCount:
     Type: Number
     Default: 3
     MinValue: 1
     MaxValue: 20
-    Description: 默认搜索活跃商品数量
 
   MaxActiveItems:
     Type: Number
     Default: 20
     MinValue: 1
     MaxValue: 50
-    Description: 最大活跃商品数量
 
   AiRequestTimeout:
     Type: Number
     Default: 60
     MinValue: 30
     MaxValue: 300
-    Description: AI API 请求超时（秒）
 
   AiMaxRetries:
     Type: Number
     Default: 3
     MinValue: 1
     MaxValue: 5
-    Description: AI API 最大重试次数
 
   RequestInterval:
     Type: Number
     Default: 1.0
     MinValue: 0.1
     MaxValue: 5.0
-    Description: 请求间隔（秒）
 
-  # ============ 估价相关参数 ============
   ExpectedSellingFeeRate:
     Type: Number
     Default: 0.10
     MinValue: 0
     MaxValue: 1
-    Description: 预期交易费率（如 0.10 = 10%）
 
   DefaultShippingCost:
     Type: Number
     Default: 1500
     MinValue: 0
     MaxValue: 10000
-    Description: 默认运费（円）
 
   DefaultRepairReserveRate:
     Type: Number
     Default: 0.05
     MinValue: 0
     MaxValue: 1
-    Description: 默认维修准备金率
 
   MinComparableCount:
     Type: Number
     Default: 3
     MinValue: 1
     MaxValue: 10
-    Description: 最少可比商品数量（用于估价）
 
   MaxPriceDeviation:
     Type: Number
     Default: 1.5
     MinValue: 1
     MaxValue: 5
-    Description: 最大价格偏差倍数（用于筛选异常值）
 
   RiskReserveRate:
     Type: Number
     Default: 0.03
     MinValue: 0
     MaxValue: 1
-    Description: 风险准备金率
 
-  # ============ Yahoo Auction 自定义搜索参数（可留空，不覆盖代码默认值）============
+  # ============ Yahoo Auction 自定义搜索参数 ============
   AuctionParamNew:
     Type: String
     Default: ""
-    Description: "新品筛选 (空或1) - 可选"
-
   AuctionParamOffer:
     Type: String
     Default: ""
-    Description: "可议价 (空或1) - 可选"
-
   AuctionParamShipping:
     Type: String
     Default: ""
-    Description: "配送方式 - 可选"
-
   AuctionParamIstatus:
     Type: String
     Default: ""
-    Description: "商品状态 - 可选"
-
   AuctionParamAbatch:
     Type: String
     Default: ""
-    Description: "批次参数 - 可选"
-
   AuctionParamLocCd:
     Type: String
     Default: ""
-    Description: "地区代码 - 可选"
-
   AuctionParamSelect:
     Type: String
     Default: ""
-    Description: "select 参数 - 可选"
-
   AuctionParamSpec:
     Type: String
     Default: ""
-    Description: "规格参数 - 可选"
-
   AuctionParamPriceType:
     Type: String
     Default: ""
-    Description: "价格类型 - 可选"
-
   AuctionParamMin:
     Type: String
     Default: ""
-    Description: "最低价格 - 可选"
-
   AuctionParamMax:
     Type: String
     Default: ""
-    Description: "最高价格 - 可选"
-
   AuctionParamCarInspection:
     Type: String
     Default: ""
-    Description: "车检参数 - 可选"
-
   AuctionParamFixed:
     Type: String
     Default: ""
-    Description: "一口价筛选 - 可选"
-
   AuctionParamAucminprice:
     Type: String
     Default: ""
-    Description: "拍卖最低价格 - 可选"
-
   AuctionParamAucmaxprice:
     Type: String
     Default: ""
-    Description: "拍卖最高价格 - 可选"
-
   AuctionParamAucminBidorbuyPrice:
     Type: String
     Default: ""
-    Description: "即决最低价格 - 可选"
-
   AuctionParamAucmaxBidorbuyPrice:
     Type: String
     Default: ""
-    Description: "即决最高价格 - 可选"
-
   AuctionParamLc1:
     Type: String
     Default: ""
-    Description: "LC1参数 - 可选"
-
   AuctionParamJpypayment:
     Type: String
     Default: ""
-    Description: "PayPay等支付方式 - 可选"
-
   AuctionParamPoint:
     Type: String
     Default: ""
-    Description: "积分参数 - 可选"
-
   AuctionParamThumb:
     Type: String
     Default: ""
-    Description: "缩略图参数 - 可选"
-
   AuctionParamWrappingicon:
     Type: String
     Default: ""
-    Description: "包装图标 - 可选"
-
   AuctionParamPrivacyDelivery:
     Type: String
     Default: ""
-    Description: "隐私配送 - 可选"
-
   AuctionParamGiftIcon:
     Type: String
     Default: ""
-    Description: "礼品图标 - 可选"
-
   AuctionParamCharity:
     Type: String
     Default: ""
-    Description: "慈善参数 - 可选"
-
   AuctionParamMode:
     Type: String
     Default: ""
-    Description: "模式参数 - 可选（代码默认值为3）"
-
   AuctionParamN:
     Type: String
     Default: ""
-    Description: "每页数量 - 可选（代码默认值为60）"
-
   AuctionParamS1:
     Type: String
     Default: ""
-    Description: "排序字段 - 可选（代码默认值为end）"
-
   AuctionParamO1:
     Type: String
     Default: ""
-    Description: "排序方向 - 可选（代码默认值为a）"
-
   AuctionParamMaxSprice:
     Type: String
     Default: ""
-    Description: "最高售价 - 可选"
-
   AuctionParamType:
     Type: String
     Default: ""
-    Description: "类型 (auction/fixed/all) - 可选"
 
   # ============ Catalog Scanner 参数 ============
   DeployCatalogScanner:
@@ -431,7 +440,6 @@ Parameters:
     AllowedValues:
       - "true"
       - "false"
-    Description: 是否部署目录扫描器
 
   CatalogScannerEnabled:
     Type: String
@@ -439,30 +447,41 @@ Parameters:
     AllowedValues:
       - "true"
       - "false"
-    Description: 是否启用目录扫描器定时触发（默认关闭）
 
   CatalogScannerIntervalMinutes:
     Type: Number
     Default: 120
     MinValue: 30
     MaxValue: 1440
-    Description: 扫描间隔（分钟），默认120分钟（2小时）
 
   CatalogScannerMaxModels:
     Type: Number
     Default: 3
     MinValue: 1
     MaxValue: 10
-    Description: 每次扫描最多分析的型号数
 
 Conditions:
+  # ============ Secret 创建条件 ============
+  # 只有当提供了 API Key 且 DeploySecret 为 true 时才创建 Secret
+  # 如果留空则不创建，使用已手动配置的 Secret
+  CreateGeminiSecret: !And
+    - !Condition DeploySecretCondition
+    - !Not [!Equals [!Ref GeminiApiKey, ""]]
+  CreateDoubaoSecret: !And
+    - !Condition DeploySecretCondition
+    - !Not [!Equals [!Ref DoubaoApiKey, ""]]
+  CreateOpenaiSecret: !And
+    - !Condition DeploySecretCondition
+    - !Not [!Equals [!Ref OpenaiApiKey, ""]]
+  CreateLegacySecret: !And
+    - !Condition DeploySecretCondition
+    - !Not [!Equals [!Ref ApiKey, ""]]
+
+  # ============ 其他条件 ============
   DeploySecretCondition: !Equals [!Ref DeploySecret, "true"]
   DeployMainAppCondition: !Equals [!Ref DeployMainApp, "true"]
-  HasApiKey: !Not [!Equals [!Ref ApiKey, ""]]
   DeployScraperCondition: !Equals [!Ref DeployScraper, "true"]
-  CatalogScannerEnabledCondition: !Equals
-    - !Ref CatalogScannerEnabled
-    - "true"
+  CatalogScannerEnabledCondition: !Equals [!Ref CatalogScannerEnabled, "true"]
   DeployCatalogScannerCondition: !And
     - !Equals [!Ref DeployCatalogScanner, "true"]
     - !Condition DeployMainAppCondition
@@ -470,29 +489,85 @@ Conditions:
 
 Resources:
   # ============================================
-  # AI API Secret（可选）
+  # AI API Secrets
+  # 重要：只有提供了 API Key 时才创建
+  # 如果 Secret 已手动配置，留空参数即可跳过创建
   # ============================================
+  
+  # Gemini API Secret（仅在提供了 Key 时创建）
+  GeminiApiSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: CreateGeminiSecret
+    Properties:
+      Name: !Sub "gemini-api-key-${Environment}"
+      Description: Gemini API Key for Yahoo Auction Analyzer (auto-created by CloudFormation)
+      SecretString: !Sub '{"GEMINI_API_KEY":"${GeminiApiKey}"}'
+      Tags:
+        - Key: Application
+          Value: YahooAuctionAnalyzer
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Type
+          Value: Gemini
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # 豆包 API Secret（仅在提供了 Key 时创建）
+  DoubaoApiSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: CreateDoubaoSecret
+    Properties:
+      Name: !Sub "doubao-api-key-${Environment}"
+      Description: Doubao API Key for Yahoo Auction Analyzer (auto-created by CloudFormation)
+      SecretString: !Sub '{"DOUBAO_API_KEY":"${DoubaoApiKey}"}'
+      Tags:
+        - Key: Application
+          Value: YahooAuctionAnalyzer
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Type
+          Value: Doubao
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # OpenAI API Secret（仅在提供了 Key 时创建）
+  OpenaiApiSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: CreateOpenaiSecret
+    Properties:
+      Name: !Sub "openai-api-key-${Environment}"
+      Description: OpenAI API Key for Yahoo Auction Analyzer (auto-created by CloudFormation)
+      SecretString: !Sub '{"OPENAI_API_KEY":"${OpenaiApiKey}"}'
+      Tags:
+        - Key: Application
+          Value: YahooAuctionAnalyzer
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Type
+          Value: OpenAI
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # 旧版 API Secret（向后兼容，仅在提供了 Key 时创建）
   ApiSecret:
     Type: AWS::SecretsManager::Secret
-    Condition: DeploySecretCondition
+    Condition: CreateLegacySecret
     Properties:
       Name: !Sub "${SecretName}/${Environment}"
-      Description: AI API key for product catalog discovery
-      SecretString: !If
-        - HasApiKey
-        - !Sub '{"apiKey":"${ApiKey}"}'
-        - '{"apiKey":"PLACEHOLDER-REPLACE-ME"}'
+      Description: Legacy AI API key for product catalog discovery
+      SecretString: !Sub '{"apiKey":"${ApiKey}"}'
       Tags:
         - Key: Application
           Value: ProductCatalog
         - Key: Environment
           Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
 
   # ============================================
-  # 主应用（可选）
+  # 主应用
   # ============================================
 
-  # ---------- DynamoDB 表 ----------
   ProductCatalogTable:
     Type: AWS::DynamoDB::Table
     Condition: DeployMainAppCondition
@@ -535,7 +610,6 @@ Resources:
         - Key: Environment
           Value: !Ref Environment
 
-  # ---------- CloudWatch Logs ----------
   ProductCatalogLogGroup:
     Type: AWS::Logs::LogGroup
     Condition: DeployMainAppCondition
@@ -543,7 +617,6 @@ Resources:
       LogGroupName: !Sub "/aws/lambda/ProductCatalog-Discovery-${Environment}"
       RetentionInDays: !Ref LogRetentionDays
 
-  # ---------- Lambda 执行角色 ----------
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Condition: DeployMainAppCondition
@@ -572,13 +645,15 @@ Resources:
                   - dynamodb:Query
                   - dynamodb:BatchWriteItem
                 Resource: !GetAtt ProductCatalogTable.Arn
-
-              - Sid: ReadApiSecret
+              - Sid: ReadApiSecrets
                 Effect: Allow
                 Action:
                   - secretsmanager:GetSecretValue
-                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}/${Environment}-*"
-
+                Resource:
+                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:gemini-api-key-${Environment}-*"
+                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:doubao-api-key-${Environment}-*"
+                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:openai-api-key-${Environment}-*"
+                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}/${Environment}-*"
               - Sid: WriteLambdaLogs
                 Effect: Allow
                 Action:
@@ -586,7 +661,6 @@ Resources:
                   - logs:PutLogEvents
                 Resource: !Sub "${ProductCatalogLogGroup.Arn}:*"
 
-  # ---------- Lambda 函数 ----------
   ProductCatalogDiscovery:
     Type: AWS::Lambda::Function
     Condition: DeployMainAppCondition
@@ -609,9 +683,23 @@ Resources:
       Environment:
         Variables:
           TABLE_NAME: !Ref ProductCatalogTable
-          SECRET_NAME: !Sub "${SecretName}/${Environment}"
-          AI_MODEL: !Ref AiModel
-          API_URL: !Ref ApiUrl
+          AI_MODE: !Ref AiMode
+          GEMINI_API_KEY: !Ref GeminiApiKey
+          GEMINI_MODEL: !Ref GeminiModel
+          GEMINI_URL: !Ref GeminiUrl
+          GEMINI_TIMEOUT: !Ref GeminiTimeout
+          GEMINI_MAX_TOKENS: !Ref GeminiMaxTokens
+          DOUBAO_API_KEY: !Ref DoubaoApiKey
+          DOUBAO_MODEL: !Ref DoubaoModel
+          DOUBAO_URL: !Ref DoubaoUrl
+          DOUBAO_TIMEOUT: !Ref DoubaoTimeout
+          DOUBAO_MAX_TOKENS: !Ref DoubaoMaxTokens
+          OPENAI_API_KEY: !Ref OpenaiApiKey
+          OPENAI_MODEL: !Ref OpenaiModel
+          OPENAI_URL: !Ref OpenaiUrl
+          OPENAI_TIMEOUT: !Ref OpenaiTimeout
+          OPENAI_MAX_TOKENS: !Ref OpenaiMaxTokens
+          AI_FAILOVER_COOLDOWN: !Ref AiFailoverCooldown
           MAX_CATEGORIES: !Ref MaxCategoriesPerRun
           MAX_BRANDS: !Ref MaxBrandsPerCategory
           MAX_MODELS: !Ref MaxModelsPerBrand
@@ -628,10 +716,9 @@ Resources:
           Value: !Ref Environment
 
   # =============================================
-  # Yahoo Auction 抓取器资源
+  # Yahoo Auction 资源
   # =============================================
 
-  # ---------- DynamoDB 表：闭拍数据 ----------
   YahooAuctionClosedTable:
     Type: AWS::DynamoDB::Table
     Condition: DeployScraperCondition
@@ -659,7 +746,6 @@ Resources:
         - Key: Type
           Value: Closed
 
-  # ---------- DynamoDB 表：活跃拍卖数据 ----------
   YahooAuctionActiveTable:
     Type: AWS::DynamoDB::Table
     Condition: DeployScraperCondition
@@ -687,7 +773,6 @@ Resources:
         - Key: Type
           Value: Active
 
-  # ---------- CloudWatch Logs ----------
   YahooAuctionScraperLogGroup:
     Type: AWS::Logs::LogGroup
     Condition: DeployScraperCondition
@@ -702,7 +787,6 @@ Resources:
       LogGroupName: !Sub "/aws/lambda/YahooAuctionAnalyzer-${Environment}"
       RetentionInDays: !Ref LogRetentionDays
 
-  # ---------- Lambda 执行角色：抓取器 ----------
   YahooAuctionScraperRole:
     Type: AWS::IAM::Role
     Condition: DeployScraperCondition
@@ -744,7 +828,6 @@ Resources:
                   - !Sub "${YahooAuctionScraperLogGroup.Arn}:*"
                   - !Sub "${YahooAuctionAnalyzerLogGroup.Arn}:*"
 
-  # ---------- Lambda 执行角色：分析器（扩展权限） ----------
   YahooAuctionAnalyzerRole:
     Type: AWS::IAM::Role
     Condition: DeployScraperCondition
@@ -777,13 +860,15 @@ Resources:
                 Resource:
                   - !GetAtt YahooAuctionClosedTable.Arn
                   - !GetAtt YahooAuctionActiveTable.Arn
-
-              - Sid: ReadApiSecret
+              - Sid: ReadAllApiSecrets
                 Effect: Allow
                 Action:
                   - secretsmanager:GetSecretValue
-                Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}/${Environment}-*"
-
+                Resource:
+                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:gemini-api-key-${Environment}-*"
+                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:doubao-api-key-${Environment}-*"
+                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:openai-api-key-${Environment}-*"
+                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}/${Environment}-*"
               - Sid: WriteLogs
                 Effect: Allow
                 Action:
@@ -793,7 +878,6 @@ Resources:
                   - !Sub "${YahooAuctionScraperLogGroup.Arn}:*"
                   - !Sub "${YahooAuctionAnalyzerLogGroup.Arn}:*"
 
-  # ---------- Lambda 函数：抓取器 ----------
   YahooAuctionScraper:
     Type: AWS::Lambda::Function
     Condition: DeployScraperCondition
@@ -858,7 +942,6 @@ Resources:
         - Key: Environment
           Value: !Ref Environment
 
-  # ---------- Lambda 函数：分析器 ----------
   AuctionAnalyzerFunction:
     Type: AWS::Lambda::Function
     Condition: DeployScraperCondition
@@ -867,7 +950,7 @@ Resources:
       - YahooAuctionAnalyzerRole
     Properties:
       FunctionName: !Sub "YahooAuctionAnalyzer-${Environment}"
-      Description: "Yahoo Auction 商品分析工作流（支持 AI 估价、模型解析、权限完整）"
+      Description: "Yahoo Auction 商品分析工作流（多AI模式切换）"
       Runtime: python3.12
       Architectures:
         - arm64
@@ -880,36 +963,35 @@ Resources:
         S3Key: !Ref LambdaCodeS3Key
       Environment:
         Variables:
-          # ========== DynamoDB 配置 ==========
           TABLE_NAME_ACTIVE: !Sub "YahooAuctionActiveItems-${Environment}"
           TABLE_NAME_CLOSED: !Sub "YahooAuctionItems-${Environment}"
-
-          # ========== Secrets Manager 配置 ==========
-          SECRET_NAME: !Sub "${SecretName}/${Environment}"
-
-          # ========== AI API 配置 ==========
-          AI_API_URL: !Ref ApiUrl
-          AI_MODEL: !Ref AiModel
-          AI_REQUEST_TIMEOUT: !Ref AiRequestTimeout
-          AI_MAX_RETRIES: !Ref AiMaxRetries
-
-          # ========== 搜索和抓取配置 ==========
+          AI_MODE: !Ref AiMode
+          GEMINI_API_KEY: !Ref GeminiApiKey
+          GEMINI_MODEL: !Ref GeminiModel
+          GEMINI_URL: !Ref GeminiUrl
+          GEMINI_TIMEOUT: !Ref GeminiTimeout
+          GEMINI_MAX_TOKENS: !Ref GeminiMaxTokens
+          DOUBAO_API_KEY: !Ref DoubaoApiKey
+          DOUBAO_MODEL: !Ref DoubaoModel
+          DOUBAO_URL: !Ref DoubaoUrl
+          DOUBAO_TIMEOUT: !Ref DoubaoTimeout
+          DOUBAO_MAX_TOKENS: !Ref DoubaoMaxTokens
+          OPENAI_API_KEY: !Ref OpenaiApiKey
+          OPENAI_MODEL: !Ref OpenaiModel
+          OPENAI_URL: !Ref OpenaiUrl
+          OPENAI_TIMEOUT: !Ref OpenaiTimeout
+          OPENAI_MAX_TOKENS: !Ref OpenaiMaxTokens
+          AI_FAILOVER_COOLDOWN: !Ref AiFailoverCooldown
           DEFAULT_SEARCH_COUNT: !Ref DefaultSearchCount
           MAX_ACTIVE_ITEMS: !Ref MaxActiveItems
           MAX_CLOSED_PER_MODEL: !Ref MaxClosedPerModel
           REQUEST_INTERVAL: !Ref RequestInterval
           INCLUDE_PAYPAY: "false"
-
-          # ========== 批量处理配置 ==========
           MODEL_PARSE_BATCH_SIZE: !Ref ModelParseBatchSize
           CLOSED_PARSE_BATCH_SIZE: !Ref ClosedParseBatchSize
-
-          # ========== Token 和超时控制 ==========
           MAX_TOTAL_TOKENS: !Ref MaxTotalTokens
           LAMBDA_TIMEOUT_SECONDS: "840"
           LAMBDA_TIMEOUT_BUFFER: !Ref LambdaTimeoutBuffer
-
-          # ========== 估价配置 ==========
           EXPECTED_SELLING_FEE_RATE: !Ref ExpectedSellingFeeRate
           DEFAULT_SHIPPING_COST: !Ref DefaultShippingCost
           DEFAULT_REPAIR_RESERVE_RATE: !Ref DefaultRepairReserveRate
@@ -923,10 +1005,9 @@ Resources:
           Value: !Ref Environment
 
   # ============================================
-  # 产品目录定期扫描器（新增）
+  # 产品目录定期扫描器
   # ============================================
 
-  # ---------- CloudWatch Logs ----------
   CatalogScannerLogGroup:
     Type: AWS::Logs::LogGroup
     Condition: DeployCatalogScannerCondition
@@ -934,7 +1015,6 @@ Resources:
       LogGroupName: !Sub "/aws/lambda/CatalogScanner-${Environment}"
       RetentionInDays: !Ref LogRetentionDays
 
-  # ---------- IAM Role ----------
   CatalogScannerRole:
     Type: AWS::IAM::Role
     Condition: DeployCatalogScannerCondition
@@ -964,13 +1044,11 @@ Resources:
                 Resource:
                   - !GetAtt ProductCatalogTable.Arn
                   - !Sub "${ProductCatalogTable.Arn}/index/*"
-
               - Sid: InvokeAnalyzerLambda
                 Effect: Allow
                 Action:
                   - lambda:InvokeFunction
                 Resource: !GetAtt AuctionAnalyzerFunction.Arn
-
               - Sid: WriteLogs
                 Effect: Allow
                 Action:
@@ -978,7 +1056,6 @@ Resources:
                   - logs:PutLogEvents
                 Resource: !Sub "${CatalogScannerLogGroup.Arn}:*"
 
-  # ---------- Lambda Function ----------
   CatalogScannerFunction:
     Type: AWS::Lambda::Function
     Condition: DeployCatalogScannerCondition
@@ -1015,7 +1092,6 @@ Resources:
         - Key: Environment
           Value: !Ref Environment
 
-  # ---------- CloudWatch Events Rule (定时触发) ----------
   CatalogScannerScheduleRule:
     Type: AWS::Events::Rule
     Condition: DeployCatalogScannerCondition
@@ -1032,7 +1108,6 @@ Resources:
           Id: "CatalogScannerTarget"
           Input: !Sub '{"source":"aws.events","max_models":${CatalogScannerMaxModels}}'
 
-  # ---------- Lambda Permission for CloudWatch Events ----------
   CatalogScannerInvokePermission:
     Type: AWS::Lambda::Permission
     Condition: DeployCatalogScannerCondition
@@ -1043,7 +1118,6 @@ Resources:
       SourceArn: !GetAtt CatalogScannerScheduleRule.Arn
 
 Outputs:
-  # ============ S3 输出 ============
   LambdaCodeBucketName:
     Description: S3 存储 Lambda 代码的存储桶名称
     Value: !Ref LambdaCodeS3Bucket
@@ -1052,18 +1126,6 @@ Outputs:
     Description: S3 中 Lambda 代码对象键
     Value: !Ref LambdaCodeS3Key
 
-  # ============ Secret 输出 ============
-  ApiSecretArn:
-    Description: API Secret ARN
-    Condition: DeploySecretCondition
-    Value: !Ref ApiSecret
-
-  ApiSecretName:
-    Description: API Secret 名称
-    Condition: DeploySecretCondition
-    Value: !Sub "${SecretName}/${Environment}"
-
-  # ============ 主应用输出 ============
   ProductCatalogTableName:
     Description: DynamoDB 产品目录表名称
     Condition: DeployMainAppCondition
@@ -1084,7 +1146,6 @@ Outputs:
     Condition: DeployMainAppCondition
     Value: !GetAtt ProductCatalogDiscovery.Arn
 
-  # ============ Yahoo Auction 输出 ============
   YahooAuctionClosedTableName:
     Description: Yahoo Auction closed items DynamoDB table name
     Condition: DeployScraperCondition
@@ -1125,17 +1186,6 @@ Outputs:
     Condition: DeployScraperCondition
     Value: !GetAtt AuctionAnalyzerFunction.Arn
 
-  YahooAuctionScraperRoleArn:
-    Description: Yahoo Auction scraper execution role ARN
-    Condition: DeployScraperCondition
-    Value: !GetAtt YahooAuctionScraperRole.Arn
-
-  YahooAuctionAnalyzerRoleArn:
-    Description: Yahoo Auction analyzer execution role ARN
-    Condition: DeployScraperCondition
-    Value: !GetAtt YahooAuctionAnalyzerRole.Arn
-
-  # ============ Catalog Scanner 输出 ============
   CatalogScannerFunctionName:
     Description: 目录扫描器 Lambda 函数名称
     Condition: DeployCatalogScannerCondition
