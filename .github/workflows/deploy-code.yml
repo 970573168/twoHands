@@ -36,6 +36,12 @@ on:
         required: true
         default: false
         type: boolean
+      
+      update_catalog_scanner:
+        description: '更新 Catalog Scanner'
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   id-token: write
@@ -76,10 +82,15 @@ jobs:
           echo "analyzer_hash=$ANALYZER_HASH" >> $GITHUB_OUTPUT
           echo "  Analyzer: $ANALYZER_HASH"
           
-          # Catalog 哈希
+          # Catalog Discovery 哈希
           CATALOG_HASH=$(find src -name "product_catalog_discovery.py" -exec sha256sum {} \; | sha256sum | cut -d' ' -f1)
           echo "catalog_hash=$CATALOG_HASH" >> $GITHUB_OUTPUT
           echo "  Catalog Discovery: $CATALOG_HASH"
+          
+          # Catalog Scanner 哈希
+          SCANNER_HASH=$(find src -name "catalog_scanner.py" -exec sha256sum {} \; | sha256sum | cut -d' ' -f1)
+          echo "scanner_hash=$SCANNER_HASH" >> $GITHUB_OUTPUT
+          echo "  Catalog Scanner: $SCANNER_HASH"
           
           # 总体哈希（用于 S3 文件命名）
           SOURCE_HASH=$(find src -type f -name "*.py" -exec sha256sum {} \; | sort | sha256sum | cut -d' ' -f1)
@@ -111,6 +122,13 @@ jobs:
             echo "✅ 需要更新 ProductCatalog Discovery"
             NEED_BUILD="true"
             BUILD_REASONS="${BUILD_REASONS} Catalog"
+          fi
+          
+          # 检查是否需要更新 catalog scanner
+          if [[ "${{ github.event.inputs.update_catalog_scanner }}" == "true" ]]; then
+            echo "✅ 需要更新 Catalog Scanner"
+            NEED_BUILD="true"
+            BUILD_REASONS="${BUILD_REASONS} CatalogScanner"
           fi
           
           if [[ "$NEED_BUILD" == "false" ]]; then
@@ -261,6 +279,38 @@ jobs:
             echo "⚠️ 函数不存在，跳过更新"
           fi
 
+      - name: 更新 Catalog Scanner 函数
+        if: steps.check.outputs.need_build == 'true' && github.event.inputs.update_catalog_scanner == 'true'
+        run: |
+          FUNCTION_NAME="CatalogScanner-${{ github.event.inputs.environment }}"
+          echo "🔄 正在检查 $FUNCTION_NAME..."
+          
+          if aws lambda get-function --function-name "$FUNCTION_NAME" >/dev/null 2>&1; then
+            CURRENT_HASH=$(aws lambda get-function --function-name "$FUNCTION_NAME" --query 'Configuration.Description' --output text 2>/dev/null || echo "")
+            
+            if [[ "$CURRENT_HASH" == "${{ steps.hash.outputs.scanner_hash }}" ]]; then
+              echo "✅ 代码未变更，跳过更新"
+            else
+              echo "🔄 更新函数代码..."
+              aws lambda update-function-code \
+                --function-name "$FUNCTION_NAME" \
+                --s3-bucket "${{ env.s3_bucket }}" \
+                --s3-key "${{ env.s3_key }}"
+              
+              echo "⏳ 等待函数更新完成..."
+              aws lambda wait function-updated --function-name "$FUNCTION_NAME"
+              
+              # 更新函数描述为新的哈希值
+              aws lambda update-function-configuration \
+                --function-name "$FUNCTION_NAME" \
+                --description "${{ steps.hash.outputs.scanner_hash }}"
+              
+              echo "✅ CatalogScanner 更新完成"
+            fi
+          else
+            echo "⚠️ 函数不存在，跳过更新"
+          fi
+
       - name: 显示部署信息
         if: success()
         run: |
@@ -272,7 +322,8 @@ jobs:
             echo "🔑 代码哈希:"
             echo "   Auction Scraper: ${{ steps.hash.outputs.auction_hash }}"
             echo "   Analyzer: ${{ steps.hash.outputs.analyzer_hash }}"
-            echo "   Catalog: ${{ steps.hash.outputs.catalog_hash }}"
+            echo "   Catalog Discovery: ${{ steps.hash.outputs.catalog_hash }}"
+            echo "   Catalog Scanner: ${{ steps.hash.outputs.scanner_hash }}"
             echo "   Overall: ${{ steps.hash.outputs.source_hash }}"
           fi
           echo ""
@@ -291,6 +342,11 @@ jobs:
             echo "   ✅ ProductCatalog-Discovery-${{ github.event.inputs.environment }}"
           else
             echo "   ⏭️  ProductCatalog-Discovery-${{ github.event.inputs.environment }} (跳过)"
+          fi
+          if [[ "${{ github.event.inputs.update_catalog_scanner }}" == "true" ]]; then
+            echo "   ✅ CatalogScanner-${{ github.event.inputs.environment }}"
+          else
+            echo "   ⏭️  CatalogScanner-${{ github.event.inputs.environment }} (跳过)"
           fi
           echo "=========================================="
 
