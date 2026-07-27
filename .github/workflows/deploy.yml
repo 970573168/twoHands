@@ -32,13 +32,43 @@ on:
           - "false"
 
       deploy_scraper:
-        description: "Deploy Yahoo Auction Scraper?"
+        description: "Deploy Yahoo Auction Scraper & Analyzer?"
         required: true
         default: "true"
         type: choice
         options:
           - "true"
           - "false"
+
+      deploy_catalog_scanner:
+        description: "Deploy Catalog Scanner?"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+      catalog_scanner_enabled:
+        description: "Enable scheduled scanning? (default: false)"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
+      catalog_scanner_interval:
+        description: "Scan interval in minutes"
+        required: false
+        default: "120"
+        type: string
+
+      catalog_scanner_max_models:
+        description: "Max models per scan"
+        required: false
+        default: "3"
+        type: string
 
       api_key:
         description: "API Key (required if deploy_secret=true)"
@@ -115,7 +145,7 @@ jobs:
           aws s3api put-public-access-block --bucket "$S3_BUCKET" --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
 
       - name: Build and Upload Lambda Code
-        if: ${{ github.event.inputs.deploy_main_app == 'true' || github.event.inputs.deploy_scraper == 'true' }}
+        if: ${{ github.event.inputs.deploy_main_app == 'true' || github.event.inputs.deploy_scraper == 'true' || github.event.inputs.deploy_catalog_scanner == 'true' }}
         run: |
           BUILD_DIR="build"
           rm -rf "$BUILD_DIR" lambda.zip
@@ -129,6 +159,7 @@ jobs:
               --platform manylinux2014_aarch64 --only-binary=:all: --python-version 3.12 --quiet
           fi
           
+          # 复制所有 Python 文件（支持多个 Lambda 函数）
           for d in src lambda; do
             if [ -d "$d" ] && [ -n "$(ls -A $d/*.py 2>/dev/null)" ]; then
               cp $d/*.py "$BUILD_DIR/" && break
@@ -155,6 +186,18 @@ jobs:
             "YahooAuctionMaxPages=${{ github.event.inputs.max_pages }}"
             "LogRetentionDays=${{ github.event.inputs.log_retention }}"
           )
+          
+          # 添加 Catalog Scanner 参数
+          if [ "${{ github.event.inputs.deploy_catalog_scanner }}" = "true" ]; then
+            PARAMS+=(
+              "DeployCatalogScanner=true"
+              "CatalogScannerEnabled=${{ github.event.inputs.catalog_scanner_enabled }}"
+              "CatalogScannerIntervalMinutes=${{ github.event.inputs.catalog_scanner_interval }}"
+              "CatalogScannerMaxModels=${{ github.event.inputs.catalog_scanner_max_models }}"
+            )
+          else
+            PARAMS+=("DeployCatalogScanner=false")
+          fi
           
           [ "${{ github.event.inputs.deploy_secret }}" = "true" ] && [ -n "${{ github.event.inputs.api_key }}" ] && \
             PARAMS+=("ParameterKey=ApiKey,ParameterValue=${{ github.event.inputs.api_key }}")
