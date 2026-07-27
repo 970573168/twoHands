@@ -427,7 +427,7 @@ Parameters:
   # ============ Catalog Scanner 参数 ============
   DeployCatalogScanner:
     Type: String
-    Default: "false"
+    Default: "true"
     AllowedValues:
       - "true"
       - "false"
