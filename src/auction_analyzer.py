@@ -79,7 +79,7 @@ GEMINI_MAX_TOKENS = _env_int("GEMINI_MAX_TOKENS", 4000)
 # 豆包配置（备用）
 DOUBAO_API_KEY = _env_str("DOUBAO_API_KEY", "")
 DOUBAO_MODEL = _env_str("DOUBAO_MODEL", "qwen3.6-flash")
-DOUBAO_URL = _env_str("DOUBAO_URL", "https://ws-8lxmxlbemcgcus5u.ap-northeast-1.maas.aliyuncs.com/compatible-mode/v1")
+DOUBAO_URL = _env_str("DOUBAO_URL", "https://ws-8lxmxlbemcgcus5u.ap-northeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions")
 DOUBAO_TIMEOUT = _env_int("DOUBAO_TIMEOUT", 90)
 DOUBAO_MAX_TOKENS = _env_int("DOUBAO_MAX_TOKENS", 6000)
 
