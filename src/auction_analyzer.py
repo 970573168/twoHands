@@ -67,7 +67,7 @@ TABLE_NAME_CLOSED = _env_str("TABLE_NAME_CLOSED", "YahooAuctionItems")
 PRODUCT_TABLE_NAME = _env_str("PRODUCT_TABLE_NAME", "ProductCatalog-dev")
 
 # ============ AI 模式切换配置 ============
-AI_MODE = _env_str("AI_MODE", "gemini")  # gemini / doubao / openai
+AI_MODE = _env_str("AI_MODE", "doubao")  # gemini / doubao / openai
 
 # Gemini 配置（默认首选）
 GEMINI_API_KEY = _env_str("GEMINI_API_KEY", "")
