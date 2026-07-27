@@ -7,11 +7,13 @@
 import os
 import json
 import time
+import re
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Optional, Set, Tuple
 from decimal import Decimal
 
 import boto3
+from boto3.dynamodb.conditions import Key
 
 # ============ 环境变量 ============
 TABLE_NAME = os.environ.get("TABLE_NAME", "ProductCatalog-dev")
@@ -42,10 +44,138 @@ def log(level: str, message: str, **fields):
     print(json.dumps(entry, ensure_ascii=False, default=str))
 
 
+def normalize_for_key(value: str) -> str:
+    """标准化用于 DynamoDB 键的值"""
+    value = str(value or "").strip().upper()
+    value = value.translate(str.maketrans(
+        'ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ'
+        'ａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ'
+        '０１２３４５６７８９',
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+        'abcdefghijklmnopqrstuvwxyz'
+        '0123456789'
+    ))
+    value = re.sub(r"[^A-Z0-9\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]+", "-", value)
+    return value.strip("-")[:180]
+
+
 def get_today_date() -> str:
     """获取今天的日期字符串（JST）"""
     jst = timezone(timedelta(hours=9))
     return datetime.now(jst).strftime("%Y-%m-%d")
+
+
+def diagnose_category_records():
+    """诊断分类记录（临时调试用）"""
+    try:
+        response = table.scan(
+            ProjectionExpression="PK, SK, entity_type, #name, #status",
+            ExpressionAttributeNames={
+                "#name": "name",
+                "#status": "status"
+            },
+            Limit=50
+        )
+        
+        items = response.get("Items", [])
+        
+        log("INFO", "分类记录诊断",
+            table=TABLE_NAME,
+            count=len(items),
+            scanned_count=response.get("ScannedCount", 0),
+            items=items[:10])  # 只显示前10条
+        
+        # 统计不同类型的记录
+        type_counts = {}
+        for item in items:
+            entity_type = item.get("entity_type", "UNKNOWN")
+            status = item.get("status", "UNKNOWN")
+            key = f"{entity_type}/{status}"
+            type_counts[key] = type_counts.get(key, 0) + 1
+        
+        log("INFO", "记录类型统计", type_counts=type_counts)
+        
+    except Exception as e:
+        log("ERROR", "诊断分类记录失败", error=str(e))
+
+
+def scan_active_categories(max_categories: int = 20) -> List[str]:
+    """
+    分页扫描 ACTIVE 状态的 CATEGORY 记录。
+    
+    DynamoDB Scan 的 Limit 是过滤前的最大评估条目数，
+    因此必须处理 LastEvaluatedKey 进行分页扫描。
+    """
+    categories = []
+    last_evaluated_key = None
+    total_scanned = 0
+    page_number = 0
+    
+    while len(categories) < max_categories:
+        page_number += 1
+        
+        scan_params = {
+            "FilterExpression": "entity_type = :entity_type AND #status = :status",
+            "ExpressionAttributeNames": {
+                "#status": "status"
+            },
+            "ExpressionAttributeValues": {
+                ":entity_type": "CATEGORY",
+                ":status": "ACTIVE"
+            },
+            "ProjectionExpression": "PK, SK, #name, entity_type, #status",
+            "Limit": 100
+        }
+        
+        scan_params["ExpressionAttributeNames"]["#name"] = "name"
+        
+        if last_evaluated_key:
+            scan_params["ExclusiveStartKey"] = last_evaluated_key
+        
+        try:
+            response = table.scan(**scan_params)
+        except Exception as e:
+            # 如果 ProjectionExpression 包含不存在的字段，尝试简化查询
+            log("WARN", "带投影的扫描失败，尝试完整扫描", error=str(e))
+            scan_params.pop("ProjectionExpression", None)
+            scan_params["ExpressionAttributeNames"]["#name"] = "name"
+            response = table.scan(**scan_params)
+        
+        items = response.get("Items", [])
+        scanned_count = response.get("ScannedCount", 0)
+        total_scanned += scanned_count
+        
+        log("INFO", "扫描分类分页",
+            page=page_number,
+            scanned_count=scanned_count,
+            matched_count=response.get("Count", 0),
+            total_scanned=total_scanned,
+            has_more=bool(response.get("LastEvaluatedKey")))
+        
+        for item in items:
+            category_name = item.get("name")
+            
+            if category_name:
+                category_name = str(category_name).strip()
+                
+                if category_name and category_name not in categories:
+                    categories.append(category_name)
+            
+            if len(categories) >= max_categories:
+                break
+        
+        last_evaluated_key = response.get("LastEvaluatedKey")
+        
+        if not last_evaluated_key:
+            break
+    
+    log("INFO", "分类扫描完成",
+        category_count=len(categories),
+        categories=categories,
+        total_scanned=total_scanned,
+        pages=page_number)
+    
+    return categories[:max_categories]
 
 
 def query_catalog_brands(category: str, limit: int = 10) -> List[Dict]:
@@ -83,13 +213,44 @@ def query_catalog_brands(category: str, limit: int = 10) -> List[Dict]:
                     "category": category,
                     "brand": brand_name,
                     "last_scanned_date": item.get("last_scanned_date", ""),
-                    "last_analysis_date": item.get("last_analysis_date", "")
+                    "last_scanned_at": item.get("last_scanned_at", 0)
                 })
         
         return brands
     except Exception as e:
         log("ERROR", "查询品类品牌失败", category=category, error=str(e))
         return []
+
+
+def get_product_scan_state(product_pk: str) -> Dict:
+    """
+    从 PRODUCT#... / META 记录读取扫描状态
+    
+    Args:
+        product_pk: 产品主键
+        
+    Returns:
+        产品的扫描状态信息
+    """
+    if not product_pk:
+        return {}
+    
+    try:
+        response = table.get_item(
+            Key={
+                "PK": product_pk,
+                "SK": "META"
+            },
+            ProjectionExpression="last_scanned_date, last_scanned_at, last_analysis_status"
+        )
+        
+        return response.get("Item", {})
+        
+    except Exception as e:
+        log("ERROR", "读取产品扫描状态失败",
+            product_pk=product_pk,
+            error=str(e))
+        return {}
 
 
 def query_catalog_products(
@@ -126,16 +287,24 @@ def query_catalog_products(
         products = []
         for item in response.get("Items", []):
             model = item.get("model")
-            if model:
-                products.append({
-                    "category": category,
-                    "brand": brand,
-                    "model": model,
-                    "product_pk": item.get("product_pk", ""),
-                    "last_scanned_date": item.get("last_scanned_date", ""),
-                    "last_analysis_date": item.get("last_analysis_date", ""),
-                    "release_date": item.get("release_date", "")
-                })
+            product_pk = item.get("product_pk", "")
+            
+            if not model:
+                continue
+            
+            # 从正式的 PRODUCT 记录读取扫描状态
+            product_state = get_product_scan_state(product_pk)
+            
+            products.append({
+                "category": category,
+                "brand": brand,
+                "model": model,
+                "product_pk": product_pk,
+                "last_scanned_date": product_state.get("last_scanned_date", ""),
+                "last_scanned_at": product_state.get("last_scanned_at"),
+                "last_analysis_status": product_state.get("last_analysis_status", ""),
+                "release_date": item.get("release_date", "")
+            })
         
         return products
     except Exception as e:
@@ -149,37 +318,21 @@ def scan_categories_for_unscanned_models(
     max_categories: int = 20
 ) -> List[Dict]:
     """
-    扫描所有品类，找到今天还没有被扫描的型号
-    
-    Args:
-        today: 今天的日期字符串
-        max_models: 最多返回的型号数量
-        max_categories: 最多扫描的品类数量
-        
-    Returns:
-        待分析的型号列表
+    扫描所有品类，找到今天尚未成功扫描的型号。
+    使用分页扫描确保能找到所有 ACTIVE 分类。
     """
-    # 先获取所有品类
     try:
-        response = table.scan(
-            FilterExpression="entity_type = :entity_type AND #status = :status",
-            ExpressionAttributeNames={
-                "#status": "status"
-            },
-            ExpressionAttributeValues={
-                ":entity_type": "CATEGORY",
-                ":status": "ACTIVE"
-            },
-            Limit=max_categories
-        )
+        # 使用分页扫描获取所有 ACTIVE 分类
+        categories = scan_active_categories(max_categories=max_categories)
         
-        categories = []
-        for item in response.get("Items", []):
-            category_name = item.get("name")
-            if category_name:
-                categories.append(category_name)
+        log("INFO", "扫描品类",
+            count=len(categories),
+            categories=categories)
         
-        log("INFO", "扫描品类", count=len(categories), categories=categories)
+        if not categories:
+            log("WARN", "没有发现 ACTIVE 分类记录",
+                table=TABLE_NAME)
+            return []
         
         unscanned_models = []
         
@@ -190,13 +343,13 @@ def scan_categories_for_unscanned_models(
             # 获取该品类下的品牌
             brands = query_catalog_brands(category, limit=10)
             
+            log("INFO", "查询分类品牌完成",
+                category=category,
+                brand_count=len(brands))
+            
             for brand_info in brands:
                 if len(unscanned_models) >= max_models:
                     break
-                
-                # 检查品牌今天是否已经扫描过
-                if brand_info.get("last_scanned_date") == today:
-                    continue
                 
                 # 获取该品牌下的产品型号
                 products = query_catalog_products(
@@ -205,21 +358,43 @@ def scan_categories_for_unscanned_models(
                     limit=5
                 )
                 
+                log("INFO", "查询品牌型号完成",
+                    category=category,
+                    brand=brand_info["brand"],
+                    product_count=len(products))
+                
                 for product in products:
                     if len(unscanned_models) >= max_models:
                         break
                     
-                    # 检查型号今天是否已经分析过
-                    if product.get("last_analysis_date") == today:
+                    # 检查型号今天是否已经扫描过（从正式 PRODUCT 记录读取）
+                    if product.get("last_scanned_date") == today:
+                        log("DEBUG", "型号今天已扫描，跳过",
+                            category=product["category"],
+                            brand=product["brand"],
+                            model=product["model"],
+                            last_scanned_date=product["last_scanned_date"])
                         continue
                     
                     unscanned_models.append(product)
         
-        log("INFO", "找到未扫描型号", count=len(unscanned_models))
+        log("INFO", "找到未扫描型号",
+            count=len(unscanned_models),
+            models=[
+                {
+                    "category": item.get("category"),
+                    "brand": item.get("brand"),
+                    "model": item.get("model")
+                }
+                for item in unscanned_models
+            ])
+        
         return unscanned_models
         
     except Exception as e:
-        log("ERROR", "扫描品类失败", error=str(e))
+        log("ERROR", "扫描品类失败",
+            error_type=type(e).__name__,
+            error=str(e))
         return []
 
 
@@ -300,7 +475,7 @@ def update_scan_timestamp(
     analysis_status: str = "SCANNED"
 ):
     """
-    更新产品、品牌的扫描时间戳
+    更新产品和品牌的扫描时间戳
     
     Args:
         product_pk: 产品主键
@@ -314,7 +489,7 @@ def update_scan_timestamp(
     brand_key = normalize_for_key(brand)
     
     try:
-        # 更新产品记录
+        # 更新产品记录（PRODUCT#... / META）
         if product_pk:
             table.update_item(
                 Key={
@@ -332,8 +507,13 @@ def update_scan_timestamp(
                     ":status": analysis_status
                 }
             )
+            
+            log("DEBUG", "更新产品扫描时间戳",
+                product_pk=product_pk,
+                today=today,
+                status=analysis_status)
         
-        # 更新品牌记录
+        # 更新品牌记录（CATEGORY#... / BRAND#...）
         table.update_item(
             Key={
                 "PK": f"CATEGORY#{category_key}",
@@ -349,12 +529,10 @@ def update_scan_timestamp(
             }
         )
         
-        log("DEBUG", "更新时间戳",
-            product_pk=product_pk,
+        log("DEBUG", "更新品牌扫描时间戳",
             category=category,
             brand=brand,
-            today=today,
-            status=analysis_status)
+            today=today)
             
     except Exception as e:
         log("ERROR", "更新时间戳失败",
@@ -362,22 +540,6 @@ def update_scan_timestamp(
             category=category,
             brand=brand,
             error=str(e))
-
-
-def normalize_for_key(value: str) -> str:
-    """标准化用于 DynamoDB 键的值"""
-    import re
-    value = str(value or "").strip().upper()
-    value = value.translate(str.maketrans(
-        'ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ'
-        'ａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ'
-        '０１２３４５６７８９',
-        'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
-        'abcdefghijklmnopqrstuvwxyz'
-        '0123456789'
-    ))
-    value = re.sub(r"[^A-Z0-9\u4e00-\u9fff\u3040-\u309f\u30a0-\u30ff]+", "-", value)
-    return value.strip("-")[:180]
 
 
 def scan_and_analyze(event: Dict) -> Dict:
@@ -445,7 +607,19 @@ def scan_and_analyze(event: Dict) -> Dict:
         
         # 更新扫描时间戳
         if result["success"]:
-            analysis_status = result["response"].get("status", "COMPLETED")
+            # 尝试从响应中提取状态
+            try:
+                response_body = result["response"]
+                if isinstance(response_body, dict):
+                    if "body" in response_body:
+                        body = json.loads(response_body["body"]) if isinstance(response_body["body"], str) else response_body["body"]
+                        analysis_status = body.get("status", "COMPLETED")
+                    else:
+                        analysis_status = response_body.get("status", "COMPLETED")
+                else:
+                    analysis_status = "COMPLETED"
+            except:
+                analysis_status = "COMPLETED"
             success_count += 1
         else:
             analysis_status = "FAILED"
@@ -514,6 +688,9 @@ def lambda_handler(event, context):
             event=event,
             enable_scheduled_scan=ENABLE_SCHEDULED_SCAN,
             scan_interval_minutes=SCAN_INTERVAL_MINUTES)
+        
+        # 临时诊断：检查表中的记录类型
+        diagnose_category_records()
         
         result = scan_and_analyze(event)
         
