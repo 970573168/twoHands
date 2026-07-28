@@ -1,1263 +1,1145 @@
-AWSTemplateFormatVersion: "2010-09-09"
-
-Description: >
-  电子产品目录采集器 + AI API Secret + Yahoo Auction 抓取器 + 分析工作流 + 目录定期扫描器
-  支持多 AI 模式切换（Gemini / 豆包 / OpenAI）
-  Secret 已存在时不会重复创建
-
-Parameters:
-  # ============ 通用参数 ============
-  Environment:
-    Type: String
-    Default: dev
-    AllowedValues:
-      - dev
-      - test
-      - prod
-    Description: 环境名称
-
-  # ============ S3 代码部署参数 ============
-  LambdaCodeS3Bucket:
-    Type: String
-    Description: 已存在的 S3 Bucket 名称，用于存储 Lambda 代码
-
-  LambdaCodeS3Key:
-    Type: String
-    Default: "productcatalog/lambda.zip"
-    Description: S3 中 Lambda 代码的对象键
-
-  # ============ AI 模式选择 ============
-  AiMode:
-    Type: String
-    Default: "doubao"
-    AllowedValues:
-      - gemini
-      - doubao
-      - openai
-    Description: AI 模式选择（gemini / doubao / openai），默认 gemini
-
-  # ============ Gemini 配置 ============
-  GeminiApiKey:
-    Type: String
-    NoEcho: true
-    Default: ""
-    Description: Gemini API Key（留空则使用已存在的 Secret，不创建新的）
-
-  GeminiModel:
-    Type: String
-    Default: "gemini-2.0-flash-latest"
-    Description: Gemini 模型名称
-
-  GeminiUrl:
-    Type: String
-    Default: "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-latest:generateContent"
-    Description: Gemini API URL
-
-  GeminiTimeout:
-    Type: Number
-    Default: 60
-    MinValue: 10
-    MaxValue: 300
-    Description: Gemini API 请求超时（秒）
-
-  GeminiMaxTokens:
-    Type: Number
-    Default: 4000
-    MinValue: 100
-    MaxValue: 8192
-    Description: Gemini 最大输出 Token 数
-
-  # ============ 豆包配置 ============
-  DoubaoApiKey:
-    Type: String
-    NoEcho: true
-    Default: ""
-    Description: 豆包 API Key（留空则使用已存在的 Secret，不创建新的）
-
-  DoubaoModel:
-    Type: String
-    Default: "qwen-plus-character"
-    Description: 豆包模型名称
-
-  DoubaoUrl:
-    Type: String
-    Default: "https://ws-8lxmxlbemcgcus5u.ap-northeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions"
-    Description: 豆包 API URL
-
-  DoubaoTimeout:
-    Type: Number
-    Default: 200
-    MinValue: 10
-    MaxValue: 300
-    Description: 豆包 API 请求超时（秒）
-
-  DoubaoMaxTokens:
-    Type: Number
-    Default: 6000
-    MinValue: 100
-    MaxValue: 8192
-    Description: 豆包最大输出 Token 数
-
-  # ============ OpenAI 配置 ============
-  OpenaiApiKey:
-    Type: String
-    NoEcho: true
-    Default: ""
-    Description: OpenAI API Key（留空则使用已存在的 Secret，不创建新的）
-
-  OpenaiModel:
-    Type: String
-    Default: "gpt-4o-mini"
-    Description: OpenAI 模型名称
-
-  OpenaiUrl:
-    Type: String
-    Default: "https://api.openai.com/v1/chat/completions"
-    Description: OpenAI API URL
-
-  OpenaiTimeout:
-    Type: Number
-    Default: 60
-    MinValue: 10
-    MaxValue: 300
-    Description: OpenAI API 请求超时（秒）
-
-  OpenaiMaxTokens:
-    Type: Number
-    Default: 4000
-    MinValue: 100
-    MaxValue: 16384
-    Description: OpenAI 最大输出 Token 数
-
-  # ============ 故障切换配置 ============
-  AiFailoverCooldown:
-    Type: Number
-    Default: 300
-    MinValue: 60
-    MaxValue: 3600
-    Description: AI 模式故障切换冷却时间（秒）
-
-  # ============ 旧版 Secret 参数（向后兼容） ============
-  DeploySecret:
-    Type: String
-    Default: "false"
-    AllowedValues:
-      - "true"
-      - "false"
-    Description: 是否部署旧版 AI API Secret（向后兼容，建议使用各 AI 的独立 Secret）
-
-  ApiKey:
-    Type: String
-    NoEcho: true
-    Default: ""
-    Description: 旧版 API Key（仅在 DeploySecret=true 且需要创建旧版 Secret 时使用）
-
-  SecretName:
-    Type: String
-    Default: "ProductCatalog/ApiSecret"
-    Description: 旧版 Secrets Manager 中的 Secret 名称前缀
-
-  # ============ 主应用参数（向后兼容） ============
-  DeployMainApp:
-    Type: String
-    Default: "true"
-    AllowedValues:
-      - "true"
-      - "false"
-    Description: 是否部署主应用
-
-  MaxCategoriesPerRun:
-    Type: Number
-    Default: 20
-    MinValue: 1
-    MaxValue: 100
-
-  MaxBrandsPerCategory:
-    Type: Number
-    Default: 20
-    MinValue: 1
-    MaxValue: 100
-
-  MaxModelsPerBrand:
-    Type: Number
-    Default: 50
-    MinValue: 1
-    MaxValue: 100
-
-  MaxTotalTokens:
-    Type: Number
-    Default: 50000
-    MinValue: 10000
-    MaxValue: 1000000
-
-  LambdaTimeoutBuffer:
-    Type: Number
-    Default: 30
-    MinValue: 10
-    MaxValue: 300
-
-  ApiCallDelay:
-    Type: Number
-    Default: 1
-    MinValue: 0
-    MaxValue: 10
-
-  CategoryLimit:
-    Type: Number
-    Default: 5
-    MinValue: 1
-    MaxValue: 20
-
-  BrandLimit:
-    Type: Number
-    Default: 3
-    MinValue: 1
-    MaxValue: 10
-
-  LogRetentionDays:
-    Type: Number
-    Default: 14
-    MinValue: 1
-    MaxValue: 3653
-
-  # ============ Yahoo Auction 抓取器参数 ============
-  DeployScraper:
-    Type: String
-    Default: "true"
-    AllowedValues:
-      - "true"
-      - "false"
-
-  YahooAuctionMaxPages:
-    Type: Number
-    Default: 1
-    MinValue: 1
-    MaxValue: 10
-
-  YahooAuctionRequestTimeout:
-    Type: Number
-    Default: 30
-    MinValue: 5
-    MaxValue: 120
-
-  YahooAuctionDebugLogHtml:
-    Type: String
-    Default: "false"
-    AllowedValues:
-      - "true"
-      - "false"
-
-  YahooAuctionItemsPerPage:
-    Type: Number
-    Default: 100
-    MinValue: 10
-    MaxValue: 100
-
-  # ============ Yahoo Auction Analyzer 参数 ============
-  ModelParseBatchSize:
-    Type: Number
-    Default: 100
-    MinValue: 1
-    MaxValue: 1000
-
-  ClosedParseBatchSize:
-    Type: Number
-    Default: 100
-    MinValue: 1
-    MaxValue: 1000
-
-  MaxClosedPerModel:
-    Type: Number
-    Default: 100
-    MinValue: 10
-    MaxValue: 200
-
-  DefaultSearchCount:
-    Type: Number
-    Default: 100
-    MinValue: 1
-    MaxValue: 1000
-
-  MaxActiveItems:
-    Type: Number
-    Default: 100
-    MinValue: 1
-    MaxValue: 1000
-
-  AiRequestTimeout:
-    Type: Number
-    Default: 300
-    MinValue: 30
-    MaxValue: 500
-
-  AiMaxRetries:
-    Type: Number
-    Default: 3
-    MinValue: 1
-    MaxValue: 5
-
-  RequestInterval:
-    Type: Number
-    Default: 1.0
-    MinValue: 0.1
-    MaxValue: 5.0
-
-  ExpectedSellingFeeRate:
-    Type: Number
-    Default: 0.10
-    MinValue: 0
-    MaxValue: 1
-
-  DefaultShippingCost:
-    Type: Number
-    Default: 1500
-    MinValue: 0
-    MaxValue: 10000
-
-  DefaultRepairReserveRate:
-    Type: Number
-    Default: 0.05
-    MinValue: 0
-    MaxValue: 1
-
-  MinComparableCount:
-    Type: Number
-    Default: 3
-    MinValue: 1
-    MaxValue: 10
-
-  MaxPriceDeviation:
-    Type: Number
-    Default: 1.5
-    MinValue: 1
-    MaxValue: 5
-
-  RiskReserveRate:
-    Type: Number
-    Default: 0.03
-    MinValue: 0
-    MaxValue: 1
-
-  # ============ 新增：Active 最低价格比率参数 ============
-  ActivePriceMinRatio:
-    Type: Number
-    Default: 1.0
-    MinValue: 0.5
-    MaxValue: 2.0
-    Description: Active商品最低价格相对于closed平均价格的比率（1.0表示不低于平均价）
-
-  # ============ 新增：收益阈值参数 ============
-  BuyMarginThreshold:
-    Type: Number
-    Default: 0.20
-    MinValue: 0.05
-    MaxValue: 0.50
-    Description: 建议购买的最低利润率阈值
-
-  ReviewMarginThreshold:
-    Type: Number
-    Default: 0.10
-    MinValue: 0.05
-    MaxValue: 0.50
-    Description: 需要人工审查的利润率阈值
-
-  HighConfidenceComparableCount:
-    Type: Number
-    Default: 10
-    MinValue: 5
-    MaxValue: 50
-    Description: 高置信度所需的最小比较样本数
-
-  MediumConfidenceComparableCount:
-    Type: Number
-    Default: 5
-    MinValue: 3
-    MaxValue: 20
-    Description: 中等置信度所需的最小比较样本数
-
-  # ============ Yahoo Auction 自定义搜索参数 ============
-  AuctionParamNew:
-    Type: String
-    Default: ""
-  AuctionParamOffer:
-    Type: String
-    Default: ""
-  AuctionParamShipping:
-    Type: String
-    Default: ""
-  AuctionParamIstatus:
-    Type: String
-    Default: ""
-  AuctionParamAbatch:
-    Type: String
-    Default: ""
-  AuctionParamLocCd:
-    Type: String
-    Default: ""
-  AuctionParamSelect:
-    Type: String
-    Default: ""
-  AuctionParamSpec:
-    Type: String
-    Default: ""
-  AuctionParamPriceType:
-    Type: String
-    Default: ""
-  AuctionParamMin:
-    Type: String
-    Default: ""
-  AuctionParamMax:
-    Type: String
-    Default: ""
-  AuctionParamCarInspection:
-    Type: String
-    Default: ""
-  AuctionParamFixed:
-    Type: String
-    Default: ""
-  AuctionParamAucminprice:
-    Type: String
-    Default: ""
-  AuctionParamAucmaxprice:
-    Type: String
-    Default: ""
-  AuctionParamAucminBidorbuyPrice:
-    Type: String
-    Default: ""
-  AuctionParamAucmaxBidorbuyPrice:
-    Type: String
-    Default: ""
-  AuctionParamLc1:
-    Type: String
-    Default: ""
-  AuctionParamJpypayment:
-    Type: String
-    Default: ""
-  AuctionParamPoint:
-    Type: String
-    Default: ""
-  AuctionParamThumb:
-    Type: String
-    Default: ""
-  AuctionParamWrappingicon:
-    Type: String
-    Default: ""
-  AuctionParamPrivacyDelivery:
-    Type: String
-    Default: ""
-  AuctionParamGiftIcon:
-    Type: String
-    Default: ""
-  AuctionParamCharity:
-    Type: String
-    Default: ""
-  AuctionParamMode:
-    Type: String
-    Default: ""
-  AuctionParamN:
-    Type: String
-    Default: ""
-  AuctionParamS1:
-    Type: String
-    Default: ""
-  AuctionParamO1:
-    Type: String
-    Default: ""
-  AuctionParamMaxSprice:
-    Type: String
-    Default: ""
-  AuctionParamType:
-    Type: String
-    Default: ""
-
-  # ============ Catalog Scanner 参数 ============
-  DeployCatalogScanner:
-    Type: String
-    Default: "true"
-    AllowedValues:
-      - "true"
-      - "false"
-
-  CatalogScannerEnabled:
-    Type: String
-    Default: "false"
-    AllowedValues:
-      - "true"
-      - "false"
-
-  CatalogScannerIntervalMinutes:
-    Type: Number
-    Default: 5
-    MinValue: 1
-    MaxValue: 1440
-
-  CatalogScannerMaxModels:
-    Type: Number
-    Default: 10
-    MinValue: 1
-    MaxValue: 100
-
-Conditions:
-  # ============ Secret 创建条件 ============
-  CreateGeminiSecret: !And
-    - !Condition DeploySecretCondition
-    - !Not [!Equals [!Ref GeminiApiKey, ""]]
-  CreateDoubaoSecret: !And
-    - !Condition DeploySecretCondition
-    - !Not [!Equals [!Ref DoubaoApiKey, ""]]
-  CreateOpenaiSecret: !And
-    - !Condition DeploySecretCondition
-    - !Not [!Equals [!Ref OpenaiApiKey, ""]]
-  CreateLegacySecret: !And
-    - !Condition DeploySecretCondition
-    - !Not [!Equals [!Ref ApiKey, ""]]
-
-  # ============ 其他条件 ============
-  DeploySecretCondition: !Equals [!Ref DeploySecret, "true"]
-  DeployMainAppCondition: !Equals [!Ref DeployMainApp, "true"]
-  DeployScraperCondition: !Equals [!Ref DeployScraper, "true"]
-  CatalogScannerEnabledCondition: !Equals [!Ref CatalogScannerEnabled, "true"]
-  DeployCatalogScannerCondition: !And
-    - !Equals [!Ref DeployCatalogScanner, "true"]
-    - !Condition DeployMainAppCondition
-    - !Condition DeployScraperCondition
-
-Resources:
-  # ============================================
-  # AI API Secrets
-  # ============================================
-  
-  GeminiApiSecret:
-    Type: AWS::SecretsManager::Secret
-    Condition: CreateGeminiSecret
-    Properties:
-      Name: !Sub "gemini-api-key-${Environment}"
-      Description: Gemini API Key for Yahoo Auction Analyzer (auto-created by CloudFormation)
-      SecretString: !Sub '{"GEMINI_API_KEY":"${GeminiApiKey}"}'
-      Tags:
-        - Key: Application
-          Value: YahooAuctionAnalyzer
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: Type
-          Value: Gemini
-        - Key: ManagedBy
-          Value: CloudFormation
-
-  DoubaoApiSecret:
-    Type: AWS::SecretsManager::Secret
-    Condition: CreateDoubaoSecret
-    Properties:
-      Name: !Sub "doubao-api-key-${Environment}"
-      Description: Doubao API Key for Yahoo Auction Analyzer (auto-created by CloudFormation)
-      SecretString: !Sub '{"DOUBAO_API_KEY":"${DoubaoApiKey}"}'
-      Tags:
-        - Key: Application
-          Value: YahooAuctionAnalyzer
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: Type
-          Value: Doubao
-        - Key: ManagedBy
-          Value: CloudFormation
-
-  OpenaiApiSecret:
-    Type: AWS::SecretsManager::Secret
-    Condition: CreateOpenaiSecret
-    Properties:
-      Name: !Sub "openai-api-key-${Environment}"
-      Description: OpenAI API Key for Yahoo Auction Analyzer (auto-created by CloudFormation)
-      SecretString: !Sub '{"OPENAI_API_KEY":"${OpenaiApiKey}"}'
-      Tags:
-        - Key: Application
-          Value: YahooAuctionAnalyzer
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: Type
-          Value: OpenAI
-        - Key: ManagedBy
-          Value: CloudFormation
-
-  ApiSecret:
-    Type: AWS::SecretsManager::Secret
-    Condition: CreateLegacySecret
-    Properties:
-      Name: !Sub "${SecretName}/${Environment}"
-      Description: Legacy AI API key for product catalog discovery
-      SecretString: !Sub '{"apiKey":"${ApiKey}"}'
-      Tags:
-        - Key: Application
-          Value: ProductCatalog
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: ManagedBy
-          Value: CloudFormation
-
-  # ============================================
-  # 主应用
-  # ============================================
-
-  ProductCatalogTable:
-    Type: AWS::DynamoDB::Table
-    Condition: DeployMainAppCondition
-    Properties:
-      TableName: !Sub "ProductCatalog-${Environment}"
-      BillingMode: PAY_PER_REQUEST
-      AttributeDefinitions:
-        - AttributeName: PK
-          AttributeType: S
-        - AttributeName: SK
-          AttributeType: S
-        - AttributeName: GSI1PK
-          AttributeType: S
-        - AttributeName: GSI1SK
-          AttributeType: S
-      KeySchema:
-        - AttributeName: PK
-          KeyType: HASH
-        - AttributeName: SK
-          KeyType: RANGE
-      GlobalSecondaryIndexes:
-        - IndexName: GSI1
-          KeySchema:
-            - AttributeName: GSI1PK
-              KeyType: HASH
-            - AttributeName: GSI1SK
-              KeyType: RANGE
-          Projection:
-            ProjectionType: ALL
-      PointInTimeRecoverySpecification:
-        PointInTimeRecoveryEnabled: true
-      TimeToLiveSpecification:
-        AttributeName: expires_at
-        Enabled: true
-      SSESpecification:
-        SSEEnabled: true
-      Tags:
-        - Key: Application
-          Value: ProductCatalog
-        - Key: Environment
-          Value: !Ref Environment
-
-  ProductCatalogLogGroup:
-    Type: AWS::Logs::LogGroup
-    Condition: DeployMainAppCondition
-    Properties:
-      LogGroupName: !Sub "/aws/lambda/ProductCatalog-Discovery-${Environment}"
-      RetentionInDays: !Ref LogRetentionDays
-
-  LambdaExecutionRole:
-    Type: AWS::IAM::Role
-    Condition: DeployMainAppCondition
-    Properties:
-      RoleName: !Sub "ProductCatalog-LambdaRole-${Environment}"
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service:
-                - lambda.amazonaws.com
-            Action:
-              - sts:AssumeRole
-      Policies:
-        - PolicyName: ProductCatalogDiscoveryPolicy
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Sid: DynamoDBCatalogAccess
-                Effect: Allow
-                Action:
-                  - dynamodb:GetItem
-                  - dynamodb:PutItem
-                  - dynamodb:UpdateItem
-                  - dynamodb:Query
-                  - dynamodb:BatchWriteItem
-                Resource:
-                  - !GetAtt ProductCatalogTable.Arn
-                  - !Sub "${ProductCatalogTable.Arn}/index/*"
-              - Sid: ReadApiSecrets
-                Effect: Allow
-                Action:
-                  - secretsmanager:GetSecretValue
-                Resource:
-                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:gemini-api-key-${Environment}-*"
-                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:doubao-api-key-${Environment}-*"
-                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:openai-api-key-${Environment}-*"
-                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}/${Environment}-*"
-              - Sid: WriteLambdaLogs
-                Effect: Allow
-                Action:
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource: !Sub "${ProductCatalogLogGroup.Arn}:*"
-
-  ProductCatalogDiscovery:
-    Type: AWS::Lambda::Function
-    Condition: DeployMainAppCondition
-    DependsOn:
-      - ProductCatalogLogGroup
-      - LambdaExecutionRole
-    Properties:
-      FunctionName: !Sub "ProductCatalog-Discovery-${Environment}"
-      Description: 通过 AI 发现电子产品品类、品牌和型号（手动触发）
-      Runtime: python3.12
-      Architectures:
-        - arm64
-      Handler: lambda_function.lambda_handler
-      Timeout: 900
-      MemorySize: 512
-      Role: !GetAtt LambdaExecutionRole.Arn
-      Code:
-        S3Bucket: !Ref LambdaCodeS3Bucket
-        S3Key: !Ref LambdaCodeS3Key
-      Environment:
-        Variables:
-          TABLE_NAME: !Ref ProductCatalogTable
-          AI_MODE: !Ref AiMode
-          GEMINI_API_KEY: !Ref GeminiApiKey
-          GEMINI_MODEL: !Ref GeminiModel
-          GEMINI_URL: !Ref GeminiUrl
-          GEMINI_TIMEOUT: !Ref GeminiTimeout
-          GEMINI_MAX_TOKENS: !Ref GeminiMaxTokens
-          DOUBAO_API_KEY: !Ref DoubaoApiKey
-          DOUBAO_MODEL: !Ref DoubaoModel
-          DOUBAO_URL: !Ref DoubaoUrl
-          DOUBAO_TIMEOUT: !Ref DoubaoTimeout
-          DOUBAO_MAX_TOKENS: !Ref DoubaoMaxTokens
-          OPENAI_API_KEY: !Ref OpenaiApiKey
-          OPENAI_MODEL: !Ref OpenaiModel
-          OPENAI_URL: !Ref OpenaiUrl
-          OPENAI_TIMEOUT: !Ref OpenaiTimeout
-          OPENAI_MAX_TOKENS: !Ref OpenaiMaxTokens
-          AI_FAILOVER_COOLDOWN: !Ref AiFailoverCooldown
-          MAX_CATEGORIES: !Ref MaxCategoriesPerRun
-          MAX_BRANDS: !Ref MaxBrandsPerCategory
-          MAX_MODELS: !Ref MaxModelsPerBrand
-          MAX_TOTAL_TOKENS: "100000"
-          LAMBDA_TIMEOUT_SECONDS: "900"
-          LAMBDA_TIMEOUT_BUFFER: !Ref LambdaTimeoutBuffer
-          CATEGORY_LIMIT: !Ref CategoryLimit
-          BRAND_LIMIT: !Ref BrandLimit
-          API_CALL_DELAY: !Ref ApiCallDelay
-      Tags:
-        - Key: Application
-          Value: ProductCatalog
-        - Key: Environment
-          Value: !Ref Environment
-
-  # =============================================
-  # Yahoo Auction 资源
-  # =============================================
-
-  YahooAuctionClosedTable:
-    Type: AWS::DynamoDB::Table
-    Condition: DeployScraperCondition
-    Properties:
-      TableName: !Sub "YahooAuctionItems-${Environment}"
-      BillingMode: PAY_PER_REQUEST
-      AttributeDefinitions:
-        - AttributeName: itemID
-          AttributeType: S
-      KeySchema:
-        - AttributeName: itemID
-          KeyType: HASH
-      TimeToLiveSpecification:
-        AttributeName: ttl
-        Enabled: true
-      SSESpecification:
-        SSEEnabled: true
-      PointInTimeRecoverySpecification:
-        PointInTimeRecoveryEnabled: true
-      Tags:
-        - Key: Application
-          Value: YahooAuctionScraper
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: Type
-          Value: Closed
-
-  YahooAuctionActiveTable:
-    Type: AWS::DynamoDB::Table
-    Condition: DeployScraperCondition
-    Properties:
-      TableName: !Sub "YahooAuctionActiveItems-${Environment}"
-      BillingMode: PAY_PER_REQUEST
-      AttributeDefinitions:
-        - AttributeName: itemID
-          AttributeType: S
-      KeySchema:
-        - AttributeName: itemID
-          KeyType: HASH
-      TimeToLiveSpecification:
-        AttributeName: ttl
-        Enabled: true
-      SSESpecification:
-        SSEEnabled: true
-      PointInTimeRecoverySpecification:
-        PointInTimeRecoveryEnabled: true
-      Tags:
-        - Key: Application
-          Value: YahooAuctionScraper
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: Type
-          Value: Active
-
-  YahooAuctionScraperLogGroup:
-    Type: AWS::Logs::LogGroup
-    Condition: DeployScraperCondition
-    Properties:
-      LogGroupName: !Sub "/aws/lambda/YahooAuctionScraper-${Environment}"
-      RetentionInDays: !Ref LogRetentionDays
-
-  YahooAuctionAnalyzerLogGroup:
-    Type: AWS::Logs::LogGroup
-    Condition: DeployScraperCondition
-    Properties:
-      LogGroupName: !Sub "/aws/lambda/YahooAuctionAnalyzer-${Environment}"
-      RetentionInDays: !Ref LogRetentionDays
-
-  YahooAuctionScraperRole:
-    Type: AWS::IAM::Role
-    Condition: DeployScraperCondition
-    Properties:
-      RoleName: !Sub "YahooAuctionScraper-Role-${Environment}"
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service:
-                - lambda.amazonaws.com
-            Action:
-              - sts:AssumeRole
-      Policies:
-        - PolicyName: YahooAuctionScraperPolicy
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Sid: DynamoDBAccess
-                Effect: Allow
-                Action:
-                  - dynamodb:PutItem
-                  - dynamodb:BatchWriteItem
-                  - dynamodb:GetItem
-                  - dynamodb:Query
-                  - dynamodb:UpdateItem
-                  - dynamodb:DeleteItem
-                  - dynamodb:Scan
-                Resource:
-                  - !GetAtt YahooAuctionClosedTable.Arn
-                  - !GetAtt YahooAuctionActiveTable.Arn
-              - Sid: WriteLogs
-                Effect: Allow
-                Action:
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource:
-                  - !Sub "${YahooAuctionScraperLogGroup.Arn}:*"
-                  - !Sub "${YahooAuctionAnalyzerLogGroup.Arn}:*"
-
-  YahooAuctionAnalyzerRole:
-    Type: AWS::IAM::Role
-    Condition: DeployScraperCondition
-    Properties:
-      RoleName: !Sub "YahooAuctionAnalyzer-Role-${Environment}"
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service:
-                - lambda.amazonaws.com
-            Action:
-              - sts:AssumeRole
-      Policies:
-        - PolicyName: YahooAuctionAnalyzerPolicy
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Sid: DynamoDBFullAccess
-                Effect: Allow
-                Action:
-                  - dynamodb:PutItem
-                  - dynamodb:BatchWriteItem
-                  - dynamodb:GetItem
-                  - dynamodb:Query
-                  - dynamodb:UpdateItem
-                  - dynamodb:DeleteItem
-                  - dynamodb:Scan
-                Resource:
-                  - !GetAtt YahooAuctionClosedTable.Arn
-                  - !GetAtt YahooAuctionActiveTable.Arn
-              - Sid: ReadAllApiSecrets
-                Effect: Allow
-                Action:
-                  - secretsmanager:GetSecretValue
-                Resource:
-                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:gemini-api-key-${Environment}-*"
-                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:doubao-api-key-${Environment}-*"
-                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:openai-api-key-${Environment}-*"
-                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${SecretName}/${Environment}-*"
-              - Sid: WriteLogs
-                Effect: Allow
-                Action:
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource:
-                  - !Sub "${YahooAuctionScraperLogGroup.Arn}:*"
-                  - !Sub "${YahooAuctionAnalyzerLogGroup.Arn}:*"
-
-  YahooAuctionScraper:
-    Type: AWS::Lambda::Function
-    Condition: DeployScraperCondition
-    DependsOn:
-      - YahooAuctionScraperLogGroup
-      - YahooAuctionScraperRole
-    Properties:
-      FunctionName: !Sub "YahooAuctionScraper-${Environment}"
-      Description: "Yahoo Auction closed & active search scraper（支持价格过滤）"
-      Runtime: python3.12
-      Architectures:
-        - arm64
-      Handler: yahoo_auction_scraper.lambda_handler
-      Timeout: 300
-      MemorySize: 512
-      Role: !GetAtt YahooAuctionScraperRole.Arn
-      Code:
-        S3Bucket: !Ref LambdaCodeS3Bucket
-        S3Key: !Ref LambdaCodeS3Key
-      Environment:
-        Variables:
-          TABLE_NAME_CLOSED: !Sub "YahooAuctionItems-${Environment}"
-          TABLE_NAME_ACTIVE: !Sub "YahooAuctionActiveItems-${Environment}"
-          MAX_PAGES: !Ref YahooAuctionMaxPages
-          REQUEST_TIMEOUT: !Ref YahooAuctionRequestTimeout
-          DEBUG_LOG_HTML: !Ref YahooAuctionDebugLogHtml
-          ITEMS_PER_PAGE: !Ref YahooAuctionItemsPerPage
-          AUCTION_PARAM_NEW: !Ref AuctionParamNew
-          AUCTION_PARAM_OFFER: !Ref AuctionParamOffer
-          AUCTION_PARAM_SHIPPING: !Ref AuctionParamShipping
-          AUCTION_PARAM_ISTATUS: !Ref AuctionParamIstatus
-          AUCTION_PARAM_ABATCH: !Ref AuctionParamAbatch
-          AUCTION_PARAM_LOC_CD: !Ref AuctionParamLocCd
-          AUCTION_PARAM_SELECT: !Ref AuctionParamSelect
-          AUCTION_PARAM_SPEC: !Ref AuctionParamSpec
-          AUCTION_PARAM_PRICE_TYPE: !Ref AuctionParamPriceType
-          AUCTION_PARAM_MIN: !Ref AuctionParamMin
-          AUCTION_PARAM_MAX: !Ref AuctionParamMax
-          AUCTION_PARAM_CAR_INSPECTION: !Ref AuctionParamCarInspection
-          AUCTION_PARAM_FIXED: !Ref AuctionParamFixed
-          AUCTION_PARAM_AUCMINPRICE: !Ref AuctionParamAucminprice
-          AUCTION_PARAM_AUCMAXPRICE: !Ref AuctionParamAucmaxprice
-          AUCTION_PARAM_AUCMIN_BIDORBUY_PRICE: !Ref AuctionParamAucminBidorbuyPrice
-          AUCTION_PARAM_AUCMAX_BIDORBUY_PRICE: !Ref AuctionParamAucmaxBidorbuyPrice
-          AUCTION_PARAM_LC1: !Ref AuctionParamLc1
-          AUCTION_PARAM_JPYPAYMENT: !Ref AuctionParamJpypayment
-          AUCTION_PARAM_POINT: !Ref AuctionParamPoint
-          AUCTION_PARAM_THUMB: !Ref AuctionParamThumb
-          AUCTION_PARAM_WRAPPINGICON: !Ref AuctionParamWrappingicon
-          AUCTION_PARAM_PRIVACY_DELIVERY: !Ref AuctionParamPrivacyDelivery
-          AUCTION_PARAM_GIFT_ICON: !Ref AuctionParamGiftIcon
-          AUCTION_PARAM_CHARITY: !Ref AuctionParamCharity
-          AUCTION_PARAM_MODE: !Ref AuctionParamMode
-          AUCTION_PARAM_N: !Ref AuctionParamN
-          AUCTION_PARAM_S1: !Ref AuctionParamS1
-          AUCTION_PARAM_O1: !Ref AuctionParamO1
-          AUCTION_PARAM_MAX_SPRICE: !Ref AuctionParamMaxSprice
-          AUCTION_PARAM_TYPE: !Ref AuctionParamType
-      Tags:
-        - Key: Application
-          Value: YahooAuctionScraper
-        - Key: Environment
-          Value: !Ref Environment
-
-  AuctionAnalyzerFunction:
-    Type: AWS::Lambda::Function
-    Condition: DeployScraperCondition
-    DependsOn:
-      - YahooAuctionAnalyzerLogGroup
-      - YahooAuctionAnalyzerRole
-    Properties:
-      FunctionName: !Sub "YahooAuctionAnalyzer-${Environment}"
-      Description: "Yahoo Auction 商品分析工作流（先closed后active，多AI模式切换）"
-      Runtime: python3.12
-      Architectures:
-        - arm64
-      Handler: auction_analyzer.lambda_handler
-      Timeout: 900
-      MemorySize: 1024
-      Role: !GetAtt YahooAuctionAnalyzerRole.Arn
-      Code:
-        S3Bucket: !Ref LambdaCodeS3Bucket
-        S3Key: !Ref LambdaCodeS3Key
-      Environment:
-        Variables:
-          # ============ 数据库表名 ============
-          TABLE_NAME_ACTIVE: !Sub "YahooAuctionActiveItems-${Environment}"
-          TABLE_NAME_CLOSED: !Sub "YahooAuctionItems-${Environment}"
-          PRODUCT_TABLE_NAME: !Sub "ProductCatalog-${Environment}"
-          ENVIRONMENT: !Ref Environment
-
-          # ============ AI 模式配置 ============
-          AI_MODE: !Ref AiMode
-          GEMINI_API_KEY: !Ref GeminiApiKey
-          GEMINI_MODEL: !Ref GeminiModel
-          GEMINI_URL: !Ref GeminiUrl
-          GEMINI_TIMEOUT: !Ref GeminiTimeout
-          GEMINI_MAX_TOKENS: !Ref GeminiMaxTokens
-          DOUBAO_API_KEY: !Ref DoubaoApiKey
-          DOUBAO_MODEL: !Ref DoubaoModel
-          DOUBAO_URL: !Ref DoubaoUrl
-          DOUBAO_TIMEOUT: !Ref DoubaoTimeout
-          DOUBAO_MAX_TOKENS: !Ref DoubaoMaxTokens
-          OPENAI_API_KEY: !Ref OpenaiApiKey
-          OPENAI_MODEL: !Ref OpenaiModel
-          OPENAI_URL: !Ref OpenaiUrl
-          OPENAI_TIMEOUT: !Ref OpenaiTimeout
-          OPENAI_MAX_TOKENS: !Ref OpenaiMaxTokens
-          AI_FAILOVER_COOLDOWN: !Ref AiFailoverCooldown
-
-          # ============ 搜索和解析配置 ============
-          DEFAULT_SEARCH_COUNT: !Ref DefaultSearchCount
-          DEFAULT_ACTIVE_COUNT: !Ref MaxActiveItems
-          DEFAULT_CLOSED_COUNT: !Ref MaxClosedPerModel
-          MAX_ACTIVE_ITEMS: !Ref MaxActiveItems
-          MAX_CLOSED_ITEMS: !Ref MaxClosedPerModel
-          REQUEST_INTERVAL: !Ref RequestInterval
-          INCLUDE_PAYPAY: "false"
-          MODEL_PARSE_BATCH_SIZE: !Ref ModelParseBatchSize
-          CLOSED_PARSE_BATCH_SIZE: !Ref ClosedParseBatchSize
-
-          # ============ Token和超时控制 ============
-          MAX_TOTAL_TOKENS: !Ref MaxTotalTokens
-          LAMBDA_TIMEOUT_SECONDS: "840"
-          LAMBDA_TIMEOUT_BUFFER: !Ref LambdaTimeoutBuffer
-
-          # ============ 价格分析参数 ============
-          EXPECTED_SELLING_FEE_RATE: !Ref ExpectedSellingFeeRate
-          DEFAULT_SHIPPING_COST: !Ref DefaultShippingCost
-          DEFAULT_REPAIR_RESERVE_RATE: !Ref DefaultRepairReserveRate
-          MIN_COMPARABLE_COUNT: !Ref MinComparableCount
-          MAX_PRICE_DEVIATION: !Ref MaxPriceDeviation
-          RISK_RESERVE_RATE: !Ref RiskReserveRate
-
-          # ============ 新增：Active价格过滤和收益阈值 ============
-          ACTIVE_PRICE_MIN_RATIO: !Ref ActivePriceMinRatio
-          BUY_MARGIN_THRESHOLD: !Ref BuyMarginThreshold
-          REVIEW_MARGIN_THRESHOLD: !Ref ReviewMarginThreshold
-          HIGH_CONFIDENCE_COMPARABLE_COUNT: !Ref HighConfidenceComparableCount
-          MEDIUM_CONFIDENCE_COMPARABLE_COUNT: !Ref MediumConfidenceComparableCount
-
-          # ============ AI请求配置 ============
-          AI_REQUEST_TIMEOUT: !Ref AiRequestTimeout
-          AI_MAX_RETRIES: !Ref AiMaxRetries
-
-      Tags:
-        - Key: Application
-          Value: YahooAuctionAnalyzer
-        - Key: Environment
-          Value: !Ref Environment
-
-  # ============================================
-  # 产品目录定期扫描器
-  # ============================================
-
-  CatalogScannerLogGroup:
-    Type: AWS::Logs::LogGroup
-    Condition: DeployCatalogScannerCondition
-    Properties:
-      LogGroupName: !Sub "/aws/lambda/CatalogScanner-${Environment}"
-      RetentionInDays: !Ref LogRetentionDays
-
-  CatalogScannerRole:
-    Type: AWS::IAM::Role
-    Condition: DeployCatalogScannerCondition
-    Properties:
-      RoleName: !Sub "CatalogScanner-Role-${Environment}"
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service:
-                - lambda.amazonaws.com
-            Action:
-              - sts:AssumeRole
-      Policies:
-        - PolicyName: CatalogScannerPolicy
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Sid: DynamoDBAccess
-                Effect: Allow
-                Action:
-                  - dynamodb:GetItem
-                  - dynamodb:Query
-                  - dynamodb:Scan
-                  - dynamodb:UpdateItem
-                Resource:
-                  - !GetAtt ProductCatalogTable.Arn
-                  - !Sub "${ProductCatalogTable.Arn}/index/*"
-              - Sid: InvokeAnalyzerLambda
-                Effect: Allow
-                Action:
-                  - lambda:InvokeFunction
-                Resource: !GetAtt AuctionAnalyzerFunction.Arn
-              - Sid: WriteLogs
-                Effect: Allow
-                Action:
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource: !Sub "${CatalogScannerLogGroup.Arn}:*"
-
-  CatalogScannerFunction:
-    Type: AWS::Lambda::Function
-    Condition: DeployCatalogScannerCondition
-    DependsOn:
-      - CatalogScannerLogGroup
-      - CatalogScannerRole
-    Properties:
-      FunctionName: !Sub "CatalogScanner-${Environment}"
-      Description: "定期扫描产品目录，将未分析的型号发送到分析器"
-      Runtime: python3.12
-      Architectures:
-        - arm64
-      Handler: catalog_scanner.lambda_handler
-      Timeout: 900
-      MemorySize: 256
-      Role: !GetAtt CatalogScannerRole.Arn
-      Code:
-        S3Bucket: !Ref LambdaCodeS3Bucket
-        S3Key: !Ref LambdaCodeS3Key
-      Environment:
-        Variables:
-          TABLE_NAME: !Ref ProductCatalogTable
-          ANALYZER_FUNCTION_NAME: !Ref AuctionAnalyzerFunction
-          SCAN_INTERVAL_MINUTES: !Ref CatalogScannerIntervalMinutes
-          MAX_MODELS_PER_RUN: !Ref CatalogScannerMaxModels
-          MAX_ACTIVE_COUNT: !Ref MaxActiveItems
-          MAX_CLOSED_COUNT: !Ref MaxClosedPerModel
-          ENABLE_SCHEDULED_SCAN: !Ref CatalogScannerEnabled
-          DISPATCH_INTERVAL_SECONDS: "10"
-          DISPATCH_JITTER_SECONDS: "5"
-          STARTUP_JITTER_SECONDS: "15"
-          BATCH_SIZE: "1"
-          BATCH_INTERVAL_SECONDS: "0"
-          TODAY_TAG_KEY: "last_scanned_date"
-          DATA_SOURCE: "AI_DISCOVERY"
-      Tags:
-        - Key: Application
-          Value: CatalogScanner
-        - Key: Environment
-          Value: !Ref Environment
-
-  CatalogScannerScheduleRule:
-    Type: AWS::Events::Rule
-    Condition: DeployCatalogScannerCondition
-    Properties:
-      Name: !Sub "CatalogScanner-Schedule-${Environment}"
-      Description: "定期触发目录扫描器"
-      ScheduleExpression: !Sub "rate(${CatalogScannerIntervalMinutes} minutes)"
-      State: !If
-        - CatalogScannerEnabledCondition
-        - ENABLED
-        - DISABLED
-      Targets:
-        - Arn: !GetAtt CatalogScannerFunction.Arn
-          Id: "CatalogScannerTarget"
-          Input: !Sub '{"source":"aws.events","max_models":${CatalogScannerMaxModels}}'
-
-  CatalogScannerInvokePermission:
-    Type: AWS::Lambda::Permission
-    Condition: DeployCatalogScannerCondition
-    Properties:
-      Action: lambda:InvokeFunction
-      FunctionName: !Ref CatalogScannerFunction
-      Principal: events.amazonaws.com
-      SourceArn: !GetAtt CatalogScannerScheduleRule.Arn
-
-Outputs:
-  LambdaCodeBucketName:
-    Description: S3 存储 Lambda 代码的存储桶名称
-    Value: !Ref LambdaCodeS3Bucket
-
-  LambdaCodeObjectKey:
-    Description: S3 中 Lambda 代码对象键
-    Value: !Ref LambdaCodeS3Key
-
-  ProductCatalogTableName:
-    Description: DynamoDB 产品目录表名称
-    Condition: DeployMainAppCondition
-    Value: !Ref ProductCatalogTable
-
-  ProductCatalogTableArn:
-    Description: DynamoDB 产品目录表 ARN
-    Condition: DeployMainAppCondition
-    Value: !GetAtt ProductCatalogTable.Arn
-
-  DiscoveryLambdaName:
-    Description: Lambda 发现函数名称
-    Condition: DeployMainAppCondition
-    Value: !Ref ProductCatalogDiscovery
-
-  DiscoveryLambdaArn:
-    Description: Lambda 发现函数 ARN
-    Condition: DeployMainAppCondition
-    Value: !GetAtt ProductCatalogDiscovery.Arn
-
-  YahooAuctionClosedTableName:
-    Description: Yahoo Auction closed items DynamoDB table name
-    Condition: DeployScraperCondition
-    Value: !Ref YahooAuctionClosedTable
-
-  YahooAuctionClosedTableArn:
-    Description: Yahoo Auction closed items DynamoDB table ARN
-    Condition: DeployScraperCondition
-    Value: !GetAtt YahooAuctionClosedTable.Arn
-
-  YahooAuctionActiveTableName:
-    Description: Yahoo Auction active items DynamoDB table name
-    Condition: DeployScraperCondition
-    Value: !Ref YahooAuctionActiveTable
-
-  YahooAuctionActiveTableArn:
-    Description: Yahoo Auction active items DynamoDB table ARN
-    Condition: DeployScraperCondition
-    Value: !GetAtt YahooAuctionActiveTable.Arn
-
-  YahooAuctionScraperFunctionName:
-    Description: Yahoo Auction scraper Lambda function name
-    Condition: DeployScraperCondition
-    Value: !Ref YahooAuctionScraper
-
-  YahooAuctionScraperFunctionArn:
-    Description: Yahoo Auction scraper Lambda function ARN
-    Condition: DeployScraperCondition
-    Value: !GetAtt YahooAuctionScraper.Arn
-
-  AuctionAnalyzerFunctionName:
-    Description: Yahoo Auction analyzer Lambda function name
-    Condition: DeployScraperCondition
-    Value: !Ref AuctionAnalyzerFunction
-
-  AuctionAnalyzerFunctionArn:
-    Description: Yahoo Auction analyzer Lambda function ARN
-    Condition: DeployScraperCondition
-    Value: !GetAtt AuctionAnalyzerFunction.Arn
-
-  CatalogScannerFunctionName:
-    Description: 目录扫描器 Lambda 函数名称
-    Condition: DeployCatalogScannerCondition
-    Value: !Ref CatalogScannerFunction
-
-  CatalogScannerFunctionArn:
-    Description: 目录扫描器 Lambda 函数 ARN
-    Condition: DeployCatalogScannerCondition
-    Value: !GetAtt CatalogScannerFunction.Arn
-
-  CatalogScannerScheduleRuleName:
-    Description: 定时触发规则名称
-    Condition: DeployCatalogScannerCondition
-    Value: !Ref CatalogScannerScheduleRule
+import os
+import re
+import json
+import time
+import logging
+from datetime import datetime, timezone, timedelta
+from urllib.parse import urlencode, quote
+
+import boto3
+import requests
+from bs4 import BeautifulSoup
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# ============ 环境变量 ============
+CLOSED_BASE_URL = os.getenv("CLOSED_BASE_URL", "https://auctions.yahoo.co.jp/closedsearch/closedsearch")
+ACTIVE_BASE_URL = os.getenv("ACTIVE_BASE_URL", "https://auctions.yahoo.co.jp/search/search")
+DEFAULT_PARAMS_CLOSED = os.getenv("DEFAULT_PARAMS_CLOSED", "is_postage_mode=1&dest_pref_code=23&n=60&s1=end&o1=d&mode=3&isdr=0")
+DEFAULT_PARAMS_ACTIVE = os.getenv("DEFAULT_PARAMS_ACTIVE", "is_postage_mode=1&dest_pref_code=23&n=60&s1=end&o1=a&mode=3&isdr=0")
+MAX_PAGES = int(os.getenv("MAX_PAGES", "1"))
+TABLE_NAME_CLOSED = os.getenv("TABLE_NAME_CLOSED", "YahooAuctionItems")
+TABLE_NAME_ACTIVE = os.getenv("TABLE_NAME_ACTIVE", "YahooAuctionActiveItems")
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
+USER_AGENT = os.getenv("USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+DEBUG_LOG_HTML = os.getenv("DEBUG_LOG_HTML", "false").lower() == "true"
+ITEMS_PER_PAGE = int(os.getenv("ITEMS_PER_PAGE", "50"))
+INCLUDE_PAYPAY = os.getenv("INCLUDE_PAYPAY", "true").lower() == "true"
+
+# ============ 详情爬取控制 ============
+ENABLE_DETAIL_SCRAPE_ON_SEARCH = os.getenv("ENABLE_DETAIL_SCRAPE_ON_SEARCH", "true").lower() == "true"
+DETAIL_REQUEST_INTERVAL = float(os.getenv("DETAIL_REQUEST_INTERVAL", "1.0"))
+DETAIL_DESCRIPTION_MAX_CHARS = int(os.getenv("DETAIL_DESCRIPTION_MAX_CHARS", "3000"))
+AUCTION_DETAIL_BASE = os.getenv("AUCTION_DETAIL_BASE", "https://auctions.yahoo.co.jp/jp/auction")
+
+# ============ 过滤词库配置 ============
+DEFAULT_EXCLUDE_KEYWORDS = os.getenv("DEFAULT_EXCLUDE_KEYWORDS",
+    "液晶 LCD OLED パネル 画面 タッチパネル フロントパネル バックパネル "
+    "バッテリー 交換用 修理用 補修用 部品 パーツ "
+    "ケーブル ライトニングケーブル Lightning USB-C "
+    "充電器 急速充電 アダプター ACアダプター モバイルバッテリー "
+    "ワイヤレス充電 MagSafe "
+    "ケース カバー 手帳型 フィルム ガラスフィルム 保護フィルム "
+    "液晶フィルム レンズカバー ストラップ ホルダー スタンド "
+    "バンパー リング "
+    "保護 耐衝撃 防水ケース 防塵 ガード "
+    "ジャンク部品 空箱 箱のみ 説明書 付属品のみ "
+    "ケーブルのみ ケースのみ フィルムのみ")
+
+DEFAULT_INCLUDE_KEYWORDS = os.getenv("DEFAULT_INCLUDE_KEYWORDS", "")
+USE_DEFAULT_EXCLUDE = os.getenv("USE_DEFAULT_EXCLUDE", "true").lower() == "true"
+
+# ============ 运输相关关键词 ============
+SHIPPING_RELATED_KEYWORDS = [
+    "送料", "発送", "配送", "運送", "宅配便", "郵便",
+    "配送方法", "配送業者", "発送方法", "発送準備",
+    "同梱", "まとめて購入", "まとめて取引",
+    "お取引について", "お取引の取消し",
+    "支払い金額", "お支払い", "お支払い金額", "振込手数料",
+    "購入価格+消費税+送料", "送料元払い", "着払い",
+    "佐川急便", "ヤマト運輸", "日本郵便", "ゆうパック",
+    "長期不在", "再配達", "返却",
+    "ご注文のキャンセル", "キャンセル対応",
+    "注文確認メール", "ご注文前",
+    "決済情報", "決済不可能",
+    "弊社都合", "受け取り拒否",
+    "ノークレーム", "ノーリターン",
+    "ご注文点数", "注文から",
+]
+
+# 日本47都道府県列表
+PREFECTURES_LIST = [
+    "北海道", "青森県", "岩手県", "宮城県", "秋田県", "山形県", "福島県",
+    "茨城県", "栃木県", "群馬県", "埼玉県", "千葉県", "東京都", "神奈川県",
+    "新潟県", "富山県", "石川県", "福井県", "山梨県", "長野県", "岐阜県",
+    "静岡県", "愛知県", "三重県", "滋賀県", "京都府", "大阪府", "兵庫県",
+    "奈良県", "和歌山県", "鳥取県", "島根県", "岡山県", "広島県", "山口県",
+    "徳島県", "香川県", "愛媛県", "高知県", "福岡県", "佐賀県", "長崎県",
+    "熊本県", "大分県", "宮崎県", "鹿児島県", "沖縄県"
+]
+
+dynamodb = boto3.resource("dynamodb")
+
+
+def get_target_table(search_type: str):
+    """根据搜索类型返回对应的 DynamoDB 表"""
+    if search_type == "active":
+        return dynamodb.Table(TABLE_NAME_ACTIVE)
+    return dynamodb.Table(TABLE_NAME_CLOSED)
+
+
+def get_auction_params():
+    """读取所有以 AUCTION_PARAM_ 开头的环境变量"""
+    params = {}
+    prefix = "AUCTION_PARAM_"
+    for key, val in os.environ.items():
+        if key.startswith(prefix):
+            param_name = key[len(prefix):].lower()
+            if val:
+                params[param_name] = val
+    return params
+
+
+def get_filter_keywords(event):
+    """从事件中获取过滤关键词"""
+    exclude_keywords = event.get("exclude_keywords", "")
+    if not exclude_keywords and USE_DEFAULT_EXCLUDE:
+        exclude_keywords = os.getenv("CUSTOM_EXCLUDE_KEYWORDS", DEFAULT_EXCLUDE_KEYWORDS)
+    
+    include_keywords = event.get("include_keywords", "")
+    if not include_keywords:
+        include_keywords = DEFAULT_INCLUDE_KEYWORDS
+    
+    if exclude_keywords:
+        exclude_keywords = " ".join(exclude_keywords.split())
+    if include_keywords:
+        include_keywords = " ".join(include_keywords.split())
+    
+    return exclude_keywords, include_keywords
+
+
+def build_url(keyword, page, search_type, exclude_keywords="", include_keywords="", min_price=None):
+    """构建请求 URL"""
+    params = {}
+    
+    if search_type == "active":
+        default_params_str = DEFAULT_PARAMS_ACTIVE
+    else:
+        default_params_str = DEFAULT_PARAMS_CLOSED
+    
+    for p in default_params_str.replace("&amp;", "&").split("&"):
+        if "=" in p:
+            k, v = p.split("=", 1)
+            params[k] = v
+    
+    params.update(get_auction_params())
+    params["va"] = keyword
+    
+    if include_keywords:
+        params["vo"] = include_keywords
+    
+    if exclude_keywords:
+        params["ve"] = exclude_keywords
+    
+    if min_price is not None and min_price > 0:
+        params["min"] = str(min_price)
+        params["price_type"] = "currentprice"
+    
+    params["b"] = str((page - 1) * ITEMS_PER_PAGE + 1)
+    
+    base_url = ACTIVE_BASE_URL if search_type == "active" else CLOSED_BASE_URL
+    return f"{base_url}?{urlencode(params, quote_via=quote)}"
+
+
+# ======================================
+# 详情页URL构建
+# ======================================
+
+def build_detail_url(item_id):
+    """构建商品详情页URL"""
+    item_id = str(item_id).strip()
+    base = AUCTION_DETAIL_BASE.rstrip('/')
+    return f"{base}/{item_id}/description"
+
+
+# ======================================
+# 详情爬虫函数
+# ======================================
+
+def clean_description(text):
+    """清理商品描述，移除运输相关内容，保留影响价格的关键信息"""
+    if not text:
+        return ""
+
+    soup = BeautifulSoup(text, "html.parser")
+    plain_text = soup.get_text(separator="\n", strip=True)
+
+    lines = plain_text.split("\n")
+    cleaned_lines = []
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        if line in ("&nbsp;", "nbsp;", "&amp;nbsp;", "&amp;nbsp"):
+            continue
+
+        if len(line) < 2 and not re.search(r"[A-Za-z0-9ぁ-んァ-ン一-龥]", line):
+            continue
+
+        if any(keyword in line for keyword in SHIPPING_RELATED_KEYWORDS):
+            continue
+
+        cleaned_lines.append(line)
+
+    cleaned = "\n".join(cleaned_lines)
+
+    # 去掉装饰符号，保留内容
+    cleaned = re.sub(r"[【】★■◆◇●○◎]", " ", cleaned)
+    # 删除分隔线
+    cleaned = re.sub(r"[-_=ー－]{3,}", " ", cleaned)
+    # 删除多余空格和空行
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+
+    return cleaned.strip()
+
+
+def scrape_item_detail(item_id):
+    """
+    爬取单个商品的详情描述
+    
+    返回:
+        dict or None: {
+            "itemId", "title", "description", "url", "scrapedAt"
+        }
+    """
+    url = build_detail_url(item_id)
+    logger.info(f"Scraping detail for item {item_id}")
+    
+    try:
+        resp = requests.get(
+            url,
+            timeout=REQUEST_TIMEOUT,
+            headers={"User-Agent": USER_AGENT}
+        )
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"Detail request failed for {item_id}: {e}")
+        return None
+    
+    soup = BeautifulSoup(resp.text, "html.parser")
+    
+    # 提取标题
+    title = None
+    
+    # 从 JSON-LD 提取
+    script_tag = soup.find("script", type="application/ld+json")
+    if script_tag:
+        try:
+            ld_json = json.loads(script_tag.string)
+            if isinstance(ld_json, dict):
+                title = ld_json.get("name", "")
+        except json.JSONDecodeError:
+            pass
+    
+    # 从 title 标签提取
+    if not title:
+        title_tag = soup.find("title")
+        if title_tag:
+            title_text = title_tag.get_text(strip=True)
+            title = re.sub(r'^Yahoo!オークション\s*-\s*', '', title_text)
+    
+    if not title:
+        title = "Unknown Title"
+    
+    # 提取描述
+    description = ""
+    
+    # 从 __NEXT_DATA__ JSON 提取
+    next_data = soup.find("script", id="__NEXT_DATA__")
+    if next_data:
+        try:
+            data = json.loads(next_data.string)
+            
+            def find_desc(obj, depth=0):
+                if depth > 10:
+                    return None
+                if isinstance(obj, dict):
+                    if "descriptionHtml" in obj and obj["descriptionHtml"]:
+                        return obj["descriptionHtml"]
+                    for v in obj.values():
+                        result = find_desc(v, depth + 1)
+                        if result:
+                            return result
+                elif isinstance(obj, list):
+                    for item in obj:
+                        result = find_desc(item, depth + 1)
+                        if result:
+                            return result
+                return None
+            
+            raw_desc = find_desc(data) or ""
+            if raw_desc:
+                description = clean_description(raw_desc)
+        except (json.JSONDecodeError, KeyError):
+            pass
+    
+    # 兜底：从 template 或 body 提取
+    if not description:
+        template_tag = soup.find("template", attrs={"shadowrootmode": "open"})
+        target = template_tag or soup.find("body")
+        if target:
+            raw_text = target.get_text(separator="\n", strip=True)
+            description = clean_description(raw_text)[:DETAIL_DESCRIPTION_MAX_CHARS]
+    
+    result = {
+        "itemId": item_id,
+        "title": title,
+        "description": description[:DETAIL_DESCRIPTION_MAX_CHARS] if description else "",
+        "url": url,
+        "scrapedAt": datetime.now(timezone.utc).isoformat()
+    }
+    
+    logger.info(f"Detail scraped for {item_id}: desc_len={len(description) if description else 0}")
+    return result
+
+
+def enrich_item_with_detail(item):
+    """
+    给列表页解析出的 item 补充详情描述。
+    搜索 closed / active 时直接调用。
+    """
+    item_id = str(item.get("itemId", "")).strip()
+    if not item_id:
+        return item
+
+    detail = scrape_item_detail(item_id)
+
+    if not detail:
+        item["detailScrapeStatus"] = "FAILED"
+        item["detailScrapeError"] = "scrape_item_detail returned None"
+        item["detailScrapedAt"] = datetime.now(timezone.utc).isoformat()
+        item["detailDescription"] = ""
+        item["detailTitle"] = ""
+        item["detailUrl"] = build_detail_url(item_id)
+        item["detailDescriptionLength"] = 0
+        return item
+
+    description = detail.get("description", "") or ""
+
+    item["detailDescription"] = description[:DETAIL_DESCRIPTION_MAX_CHARS]
+    item["detailTitle"] = detail.get("title", "")
+    item["detailUrl"] = detail.get("url", "")
+    item["detailScrapedAt"] = detail.get("scrapedAt", datetime.now(timezone.utc).isoformat())
+    item["detailDescriptionLength"] = len(description)
+    item["detailScrapeStatus"] = "COMPLETED" if description else "EMPTY"
+    item["detailScrapeError"] = ""
+
+    return item
+
+
+def scrape_multiple_details(item_ids, save_to_db=False, search_type="active"):
+    """
+    批量爬取多个商品详情
+    
+    参数:
+        item_ids: 商品ID列表
+        save_to_db: 是否保存到 DynamoDB
+        search_type: active / closed
+    """
+    results = []
+    table = get_target_table(search_type) if save_to_db else None
+    
+    for index, item_id in enumerate(item_ids):
+        detail = scrape_item_detail(item_id)
+
+        if detail:
+            results.append(detail)
+
+            if save_to_db and table:
+                try:
+                    desc = detail.get("description", "")
+                    table.update_item(
+                        Key={"itemID": item_id},
+                        UpdateExpression="""
+                            SET detailDescription = :desc,
+                                detailTitle = :title,
+                                detailUrl = :url,
+                                detailScrapedAt = :now,
+                                detailDescriptionLength = :length,
+                                detailScrapeStatus = :status
+                        """,
+                        ExpressionAttributeValues={
+                            ":desc": desc[:DETAIL_DESCRIPTION_MAX_CHARS],
+                            ":title": detail.get("title", ""),
+                            ":url": detail.get("url", ""),
+                            ":now": detail.get("scrapedAt", datetime.now(timezone.utc).isoformat()),
+                            ":length": len(desc),
+                            ":status": "COMPLETED" if desc else "EMPTY",
+                        }
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to save detail for {item_id}: {e}")
+        
+        if index < len(item_ids) - 1:
+            time.sleep(DETAIL_REQUEST_INTERVAL)
+    
+    return results
+
+
+# ======================================
+# Lambda Handler
+# ======================================
+
+def lambda_handler(event, context):
+    """
+    主入口函数
+    
+    支持的模式:
+    1. search: 搜索商品列表（含详情抓取）
+    2. detail: 爬取单个商品详情
+    3. batch_detail: 批量爬取商品详情
+    4. scrape_and_parse: 搜索 + 详情爬取一体化
+    """
+    action = event.get("action", "search")
+    
+    # ========== 模式1：搜索商品（含详情） ==========
+    if action == "search":
+        keyword = event.get("keyword")
+        if not keyword:
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"error": "Missing keyword"}, ensure_ascii=False)
+            }
+        
+        search_type = event.get("search_type", "closed")
+        include_paypay = event.get("include_paypay", INCLUDE_PAYPAY)
+        min_price = event.get("min_price")
+        if min_price is not None:
+            try:
+                min_price = int(min_price)
+            except (ValueError, TypeError):
+                min_price = None
+        
+        exclude_keywords, include_keywords = get_filter_keywords(event)
+        
+        logger.info(f"Scraping for keyword: '{keyword}', type: '{search_type}'")
+        
+        items = scrape_auctions(keyword, search_type, include_paypay,
+                                exclude_keywords, include_keywords, min_price)
+        
+        if not items:
+            return {
+                "statusCode": 200,
+                "body": json.dumps({
+                    "scraped": 0,
+                    "saved": 0,
+                    "type": search_type,
+                    "min_price_applied": min_price
+                }, ensure_ascii=False)
+            }
+        
+        table = get_target_table(search_type)
+        saved = save_items(items, table)
+        
+        # 统计详情抓取情况
+        detail_stats = {
+            "total": len(items),
+            "completed": sum(1 for i in items if i.get("detailScrapeStatus") == "COMPLETED"),
+            "empty": sum(1 for i in items if i.get("detailScrapeStatus") == "EMPTY"),
+            "failed": sum(1 for i in items if i.get("detailScrapeStatus") == "FAILED"),
+            "not_scraped": sum(1 for i in items if i.get("detailScrapeStatus") in (None, "", "NOT_SCRAPED")),
+        }
+        
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "scraped": len(items),
+                "saved": saved,
+                "type": search_type,
+                "min_price_applied": min_price,
+                "detail_stats": detail_stats,
+                "filters_applied": {
+                    "exclude_keywords": exclude_keywords if exclude_keywords else None,
+                    "include_keywords": include_keywords if include_keywords else None
+                }
+            }, ensure_ascii=False)
+        }
+    
+    # ========== 模式2：爬取单个商品详情 ==========
+    elif action == "detail":
+        item_id = event.get("item_id") or event.get("itemId") or event.get("auctionId")
+        if not item_id:
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"error": "Missing item_id"}, ensure_ascii=False)
+            }
+        
+        detail = scrape_item_detail(item_id)
+        if not detail:
+            return {
+                "statusCode": 404,
+                "body": json.dumps({"error": f"Failed to scrape detail for {item_id}"}, ensure_ascii=False)
+            }
+        
+        # 可选保存到DB
+        if event.get("save_to_db"):
+            table = get_target_table(event.get("search_type", "active"))
+            try:
+                table.update_item(
+                    Key={"itemID": item_id},
+                    UpdateExpression="""
+                        SET detailDescription = :desc,
+                            detailTitle = :title,
+                            detailUrl = :url,
+                            detailScrapedAt = :now,
+                            detailDescriptionLength = :len,
+                            detailScrapeStatus = :status
+                    """,
+                    ExpressionAttributeValues={
+                        ":desc": detail["description"],
+                        ":title": detail["title"],
+                        ":url": detail["url"],
+                        ":now": detail["scrapedAt"],
+                        ":len": len(detail["description"]),
+                        ":status": "COMPLETED" if detail["description"] else "EMPTY"
+                    }
+                )
+            except Exception as e:
+                logger.error(f"Failed to save detail: {e}")
+        
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "itemId": detail["itemId"],
+                "title": detail["title"],
+                "description": detail["description"],
+                "url": detail["url"],
+                "scrapedAt": detail["scrapedAt"]
+            }, ensure_ascii=False)
+        }
+    
+    # ========== 模式3：批量爬取商品详情 ==========
+    elif action == "batch_detail":
+        item_ids = event.get("item_ids") or event.get("itemIds") or []
+        if not item_ids:
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"error": "Missing item_ids"}, ensure_ascii=False)
+            }
+        
+        if isinstance(item_ids, str):
+            item_ids = [i.strip() for i in item_ids.split(",") if i.strip()]
+        
+        save_to_db = event.get("save_to_db", True)
+        search_type = event.get("search_type", "active")
+        
+        results = scrape_multiple_details(item_ids, save_to_db=save_to_db, search_type=search_type)
+        
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "total": len(item_ids),
+                "scraped": len(results),
+                "results": results[:10],  # 只返回前10条
+                "item_ids": item_ids[:10]
+            }, ensure_ascii=False, default=str)
+        }
+    
+    # ========== 模式4：搜索 + 详情爬取一体化 ==========
+    elif action == "scrape_and_parse":
+        keyword = event.get("keyword")
+        if not keyword:
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"error": "Missing keyword"}, ensure_ascii=False)
+            }
+        
+        search_type = event.get("search_type", "closed")
+        include_paypay = event.get("include_paypay", INCLUDE_PAYPAY)
+        exclude_keywords, include_keywords = get_filter_keywords(event)
+        
+        items = scrape_auctions(keyword, search_type, include_paypay,
+                                exclude_keywords, include_keywords, event.get("min_price"))
+        
+        if not items:
+            return {
+                "statusCode": 200,
+                "body": json.dumps({
+                    "search": {"scraped": 0, "saved": 0},
+                    "details": {"total": 0, "success": 0},
+                    "type": search_type
+                }, ensure_ascii=False)
+            }
+        
+        table = get_target_table(search_type)
+        saved = save_items(items, table)
+        
+        detail_stats = {
+            "completed": sum(1 for i in items if i.get("detailScrapeStatus") == "COMPLETED"),
+            "empty": sum(1 for i in items if i.get("detailScrapeStatus") == "EMPTY"),
+            "failed": sum(1 for i in items if i.get("detailScrapeStatus") == "FAILED"),
+        }
+        
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "search": {"scraped": len(items), "saved": saved},
+                "details": {
+                    "total": len(items),
+                    "success": detail_stats["completed"],
+                    "empty": detail_stats["empty"],
+                    "failed": detail_stats["failed"],
+                },
+                "type": search_type,
+                "item_ids": [item["itemId"] for item in items[:20]]
+            }, ensure_ascii=False, default=str)
+        }
+    
+    else:
+        return {
+            "statusCode": 400,
+            "body": json.dumps({"error": f"Unknown action: {action}"}, ensure_ascii=False)
+        }
+
+
+# ======================================
+# 搜索和解析函数
+# ======================================
+
+def scrape_auctions(keyword, search_type, include_paypay=True,
+                    exclude_keywords="", include_keywords="", min_price=None):
+    """抓取所有页面，并在解析列表时同步抓取详情"""
+    if not exclude_keywords and USE_DEFAULT_EXCLUDE:
+        exclude_keywords = os.getenv("CUSTOM_EXCLUDE_KEYWORDS", DEFAULT_EXCLUDE_KEYWORDS)
+
+    if not include_keywords:
+        include_keywords = DEFAULT_INCLUDE_KEYWORDS
+
+    all_items = []
+
+    for page in range(1, MAX_PAGES + 1):
+        url = build_url(keyword, page, search_type, exclude_keywords, include_keywords, min_price)
+        logger.info(f"Fetching page {page}: {url}")
+
+        try:
+            resp = requests.get(url, timeout=REQUEST_TIMEOUT, headers={"User-Agent": USER_AGENT})
+            resp.raise_for_status()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request failed for page {page}: {e}")
+            continue
+
+        items = parse_html(resp.text, search_type, include_paypay)
+        if not items:
+            break
+
+        # ========== 关键：列表解析后立即进入详情页抓取 ==========
+        if ENABLE_DETAIL_SCRAPE_ON_SEARCH:
+            enriched_items = []
+            for index, item in enumerate(items):
+                try:
+                    enriched_item = enrich_item_with_detail(item)
+                    enriched_items.append(enriched_item)
+                except Exception as e:
+                    logger.error(f"详情补充失败 itemId={item.get('itemId')}: {e}")
+                    item["detailScrapeStatus"] = "FAILED"
+                    item["detailScrapeError"] = str(e)[:500]
+                    item["detailScrapedAt"] = datetime.now(timezone.utc).isoformat()
+                    enriched_items.append(item)
+
+                # 请求间隔
+                if index < len(items) - 1:
+                    time.sleep(DETAIL_REQUEST_INTERVAL)
+
+            items = enriched_items
+
+        all_items.extend(items)
+
+        if len(items) < ITEMS_PER_PAGE:
+            break
+
+    logger.info(f"Total items scraped: {len(all_items)}")
+    return all_items
+
+
+def parse_html(html, search_type, include_paypay=True):
+    """解析 HTML，提取商品列表"""
+    soup = BeautifulSoup(html, "html.parser")
+    items = []
+
+    if search_type == "closed":
+        container = soup.select_one("#closedSearchItems")
+    else:
+        selectors = [".Products__list", ".ProductList", "[data-auction-list]",
+                     ".SearchResults__list", "#auctionsItems", ".Products__items"]
+        container = None
+        for selector in selectors:
+            container = soup.select_one(selector)
+            if container:
+                break
+
+    product_items = find_product_items_in_container(
+        container if container else soup.body, search_type, include_paypay
+    )
+
+    for li in product_items:
+        try:
+            item = parse_item(li, include_paypay)
+            if item:
+                items.append(item)
+        except Exception as e:
+            logger.warning(f"Failed to parse product item: {e}")
+
+    logger.info(f"Parsed {len(items)} items")
+    return items
+
+
+def find_product_items_in_container(container, search_type, include_paypay):
+    """在容器中查找商品列表项"""
+    product_items = []
+
+    if include_paypay:
+        link_pattern = re.compile(r"(/auction/|paypayfleamarket\.yahoo\.co\.jp/item/)")
+    else:
+        link_pattern = re.compile(r"/auction/")
+
+    for ul in container.find_all("ul"):
+        ul_class = " ".join(ul.get("class", [])).lower()
+
+        if any(skip in ul_class for skip in ["category", "nav", "menu", "footer", "header", "breadcrumb"]):
+            continue
+
+        has_links = any(
+            li.find("a", href=link_pattern) or li.get("data-auction-id")
+            for li in ul.find_all("li", recursive=False)
+        )
+
+        if has_links:
+            for li in ul.find_all("li", recursive=False):
+                li_class = " ".join(li.get("class", [])).lower()
+                if "category" in li_class:
+                    continue
+                if li.find("a", href=link_pattern) or li.get("data-auction-id"):
+                    product_items.append(li)
+
+    return product_items
+
+
+def parse_shipping_info(li):
+    """解析运费信息"""
+    shipping = {"shippingFee": None, "shippingText": None, "isFreeShipping": False}
+
+    postage_elem = li.select_one('.Product__postage')
+    if postage_elem:
+        shipping_text = postage_elem.get_text(strip=True)
+        shipping["shippingText"] = shipping_text
+
+        if not shipping_text:
+            shipping["shippingFee"] = 0
+            shipping["isFreeShipping"] = True
+            shipping["shippingText"] = "送料込み"
+            return shipping
+
+        match = re.search(r'送料(\d[\d,]*)円', shipping_text)
+        if match:
+            try:
+                shipping["shippingFee"] = int(match.group(1).replace(',', ''))
+            except ValueError:
+                pass
+        elif '無料' in shipping_text or '送料無料' in shipping_text:
+            shipping["shippingFee"] = 0
+            shipping["isFreeShipping"] = True
+
+    return shipping
+
+
+def parse_seller_location(li):
+    """解析发货地"""
+    prefecture = None
+
+    sell_from = li.select_one('.Product__sellFrom')
+    if sell_from:
+        sell_from_span = sell_from.find('span', class_='u-textGray')
+        if sell_from_span:
+            sell_from_text = sell_from_span.get_text(strip=True)
+            match = re.search(r'(.+?)から発送', sell_from_text)
+            if match:
+                prefecture = match.group(1).strip()
+            else:
+                prefecture = sell_from_text.strip()
+
+    if not prefecture:
+        for p in li.find_all("p"):
+            txt = p.get_text(strip=True)
+            if "から発送" in txt:
+                prefecture = txt.replace("から発送", "").strip()
+                break
+
+    if not prefecture:
+        for elem in li.find_all(['span', 'div', 'p']):
+            txt = elem.get_text(strip=True)
+            if "から発送" in txt:
+                match = re.search(r'(.+?)から発送', txt)
+                if match:
+                    prefecture = match.group(1).strip()
+                    break
+
+    if not prefecture:
+        li_text = li.get_text()
+        for pref in PREFECTURES_LIST:
+            if pref in li_text:
+                prefecture = pref
+                break
+
+    return prefecture
+
+
+def parse_item(li, include_paypay=True):
+    """解析单个商品列表项"""
+    if include_paypay:
+        link_pattern = re.compile(r"(/auction/|paypayfleamarket\.yahoo\.co\.jp/item/)")
+    else:
+        link_pattern = re.compile(r"/auction/")
+
+    # 查找商品链接
+    auction_link = li.select_one('.Product__titleLink')
+    if not auction_link:
+        h3 = li.find('h3', class_='Product__title')
+        if h3:
+            auction_link = h3.find('a', href=link_pattern)
+        if not auction_link:
+            auction_link = li.find("a", href=link_pattern)
+
+    if not auction_link:
+        return None
+
+    href = auction_link.get("href", "")
+    if not href:
+        return None
+
+    # 提取商品 ID 和类型
+    item_id = None
+    item_type = None
+
+    data_id = auction_link.get('data-auction-id', '')
+    if data_id:
+        item_id = data_id
+        item_type = "paypay" if item_id.startswith('z') else "auction"
+    else:
+        m = re.search(r"/auction/([a-z0-9]+)", href)
+        if m:
+            item_id = m.group(1)
+            item_type = "auction"
+        else:
+            m = re.search(r"/item/([a-z0-9]+)", href)
+            if m:
+                item_id = m.group(1)
+                item_type = "paypay"
+
+    if not item_id:
+        return None
+
+    # 提取标题
+    title = auction_link.get('data-auction-title', '').strip()
+    if not title:
+        title = auction_link.get_text(strip=True)
+    if not title:
+        title = auction_link.get("title", "").strip()
+
+    # 提取价格
+    price = 0
+    data_price = auction_link.get('data-auction-price', '')
+    if data_price:
+        try:
+            price = int(data_price)
+        except ValueError:
+            pass
+
+    if price == 0:
+        price_value = li.select_one('.Product__priceValue')
+        if price_value:
+            price_text = price_value.get_text(strip=True)
+            match = re.search(r'([\d,]+)円', price_text)
+            if match:
+                try:
+                    price = int(match.group(1).replace(",", ""))
+                except ValueError:
+                    pass
+
+    if price == 0:
+        for span in li.find_all("span"):
+            txt = span.get_text(strip=True)
+            m = re.match(r"^([\d,]+)円$", txt)
+            if m:
+                try:
+                    price = int(m.group(1).replace(",", ""))
+                    break
+                except ValueError:
+                    pass
+
+    # 运费
+    shipping = parse_shipping_info(li)
+
+    # 即决价格
+    buynow_price = None
+    price_info_spans = li.select('.Product__price')
+    for price_span in price_info_spans:
+        label = price_span.select_one('.Product__label')
+        if label and '即決' in label.get_text():
+            value = price_span.select_one('.Product__priceValue')
+            if value:
+                value_text = value.get_text(strip=True)
+                if value_text != '-':
+                    match = re.search(r'([\d,]+)円', value_text)
+                    if match:
+                        try:
+                            buynow_price = int(match.group(1).replace(',', ''))
+                        except ValueError:
+                            pass
+            break
+
+    # 入札数
+    bid_count = 0
+    if item_type == "auction":
+        bid_link = li.find("a", href=re.compile(r"bid_hist"))
+        if bid_link:
+            bid_text = bid_link.get_text(strip=True)
+            try:
+                bid_count = int(re.sub(r"\D", "", bid_text))
+            except ValueError:
+                pass
+
+    # 结束时间
+    end_time = None
+    product_div = li.find_parent('div', class_='Product') or li
+
+    endtime_elem = product_div.select_one('[data-auction-endtime]')
+    if endtime_elem:
+        endtime_value = endtime_elem.get('data-auction-endtime', '')
+        if endtime_value:
+            try:
+                timestamp = int(endtime_value)
+                dt = datetime.fromtimestamp(timestamp, tz=timezone(timedelta(hours=9)))
+                end_time = dt.isoformat()
+            except (ValueError, OSError):
+                pass
+
+    if not end_time:
+        ended_elem = li.find(lambda tag: tag.name in ["span", "p"] and "終了" in tag.get_text())
+        if ended_elem:
+            time_text = ended_elem.get_text(strip=True)
+            end_time = parse_end_time(time_text)
+
+    if not end_time:
+        all_text = li.get_text(separator=" ", strip=True)
+        m = re.search(r"\d{1,2}/\d{1,2}\s+\d{1,2}:\d{2}", all_text)
+        if m:
+            end_time = parse_end_time(m.group())
+
+    if not end_time:
+        timeleft_elem = li.select_one('[data-timeleft]')
+        if timeleft_elem:
+            timeleft = timeleft_elem.get('data-timeleft', '')
+            if timeleft:
+                try:
+                    seconds_left = int(timeleft)
+                    now = datetime.now(timezone(timedelta(hours=9)))
+                    end_time = (now + timedelta(seconds=seconds_left)).isoformat()
+                except ValueError:
+                    pass
+
+    # 卖家ID
+    seller_id = None
+    seller_id_elem = product_div.select_one('[data-auction-auc-seller-id]')
+    if seller_id_elem:
+        seller_id = seller_id_elem.get('data-auction-auc-seller-id', '')
+
+    if not seller_id:
+        seller_patterns = [
+            re.compile(r"/user/"), re.compile(r"/seller/"),
+            re.compile(r"userID=", re.IGNORECASE), re.compile(r"/show/rating", re.IGNORECASE)
+        ]
+        seller_link = None
+        for pattern in seller_patterns:
+            seller_link = li.find("a", href=pattern)
+            if seller_link:
+                break
+        if seller_link:
+            seller_href = seller_link.get("href", "")
+            for pattern in [r"/user/([^/?#]+)", r"/seller/([^/?#]+)", r"[?&]userID=([^&#]+)"]:
+                match = re.search(pattern, seller_href, re.IGNORECASE)
+                if match:
+                    seller_id = match.group(1)
+                    break
+
+    # 好评率
+    rating = None
+    rating_elem = li.select_one('.Product__ratingValue')
+    if rating_elem:
+        rating_text = rating_elem.get_text(strip=True)
+        if rating_text and rating_text != "新規":
+            rating = rating_text
+
+    if not rating:
+        for sp in li.find_all("span"):
+            txt = sp.get_text(strip=True)
+            if re.match(r"^\d{1,3}\.\d%$", txt):
+                rating = txt
+                break
+
+    # 发货地
+    prefecture = parse_seller_location(li)
+
+    # 卖家类型
+    seller_type = "store" if li.select_one('.Product__icon--store') else "personal"
+
+    # 商品状态
+    item_condition = None
+    condition_icons = li.select('.Product__icon')
+    for icon in condition_icons:
+        icon_text = icon.get_text(strip=True)
+        if icon_text in ['未使用', '新品', '中古', '新規']:
+            item_condition = icon_text
+            break
+
+    # 缩略图
+    thumbnail_url = auction_link.get('data-auction-img', '')
+    if not thumbnail_url:
+        img = li.find("img")
+        if img:
+            thumbnail_url = img.get("src") or img.get("data-src") or ""
+
+    # 构建返回对象
+    item = {
+        "itemId": item_id,
+        "itemType": item_type,
+        "title": title,
+        "price": price,
+        "buynowPrice": buynow_price,
+        "shippingFee": shipping["shippingFee"],
+        "shippingText": shipping["shippingText"],
+        "isFreeShipping": shipping["isFreeShipping"],
+        "bidCount": bid_count,
+        "endTime": end_time,
+        "sellerId": seller_id,
+        "sellerRating": rating,
+        "sellerType": seller_type,
+        "prefecture": prefecture,
+        "itemCondition": item_condition,
+        "url": href,
+        "thumbnailUrl": thumbnail_url,
+        "scrapedAt": datetime.now(timezone.utc).isoformat()
+    }
+
+    return item
+
+
+def parse_end_time(text):
+    """解析结束时间"""
+    if not text:
+        return None
+
+    text = text.replace("時", ":").replace("分", "")
+    m = re.search(r"(\d{1,4})?[\/-]?(\d{1,2})[\/-](\d{1,2})\s+(\d{1,2}):(\d{2})", text)
+    if not m:
+        return None
+
+    if m.group(1) and len(m.group(1)) == 4:
+        year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    else:
+        year, month, day = datetime.now().year, int(m.group(2)), int(m.group(3))
+
+    hour, minute = int(m.group(4)), int(m.group(5))
+
+    try:
+        dt = datetime(year, month, day, hour, minute, tzinfo=timezone(timedelta(hours=9)))
+        return dt.isoformat()
+    except ValueError:
+        return None
+
+
+def save_items(items, table):
+    """保存商品到 DynamoDB，包含详情描述"""
+    saved = 0
+    skipped_duplicates = 0
+    failed = 0
+
+    for item in items:
+        try:
+            item_key = item["itemId"]
+            table.put_item(
+                Item={
+                    "itemID": item_key,
+                    "itemType": item.get("itemType", "unknown"),
+                    "title": item.get("title", ""),
+                    "price": item.get("price", 0),
+                    "buynowPrice": item.get("buynowPrice"),
+                    "shippingFee": item.get("shippingFee"),
+                    "shippingText": item.get("shippingText", ""),
+                    "isFreeShipping": item.get("isFreeShipping", False),
+                    "bidCount": item.get("bidCount", 0),
+                    "endTime": item.get("endTime") or "unknown",
+                    "sellerId": item.get("sellerId") or "unknown",
+                    "sellerRating": item.get("sellerRating") or "unknown",
+                    "sellerType": item.get("sellerType", "personal"),
+                    "prefecture": item.get("prefecture") or "unknown",
+                    "itemCondition": item.get("itemCondition"),
+                    "url": item.get("url") or "",
+                    "thumbnailUrl": item.get("thumbnailUrl") or "",
+                    "scrapedAt": item.get("scrapedAt") or datetime.now(timezone.utc).isoformat(),
+                    
+                    # 详情字段
+                    "detailDescription": item.get("detailDescription", ""),
+                    "detailTitle": item.get("detailTitle", ""),
+                    "detailUrl": item.get("detailUrl", ""),
+                    "detailScrapedAt": item.get("detailScrapedAt", ""),
+                    "detailDescriptionLength": item.get("detailDescriptionLength", 0),
+                    "detailScrapeStatus": item.get("detailScrapeStatus", "NOT_SCRAPED"),
+                    "detailScrapeError": item.get("detailScrapeError", ""),
+                    
+                    "ttl": int((datetime.now(timezone.utc) + timedelta(days=180)).timestamp())
+                },
+                ConditionExpression="attribute_not_exists(itemID)"
+            )
+            saved += 1
+
+        except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
+            skipped_duplicates += 1
+            
+            # 已存在时也更新详情
+            try:
+                table.update_item(
+                    Key={"itemID": item["itemId"]},
+                    UpdateExpression="""
+                        SET detailDescription = :desc,
+                            detailTitle = :detail_title,
+                            detailUrl = :detail_url,
+                            detailScrapedAt = :detail_scraped_at,
+                            detailDescriptionLength = :detail_len,
+                            detailScrapeStatus = :detail_status,
+                            detailScrapeError = :detail_error,
+                            lastDetailUpdatedAt = :now
+                    """,
+                    ExpressionAttributeValues={
+                        ":desc": item.get("detailDescription", ""),
+                        ":detail_title": item.get("detailTitle", ""),
+                        ":detail_url": item.get("detailUrl", ""),
+                        ":detail_scraped_at": item.get("detailScrapedAt", ""),
+                        ":detail_len": item.get("detailDescriptionLength", 0),
+                        ":detail_status": item.get("detailScrapeStatus", "NOT_SCRAPED"),
+                        ":detail_error": item.get("detailScrapeError", ""),
+                        ":now": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+            except Exception as e:
+                logger.error(f"Failed to update detail for duplicate {item.get('itemId')}: {e}")
+
+        except Exception as e:
+            failed += 1
+            logger.error(f"Failed to save {item.get('itemId')}: {e}")
+
+    logger.info(f"Saved: {saved}, Skipped: {skipped_duplicates}, Failed: {failed}")
+    return saved
