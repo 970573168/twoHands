@@ -110,13 +110,14 @@ def get_filter_keywords(event):
     return exclude_keywords, include_keywords
 
 
-def build_url(keyword, page, search_type, exclude_keywords="", include_keywords=""):
+def build_url(keyword, page, search_type, exclude_keywords="", include_keywords="", min_price=None):
     """
     构建请求 URL，合并：
     1. 根据搜索类型选择对应的默认参数
     2. AUCTION_PARAM_* 环境变量中的自定义参数
     3. 关键词和分页参数
     4. 过滤关键词（va/vo/ve参数）
+    5. 价格范围参数（min/max）
     """
     params = {}
 
@@ -147,14 +148,24 @@ def build_url(keyword, page, search_type, exclude_keywords="", include_keywords=
         params["ve"] = exclude_keywords
         logger.info(f"Setting ve (exclude keywords): {exclude_keywords[:100]}...")
     
-    # 6. 设置分页参数
+    # 6. 设置价格范围参数（新增）
+    if min_price is not None and min_price > 0:
+        # Yahoo拍卖的min参数：最低价格
+        params["min"] = str(min_price)
+        # 同时设置价格类型为当前价格
+        params["price_type"] = "currentprice"
+        logger.info(f"Setting min price filter: {min_price}円")
+    
+    # 7. 设置分页参数
     params["b"] = str((page - 1) * ITEMS_PER_PAGE + 1)
 
-    # 7. 选择基础 URL
+    # 8. 选择基础 URL
     base_url = ACTIVE_BASE_URL if search_type == "active" else CLOSED_BASE_URL
 
     final_url = f"{base_url}?{urlencode(params, quote_via=quote)}"
-    logger.info(f"Built URL with va='{keyword}', vo='{include_keywords[:50] if include_keywords else ''}', ve='{exclude_keywords[:50] if exclude_keywords else ''}'")
+    
+    price_info = f", min_price={min_price}" if min_price else ""
+    logger.info(f"Built URL with va='{keyword}'{price_info}")
     
     return final_url
 
@@ -171,16 +182,26 @@ def lambda_handler(event, context):
     search_type = event.get("search_type", "closed")
     include_paypay = event.get("include_paypay", INCLUDE_PAYPAY)
     
+    # 新增：支持 min_price 参数
+    min_price = event.get("min_price")
+    if min_price is not None:
+        try:
+            min_price = int(min_price)
+        except (ValueError, TypeError):
+            min_price = None
+    
     # 获取过滤关键词
     exclude_keywords, include_keywords = get_filter_keywords(event)
     
-    logger.info(f"Scraping for keyword: '{keyword}', type: '{search_type}', include_paypay: {include_paypay}")
+    logger.info(f"Scraping for keyword: '{keyword}', type: '{search_type}', "
+                f"include_paypay: {include_paypay}, min_price: {min_price}")
     if exclude_keywords:
         logger.info(f"Excluding keywords: {exclude_keywords}")
     if include_keywords:
         logger.info(f"Including keywords: {include_keywords}")
 
-    items = scrape_auctions(keyword, search_type, include_paypay, exclude_keywords, include_keywords)
+    items = scrape_auctions(keyword, search_type, include_paypay, 
+                            exclude_keywords, include_keywords, min_price)
 
     if not items:
         logger.info("No items found")
@@ -190,6 +211,7 @@ def lambda_handler(event, context):
                 "scraped": 0, 
                 "saved": 0, 
                 "type": search_type,
+                "min_price_applied": min_price,
                 "filters_applied": {
                     "exclude_keywords": exclude_keywords if exclude_keywords else None,
                     "include_keywords": include_keywords if include_keywords else None
@@ -208,6 +230,7 @@ def lambda_handler(event, context):
             "scraped": len(items),
             "saved": saved,
             "type": search_type,
+            "min_price_applied": min_price,
             "filters_applied": {
                 "exclude_keywords": exclude_keywords if exclude_keywords else None,
                 "include_keywords": include_keywords if include_keywords else None
@@ -216,7 +239,8 @@ def lambda_handler(event, context):
     }
 
 
-def scrape_auctions(keyword, search_type, include_paypay=True, exclude_keywords="", include_keywords=""):
+def scrape_auctions(keyword, search_type, include_paypay=True, 
+                    exclude_keywords="", include_keywords="", min_price=None):
     """抓取所有页面"""
     
     # ✅ 如果调用方没传过滤词，自动使用默认词库
@@ -228,10 +252,9 @@ def scrape_auctions(keyword, search_type, include_paypay=True, exclude_keywords=
         include_keywords = DEFAULT_INCLUDE_KEYWORDS
     
     all_items = []
-    # ... 其余代码不变
 
     for page in range(1, MAX_PAGES + 1):
-        url = build_url(keyword, page, search_type, exclude_keywords, include_keywords)
+        url = build_url(keyword, page, search_type, exclude_keywords, include_keywords, min_price)
         logger.info(f"Fetching page {page}: {url}")
 
         try:
@@ -261,6 +284,8 @@ def scrape_auctions(keyword, search_type, include_paypay=True, exclude_keywords=
     logger.info(f"Total items scraped across all pages: {len(all_items)}")
     return all_items
 
+
+# ==================== 以下所有解析函数保持不变 ====================
 
 def parse_html(html, search_type, include_paypay=True):
     """解析 HTML，提取商品列表"""
