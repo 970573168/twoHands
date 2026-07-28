@@ -450,8 +450,8 @@ Parameters:
 
   CatalogScannerIntervalMinutes:
     Type: Number
-    Default: 120
-    MinValue: 30
+    Default: 5
+    MinValue: 1
     MaxValue: 1440
 
   CatalogScannerMaxModels:
