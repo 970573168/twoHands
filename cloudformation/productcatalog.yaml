@@ -274,21 +274,21 @@ Parameters:
 
   DefaultSearchCount:
     Type: Number
-    Default: 3
+    Default: 100
     MinValue: 1
-    MaxValue: 20
+    MaxValue: 1000
 
   MaxActiveItems:
     Type: Number
-    Default: 20
+    Default: 100
     MinValue: 1
-    MaxValue: 50
+    MaxValue: 1000
 
   AiRequestTimeout:
     Type: Number
-    Default: 60
+    Default: 300
     MinValue: 30
-    MaxValue: 300
+    MaxValue: 500
 
   AiMaxRetries:
     Type: Number
