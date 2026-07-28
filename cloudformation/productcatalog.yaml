@@ -769,6 +769,8 @@ Resources:
           CATEGORY_LIMIT: !Ref CategoryLimit
           BRAND_LIMIT: !Ref BrandLimit
           API_CALL_DELAY: !Ref ApiCallDelay
+          MIN_OFFICIAL_PRICE_JPY: !Ref MinOfficialPriceJpy
+          SKIP_IF_OFFICIAL_PRICE_MISSING: "false"
       Tags:
         - Key: Application
           Value: ProductCatalog
