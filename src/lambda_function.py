@@ -489,13 +489,13 @@ def build_prompt(task):
 
     if task_type == "DISCOVER_CATEGORIES":
         instruction = (
-            "一般的な電子製品のカテゴリをリストアップしてください。"
+            "一般的な商品のカテゴリをリストアップしてください。"
             "各エントリにはcategoryフィールドのみを含めてください。"
         )
     elif task_type == "DISCOVER_BRANDS":
         category = normalize(task.get("category"))
         instruction = (
-            f"電子製品カテゴリ「{category}」の実際のブランドをリストアップしてください。"
+            f"商品カテゴリ「{category}」の実際のブランドをリストアップしてください。"
             "各エントリにはcategoryとbrandフィールドを含めてください。"
         )
     elif task_type == "DISCOVER_MODELS":
@@ -848,21 +848,37 @@ def process_discovery(event):
     log("INFO", "开始发现处理", task_type=task_type, ai_mode=AI_MODE)
     
     try:
+        # 在 process_discovery 函数中，DISCOVER_CATEGORIES 部分修改为：
+
         if task_type == "DISCOVER_CATEGORIES":
-            _tracker.start_phase("discover_categories")
-            task = {"task_type": "DISCOVER_CATEGORIES", "max_items": MAX_CATEGORIES}
-            items = call_api(task)
+            target_categories = event.get("target_categories", None)
             
-            categories = []
-            for item in items:
-                if isinstance(item, dict) and "category" in item:
-                    category = normalize(item["category"])
+            if target_categories:
+                # 如果指定了目标品类，直接使用
+                categories = target_categories
+                for category in categories:
+                    category = normalize(category)
                     if category:
                         upsert_category(category)
-                        categories.append(category)
+                log("INFO", "使用指定品类", categories=categories)
+            else:
+                # 原有逻辑：AI 发现品类
+                _tracker.start_phase("discover_categories")
+                task = {"task_type": "DISCOVER_CATEGORIES", "max_items": MAX_CATEGORIES}
+                items = call_api(task)
+                
+                categories = []
+                for item in items:
+                    if isinstance(item, dict) and "category" in item:
+                        category = normalize(item["category"])
+                        if category:
+                            upsert_category(category)
+                            categories.append(category)
+                
+                _tracker.end_phase()
+                log("INFO", "品类发现完成", count=len(categories))
             
-            _tracker.end_phase()
-            log("INFO", "品类发现完成", count=len(categories))
+            # 后续品牌和型号发现的逻辑保持不变...
             
             category_count = 0
             for category in categories[:CATEGORY_LIMIT]:
