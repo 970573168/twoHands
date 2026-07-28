@@ -1086,6 +1086,12 @@ Resources:
           MAX_ACTIVE_COUNT: !Ref MaxActiveItems
           MAX_CLOSED_COUNT: !Ref MaxClosedPerModel
           ENABLE_SCHEDULED_SCAN: !Ref CatalogScannerEnabled
+          # ============ 平滑控制环境变量 ============
+          DISPATCH_INTERVAL_SECONDS: "10"
+          DISPATCH_JITTER_SECONDS: "5"
+          STARTUP_JITTER_SECONDS: "15"
+          BATCH_SIZE: "1"
+          BATCH_INTERVAL_SECONDS: "0"
           TODAY_TAG_KEY: "last_scanned_date"
           DATA_SOURCE: "AI_DISCOVERY"
       Tags:
