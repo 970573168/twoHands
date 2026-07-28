@@ -86,7 +86,7 @@ Parameters:
 
   DoubaoTimeout:
     Type: Number
-    Default: 90
+    Default: 200
     MinValue: 10
     MaxValue: 300
     Description: 豆包 API 请求超时（秒）
