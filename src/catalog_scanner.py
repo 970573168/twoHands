@@ -10,6 +10,7 @@
 import os
 import json
 import time
+import random
 import re
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Optional
@@ -25,6 +26,13 @@ MAX_MODELS_PER_RUN = int(os.environ.get("MAX_MODELS_PER_RUN", "3"))
 MAX_ACTIVE_COUNT = int(os.environ.get("MAX_ACTIVE_COUNT", "20"))
 MAX_CLOSED_COUNT = int(os.environ.get("MAX_CLOSED_COUNT", "50"))
 ENABLE_SCHEDULED_SCAN = os.environ.get("ENABLE_SCHEDULED_SCAN", "false").lower() == "true"
+
+# ============ 平滑控制环境变量 ============
+DISPATCH_INTERVAL_SECONDS = float(os.environ.get("DISPATCH_INTERVAL_SECONDS", "5"))
+DISPATCH_JITTER_SECONDS = float(os.environ.get("DISPATCH_JITTER_SECONDS", "3"))
+STARTUP_JITTER_SECONDS = float(os.environ.get("STARTUP_JITTER_SECONDS", "10"))
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "1"))
+BATCH_INTERVAL_SECONDS = float(os.environ.get("BATCH_INTERVAL_SECONDS", "0"))
 
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table(TABLE_NAME)
@@ -46,6 +54,34 @@ def get_today_date() -> str:
     """获取今天的日期字符串（JST）"""
     jst = timezone(timedelta(hours=9))
     return datetime.now(jst).strftime("%Y-%m-%d")
+
+
+def smooth_sleep(
+    base_seconds: float,
+    jitter_seconds: float = 0,
+    reason: str = "smooth_control"
+):
+    """
+    平滑控制等待。
+    base_seconds: 固定等待秒数
+    jitter_seconds: 随机抖动秒数，实际等待 base + [0, jitter]
+    """
+    if base_seconds <= 0 and jitter_seconds <= 0:
+        return
+
+    jitter = random.uniform(0, jitter_seconds) if jitter_seconds > 0 else 0
+    sleep_seconds = base_seconds + jitter
+
+    if sleep_seconds <= 0:
+        return
+
+    log("INFO", "平滑控制等待",
+        reason=reason,
+        base_seconds=base_seconds,
+        jitter_seconds=jitter_seconds,
+        actual_sleep_seconds=round(sleep_seconds, 3))
+
+    time.sleep(sleep_seconds)
 
 
 def scan_unanalyzed_products(today: str, max_models: int = 3) -> List[Dict]:
@@ -237,25 +273,38 @@ def dispatch_to_analyzer(
 
 def scan_and_dispatch(event: Dict) -> Dict:
     """
-    主流程：扫描 → 标记 → 投递
+    主流程：扫描 → 标记 → 平滑投递
     """
     today = get_today_date()
     max_models = int(event.get("max_models", MAX_MODELS_PER_RUN))
     max_active = int(event.get("max_active", MAX_ACTIVE_COUNT))
     max_closed = int(event.get("max_closed", MAX_CLOSED_COUNT))
-    
+
+    # 允许手动触发时覆盖平滑参数
+    dispatch_interval = float(event.get("dispatch_interval_seconds", DISPATCH_INTERVAL_SECONDS))
+    dispatch_jitter = float(event.get("dispatch_jitter_seconds", DISPATCH_JITTER_SECONDS))
+    batch_size = int(event.get("batch_size", BATCH_SIZE))
+    batch_interval = float(event.get("batch_interval_seconds", BATCH_INTERVAL_SECONDS))
+
+    if batch_size <= 0:
+        batch_size = 1
+
     log("INFO", "CatalogScanner 开始执行",
         today=today,
         max_models=max_models,
         max_active=max_active,
-        max_closed=max_closed)
-    
+        max_closed=max_closed,
+        dispatch_interval_seconds=dispatch_interval,
+        dispatch_jitter_seconds=dispatch_jitter,
+        batch_size=batch_size,
+        batch_interval_seconds=batch_interval)
+
     # 1. 扫描未分析产品
     products = scan_unanalyzed_products(
         today=today,
         max_models=max_models
     )
-    
+
     if not products:
         log("INFO", "没有需要分析的产品", today=today)
         return {
@@ -264,19 +313,36 @@ def scan_and_dispatch(event: Dict) -> Dict:
             "dispatched": 0,
             "results": []
         }
-    
-    # 2. 标记 QUEUED 并投递
+
+    # 2. 标记 QUEUED 并平滑投递
     results = []
     dispatched = 0
     skipped = 0
     failed = 0
-    
-    for product in products:
+
+    for index, product in enumerate(products):
         category = product["category"]
         brand = product["brand"]
         model = product["model"]
         product_pk = product["product_pk"]
-        
+
+        # 批次间隔控制
+        if index > 0 and index % batch_size == 0 and batch_interval > 0:
+            smooth_sleep(
+                base_seconds=batch_interval,
+                jitter_seconds=dispatch_jitter,
+                reason="batch_interval"
+            )
+
+        # 单个投递间隔控制
+        # 第一个产品不等待，第二个开始等待
+        if index > 0:
+            smooth_sleep(
+                base_seconds=dispatch_interval,
+                jitter_seconds=dispatch_jitter,
+                reason="dispatch_interval"
+            )
+
         # 先标记 QUEUED
         if not mark_as_queued(product_pk, today):
             skipped += 1
@@ -288,7 +354,7 @@ def scan_and_dispatch(event: Dict) -> Dict:
                 "reason": "ALREADY_QUEUED"
             })
             continue
-        
+
         # 再投递到 Analyzer
         success = dispatch_to_analyzer(
             category=category,
@@ -298,7 +364,7 @@ def scan_and_dispatch(event: Dict) -> Dict:
             max_active=max_active,
             max_closed=max_closed
         )
-        
+
         if success:
             dispatched += 1
             results.append({
@@ -316,7 +382,7 @@ def scan_and_dispatch(event: Dict) -> Dict:
                 "status": "FAILED",
                 "reason": "INVOKE_FAILED"
             })
-    
+
     summary = {
         "status": "COMPLETED",
         "today": today,
@@ -324,9 +390,15 @@ def scan_and_dispatch(event: Dict) -> Dict:
         "dispatched": dispatched,
         "skipped": skipped,
         "failed": failed,
+        "smooth_control": {
+            "dispatch_interval_seconds": dispatch_interval,
+            "dispatch_jitter_seconds": dispatch_jitter,
+            "batch_size": batch_size,
+            "batch_interval_seconds": batch_interval
+        },
         "results": results
     }
-    
+
     log("INFO", "CatalogScanner 执行完成", **summary)
     return summary
 
@@ -358,6 +430,16 @@ def lambda_handler(event, context):
             source=event.get("source", "manual"),
             enable_scheduled_scan=ENABLE_SCHEDULED_SCAN)
         
+        # 启动错峰：避免多个定时任务或重试实例同时投递
+        startup_jitter = float(event.get("startup_jitter_seconds", STARTUP_JITTER_SECONDS))
+
+        if startup_jitter > 0:
+            smooth_sleep(
+                base_seconds=0,
+                jitter_seconds=startup_jitter,
+                reason="startup_jitter"
+            )
+
         result = scan_and_dispatch(event)
         
         return {
