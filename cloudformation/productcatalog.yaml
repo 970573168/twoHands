@@ -29,7 +29,7 @@ Parameters:
   # ============ AI 模式选择 ============
   AiMode:
     Type: String
-    Default: "gemini"
+    Default: "doubao"
     AllowedValues:
       - gemini
       - doubao
