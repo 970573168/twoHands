@@ -34,7 +34,7 @@ GEMINI_MAX_TOKENS = int(os.environ.get("GEMINI_MAX_TOKENS", "4000"))
 DOUBAO_API_KEY = os.environ.get("DOUBAO_API_KEY", "")
 DOUBAO_MODEL = os.environ.get("DOUBAO_MODEL", "doubao-seed-2-0-mini-260428")
 DOUBAO_URL = os.environ.get("DOUBAO_URL", "https://ark.cn-beijing.volces.com/api/v3/chat/completions")
-DOUBAO_TIMEOUT = int(os.environ.get("DOUBAO_TIMEOUT", "180))
+DOUBAO_TIMEOUT = int(os.environ.get("DOUBAO_TIMEOUT", "180"))
 DOUBAO_MAX_TOKENS = int(os.environ.get("DOUBAO_MAX_TOKENS", "6000"))
 
 # OpenAI 配置
