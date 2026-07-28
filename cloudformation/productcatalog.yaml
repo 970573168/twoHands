@@ -644,7 +644,9 @@ Resources:
                   - dynamodb:UpdateItem
                   - dynamodb:Query
                   - dynamodb:BatchWriteItem
-                Resource: !GetAtt ProductCatalogTable.Arn
+                Resource:
+                  - !GetAtt ProductCatalogTable.Arn
+                  - !Sub "${ProductCatalogTable.Arn}/index/*"  # ← 添加这一行
               - Sid: ReadApiSecrets
                 Effect: Allow
                 Action:
