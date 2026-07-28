@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import time
 import logging
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode, quote
@@ -26,8 +27,14 @@ DEBUG_LOG_HTML = os.getenv("DEBUG_LOG_HTML", "false").lower() == "true"
 ITEMS_PER_PAGE = int(os.getenv("ITEMS_PER_PAGE", "50"))
 INCLUDE_PAYPAY = os.getenv("INCLUDE_PAYPAY", "true").lower() == "true"
 
+# ============ 详情爬取控制 ============
+ENABLE_DETAIL_SCRAPE_ON_SEARCH = os.getenv("ENABLE_DETAIL_SCRAPE_ON_SEARCH", "true").lower() == "true"
+DETAIL_REQUEST_INTERVAL = float(os.getenv("DETAIL_REQUEST_INTERVAL", "1.0"))
+DETAIL_DESCRIPTION_MAX_CHARS = int(os.getenv("DETAIL_DESCRIPTION_MAX_CHARS", "3000"))
+AUCTION_DETAIL_BASE = os.getenv("AUCTION_DETAIL_BASE", "https://auctions.yahoo.co.jp/jp/auction")
+
 # ============ 过滤词库配置 ============
-DEFAULT_EXCLUDE_KEYWORDS = os.getenv("DEFAULT_EXCLUDE_KEYWORDS", 
+DEFAULT_EXCLUDE_KEYWORDS = os.getenv("DEFAULT_EXCLUDE_KEYWORDS",
     "液晶 LCD OLED パネル 画面 タッチパネル フロントパネル バックパネル "
     "バッテリー 交換用 修理用 補修用 部品 パーツ "
     "ケーブル ライトニングケーブル Lightning USB-C "
@@ -43,7 +50,23 @@ DEFAULT_EXCLUDE_KEYWORDS = os.getenv("DEFAULT_EXCLUDE_KEYWORDS",
 DEFAULT_INCLUDE_KEYWORDS = os.getenv("DEFAULT_INCLUDE_KEYWORDS", "")
 USE_DEFAULT_EXCLUDE = os.getenv("USE_DEFAULT_EXCLUDE", "true").lower() == "true"
 
-dynamodb = boto3.resource("dynamodb")
+# ============ 运输相关关键词 ============
+SHIPPING_RELATED_KEYWORDS = [
+    "送料", "発送", "配送", "運送", "宅配便", "郵便",
+    "配送方法", "配送業者", "発送方法", "発送準備",
+    "同梱", "まとめて購入", "まとめて取引",
+    "お取引について", "お取引の取消し",
+    "支払い金額", "お支払い", "お支払い金額", "振込手数料",
+    "購入価格+消費税+送料", "送料元払い", "着払い",
+    "佐川急便", "ヤマト運輸", "日本郵便", "ゆうパック",
+    "長期不在", "再配達", "返却",
+    "ご注文のキャンセル", "キャンセル対応",
+    "注文確認メール", "ご注文前",
+    "決済情報", "決済不可能",
+    "弊社都合", "受け取り拒否",
+    "ノークレーム", "ノーリターン",
+    "ご注文点数", "注文から",
+]
 
 # 日本47都道府県列表
 PREFECTURES_LIST = [
@@ -56,6 +79,8 @@ PREFECTURES_LIST = [
     "熊本県", "大分県", "宮崎県", "鹿児島県", "沖縄県"
 ]
 
+dynamodb = boto3.resource("dynamodb")
+
 
 def get_target_table(search_type: str):
     """根据搜索类型返回对应的 DynamoDB 表"""
@@ -65,10 +90,7 @@ def get_target_table(search_type: str):
 
 
 def get_auction_params():
-    """
-    读取所有以 AUCTION_PARAM_ 开头的环境变量，返回参数字典。
-    例如：AUCTION_PARAM_NEW=1 → {"new": "1"}
-    """
+    """读取所有以 AUCTION_PARAM_ 开头的环境变量"""
     params = {}
     prefix = "AUCTION_PARAM_"
     for key, val in os.environ.items():
@@ -80,48 +102,27 @@ def get_auction_params():
 
 
 def get_filter_keywords(event):
-    """
-    从事件中获取过滤关键词
-    优先级：event参数 > 环境变量 > 默认词库
-    
-    返回:
-        tuple: (exclude_keywords_str, include_keywords_str)
-    """
-    # 获取排除关键词
+    """从事件中获取过滤关键词"""
     exclude_keywords = event.get("exclude_keywords", "")
-    
     if not exclude_keywords and USE_DEFAULT_EXCLUDE:
         exclude_keywords = os.getenv("CUSTOM_EXCLUDE_KEYWORDS", DEFAULT_EXCLUDE_KEYWORDS)
-        logger.info(f"Using default/custom exclude keywords: {exclude_keywords[:100]}...")
     
-    # 获取包含关键词
     include_keywords = event.get("include_keywords", "")
     if not include_keywords:
         include_keywords = DEFAULT_INCLUDE_KEYWORDS
     
-    # 清理关键词
     if exclude_keywords:
         exclude_keywords = " ".join(exclude_keywords.split())
     if include_keywords:
         include_keywords = " ".join(include_keywords.split())
     
-    logger.info(f"Filter keywords - Exclude: '{exclude_keywords[:100] if exclude_keywords else ''}', Include: '{include_keywords[:50] if include_keywords else ''}'")
-    
     return exclude_keywords, include_keywords
 
 
 def build_url(keyword, page, search_type, exclude_keywords="", include_keywords="", min_price=None):
-    """
-    构建请求 URL，合并：
-    1. 根据搜索类型选择对应的默认参数
-    2. AUCTION_PARAM_* 环境变量中的自定义参数
-    3. 关键词和分页参数
-    4. 过滤关键词（va/vo/ve参数）
-    5. 价格范围参数（min/max）
-    """
+    """构建请求 URL"""
     params = {}
-
-    # 1. 解析默认参数
+    
     if search_type == "active":
         default_params_str = DEFAULT_PARAMS_ACTIVE
     else:
@@ -131,126 +132,493 @@ def build_url(keyword, page, search_type, exclude_keywords="", include_keywords=
         if "=" in p:
             k, v = p.split("=", 1)
             params[k] = v
-
-    # 2. 合并自定义参数
+    
     params.update(get_auction_params())
-
-    # 3. 设置主搜索关键词（va参数）
     params["va"] = keyword
     
-    # 4. 设置包含关键词（vo参数）
     if include_keywords:
         params["vo"] = include_keywords
-        logger.info(f"Setting vo (OR keywords): {include_keywords}")
     
-    # 5. 设置排除关键词（ve参数）
     if exclude_keywords:
         params["ve"] = exclude_keywords
-        logger.info(f"Setting ve (exclude keywords): {exclude_keywords[:100]}...")
     
-    # 6. 设置价格范围参数（新增）
     if min_price is not None and min_price > 0:
-        # Yahoo拍卖的min参数：最低价格
         params["min"] = str(min_price)
-        # 同时设置价格类型为当前价格
         params["price_type"] = "currentprice"
-        logger.info(f"Setting min price filter: {min_price}円")
     
-    # 7. 设置分页参数
     params["b"] = str((page - 1) * ITEMS_PER_PAGE + 1)
-
-    # 8. 选择基础 URL
+    
     base_url = ACTIVE_BASE_URL if search_type == "active" else CLOSED_BASE_URL
+    return f"{base_url}?{urlencode(params, quote_via=quote)}"
 
-    final_url = f"{base_url}?{urlencode(params, quote_via=quote)}"
-    
-    price_info = f", min_price={min_price}" if min_price else ""
-    logger.info(f"Built URL with va='{keyword}'{price_info}")
-    
-    return final_url
 
+# ======================================
+# 详情页URL构建
+# ======================================
+
+def build_detail_url(item_id):
+    """构建商品详情页URL"""
+    item_id = str(item_id).strip()
+    base = AUCTION_DETAIL_BASE.rstrip('/')
+    return f"{base}/{item_id}/description"
+
+
+# ======================================
+# 详情爬虫函数
+# ======================================
+
+def clean_description(text):
+    """清理商品描述，移除运输相关内容，保留影响价格的关键信息"""
+    if not text:
+        return ""
+
+    soup = BeautifulSoup(text, "html.parser")
+    plain_text = soup.get_text(separator="\n", strip=True)
+
+    lines = plain_text.split("\n")
+    cleaned_lines = []
+
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+
+        if line in ("&nbsp;", "nbsp;", "&amp;nbsp;", "&amp;nbsp"):
+            continue
+
+        if len(line) < 2 and not re.search(r"[A-Za-z0-9ぁ-んァ-ン一-龥]", line):
+            continue
+
+        if any(keyword in line for keyword in SHIPPING_RELATED_KEYWORDS):
+            continue
+
+        cleaned_lines.append(line)
+
+    cleaned = "\n".join(cleaned_lines)
+
+    # 去掉装饰符号，保留内容
+    cleaned = re.sub(r"[【】★■◆◇●○◎]", " ", cleaned)
+    # 删除分隔线
+    cleaned = re.sub(r"[-_=ー－]{3,}", " ", cleaned)
+    # 删除多余空格和空行
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+
+    return cleaned.strip()
+
+
+def scrape_item_detail(item_id):
+    """
+    爬取单个商品的详情描述
+    
+    返回:
+        dict or None: {
+            "itemId", "title", "description", "url", "scrapedAt"
+        }
+    """
+    url = build_detail_url(item_id)
+    logger.info(f"Scraping detail for item {item_id}")
+    
+    try:
+        resp = requests.get(
+            url,
+            timeout=REQUEST_TIMEOUT,
+            headers={"User-Agent": USER_AGENT}
+        )
+        resp.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"Detail request failed for {item_id}: {e}")
+        return None
+    
+    soup = BeautifulSoup(resp.text, "html.parser")
+    
+    # 提取标题
+    title = None
+    
+    # 从 JSON-LD 提取
+    script_tag = soup.find("script", type="application/ld+json")
+    if script_tag:
+        try:
+            ld_json = json.loads(script_tag.string)
+            if isinstance(ld_json, dict):
+                title = ld_json.get("name", "")
+        except json.JSONDecodeError:
+            pass
+    
+    # 从 title 标签提取
+    if not title:
+        title_tag = soup.find("title")
+        if title_tag:
+            title_text = title_tag.get_text(strip=True)
+            title = re.sub(r'^Yahoo!オークション\s*-\s*', '', title_text)
+    
+    if not title:
+        title = "Unknown Title"
+    
+    # 提取描述
+    description = ""
+    
+    # 从 __NEXT_DATA__ JSON 提取
+    next_data = soup.find("script", id="__NEXT_DATA__")
+    if next_data:
+        try:
+            data = json.loads(next_data.string)
+            
+            def find_desc(obj, depth=0):
+                if depth > 10:
+                    return None
+                if isinstance(obj, dict):
+                    if "descriptionHtml" in obj and obj["descriptionHtml"]:
+                        return obj["descriptionHtml"]
+                    for v in obj.values():
+                        result = find_desc(v, depth + 1)
+                        if result:
+                            return result
+                elif isinstance(obj, list):
+                    for item in obj:
+                        result = find_desc(item, depth + 1)
+                        if result:
+                            return result
+                return None
+            
+            raw_desc = find_desc(data) or ""
+            if raw_desc:
+                description = clean_description(raw_desc)
+        except (json.JSONDecodeError, KeyError):
+            pass
+    
+    # 兜底：从 template 或 body 提取
+    if not description:
+        template_tag = soup.find("template", attrs={"shadowrootmode": "open"})
+        target = template_tag or soup.find("body")
+        if target:
+            raw_text = target.get_text(separator="\n", strip=True)
+            description = clean_description(raw_text)[:DETAIL_DESCRIPTION_MAX_CHARS]
+    
+    result = {
+        "itemId": item_id,
+        "title": title,
+        "description": description[:DETAIL_DESCRIPTION_MAX_CHARS] if description else "",
+        "url": url,
+        "scrapedAt": datetime.now(timezone.utc).isoformat()
+    }
+    
+    logger.info(f"Detail scraped for {item_id}: desc_len={len(description) if description else 0}")
+    return result
+
+
+def enrich_item_with_detail(item):
+    """
+    给列表页解析出的 item 补充详情描述。
+    搜索 closed / active 时直接调用。
+    """
+    item_id = str(item.get("itemId", "")).strip()
+    if not item_id:
+        return item
+
+    detail = scrape_item_detail(item_id)
+
+    if not detail:
+        item["detailScrapeStatus"] = "FAILED"
+        item["detailScrapeError"] = "scrape_item_detail returned None"
+        item["detailScrapedAt"] = datetime.now(timezone.utc).isoformat()
+        item["detailDescription"] = ""
+        item["detailTitle"] = ""
+        item["detailUrl"] = build_detail_url(item_id)
+        item["detailDescriptionLength"] = 0
+        return item
+
+    description = detail.get("description", "") or ""
+
+    item["detailDescription"] = description[:DETAIL_DESCRIPTION_MAX_CHARS]
+    item["detailTitle"] = detail.get("title", "")
+    item["detailUrl"] = detail.get("url", "")
+    item["detailScrapedAt"] = detail.get("scrapedAt", datetime.now(timezone.utc).isoformat())
+    item["detailDescriptionLength"] = len(description)
+    item["detailScrapeStatus"] = "COMPLETED" if description else "EMPTY"
+    item["detailScrapeError"] = ""
+
+    return item
+
+
+def scrape_multiple_details(item_ids, save_to_db=False, search_type="active"):
+    """
+    批量爬取多个商品详情
+    
+    参数:
+        item_ids: 商品ID列表
+        save_to_db: 是否保存到 DynamoDB
+        search_type: active / closed
+    """
+    results = []
+    table = get_target_table(search_type) if save_to_db else None
+    
+    for index, item_id in enumerate(item_ids):
+        detail = scrape_item_detail(item_id)
+
+        if detail:
+            results.append(detail)
+
+            if save_to_db and table:
+                try:
+                    desc = detail.get("description", "")
+                    table.update_item(
+                        Key={"itemID": item_id},
+                        UpdateExpression="""
+                            SET detailDescription = :desc,
+                                detailTitle = :title,
+                                detailUrl = :url,
+                                detailScrapedAt = :now,
+                                detailDescriptionLength = :length,
+                                detailScrapeStatus = :status
+                        """,
+                        ExpressionAttributeValues={
+                            ":desc": desc[:DETAIL_DESCRIPTION_MAX_CHARS],
+                            ":title": detail.get("title", ""),
+                            ":url": detail.get("url", ""),
+                            ":now": detail.get("scrapedAt", datetime.now(timezone.utc).isoformat()),
+                            ":length": len(desc),
+                            ":status": "COMPLETED" if desc else "EMPTY",
+                        }
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to save detail for {item_id}: {e}")
+        
+        if index < len(item_ids) - 1:
+            time.sleep(DETAIL_REQUEST_INTERVAL)
+    
+    return results
+
+
+# ======================================
+# Lambda Handler
+# ======================================
 
 def lambda_handler(event, context):
-    keyword = event.get("keyword")
-    if not keyword:
-        logger.error("Missing 'keyword' in event")
-        return {
-            "statusCode": 400,
-            "body": json.dumps({"error": "Missing keyword"}, ensure_ascii=False)
+    """
+    主入口函数
+    
+    支持的模式:
+    1. search: 搜索商品列表（含详情抓取）
+    2. detail: 爬取单个商品详情
+    3. batch_detail: 批量爬取商品详情
+    4. scrape_and_parse: 搜索 + 详情爬取一体化
+    """
+    action = event.get("action", "search")
+    
+    # ========== 模式1：搜索商品（含详情） ==========
+    if action == "search":
+        keyword = event.get("keyword")
+        if not keyword:
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"error": "Missing keyword"}, ensure_ascii=False)
+            }
+        
+        search_type = event.get("search_type", "closed")
+        include_paypay = event.get("include_paypay", INCLUDE_PAYPAY)
+        min_price = event.get("min_price")
+        if min_price is not None:
+            try:
+                min_price = int(min_price)
+            except (ValueError, TypeError):
+                min_price = None
+        
+        exclude_keywords, include_keywords = get_filter_keywords(event)
+        
+        logger.info(f"Scraping for keyword: '{keyword}', type: '{search_type}'")
+        
+        items = scrape_auctions(keyword, search_type, include_paypay,
+                                exclude_keywords, include_keywords, min_price)
+        
+        if not items:
+            return {
+                "statusCode": 200,
+                "body": json.dumps({
+                    "scraped": 0,
+                    "saved": 0,
+                    "type": search_type,
+                    "min_price_applied": min_price
+                }, ensure_ascii=False)
+            }
+        
+        table = get_target_table(search_type)
+        saved = save_items(items, table)
+        
+        # 统计详情抓取情况
+        detail_stats = {
+            "total": len(items),
+            "completed": sum(1 for i in items if i.get("detailScrapeStatus") == "COMPLETED"),
+            "empty": sum(1 for i in items if i.get("detailScrapeStatus") == "EMPTY"),
+            "failed": sum(1 for i in items if i.get("detailScrapeStatus") == "FAILED"),
+            "not_scraped": sum(1 for i in items if i.get("detailScrapeStatus") in (None, "", "NOT_SCRAPED")),
         }
-
-    search_type = event.get("search_type", "closed")
-    include_paypay = event.get("include_paypay", INCLUDE_PAYPAY)
-    
-    # 新增：支持 min_price 参数
-    min_price = event.get("min_price")
-    if min_price is not None:
-        try:
-            min_price = int(min_price)
-        except (ValueError, TypeError):
-            min_price = None
-    
-    # 获取过滤关键词
-    exclude_keywords, include_keywords = get_filter_keywords(event)
-    
-    logger.info(f"Scraping for keyword: '{keyword}', type: '{search_type}', "
-                f"include_paypay: {include_paypay}, min_price: {min_price}")
-    if exclude_keywords:
-        logger.info(f"Excluding keywords: {exclude_keywords}")
-    if include_keywords:
-        logger.info(f"Including keywords: {include_keywords}")
-
-    items = scrape_auctions(keyword, search_type, include_paypay, 
-                            exclude_keywords, include_keywords, min_price)
-
-    if not items:
-        logger.info("No items found")
+        
         return {
             "statusCode": 200,
             "body": json.dumps({
-                "scraped": 0, 
-                "saved": 0, 
+                "scraped": len(items),
+                "saved": saved,
                 "type": search_type,
                 "min_price_applied": min_price,
+                "detail_stats": detail_stats,
                 "filters_applied": {
                     "exclude_keywords": exclude_keywords if exclude_keywords else None,
                     "include_keywords": include_keywords if include_keywords else None
                 }
             }, ensure_ascii=False)
         }
-
-    table = get_target_table(search_type)
-    saved = save_items(items, table)
-
-    logger.info(f"Scraping completed: {len(items)} items scraped, {saved} saved to DynamoDB")
     
-    return {
-        "statusCode": 200,
-        "body": json.dumps({
-            "scraped": len(items),
-            "saved": saved,
-            "type": search_type,
-            "min_price_applied": min_price,
-            "filters_applied": {
-                "exclude_keywords": exclude_keywords if exclude_keywords else None,
-                "include_keywords": include_keywords if include_keywords else None
+    # ========== 模式2：爬取单个商品详情 ==========
+    elif action == "detail":
+        item_id = event.get("item_id") or event.get("itemId") or event.get("auctionId")
+        if not item_id:
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"error": "Missing item_id"}, ensure_ascii=False)
             }
-        }, ensure_ascii=False)
-    }
-
-
-def scrape_auctions(keyword, search_type, include_paypay=True, 
-                    exclude_keywords="", include_keywords="", min_price=None):
-    """抓取所有页面"""
+        
+        detail = scrape_item_detail(item_id)
+        if not detail:
+            return {
+                "statusCode": 404,
+                "body": json.dumps({"error": f"Failed to scrape detail for {item_id}"}, ensure_ascii=False)
+            }
+        
+        # 可选保存到DB
+        if event.get("save_to_db"):
+            table = get_target_table(event.get("search_type", "active"))
+            try:
+                table.update_item(
+                    Key={"itemID": item_id},
+                    UpdateExpression="""
+                        SET detailDescription = :desc,
+                            detailTitle = :title,
+                            detailUrl = :url,
+                            detailScrapedAt = :now,
+                            detailDescriptionLength = :len,
+                            detailScrapeStatus = :status
+                    """,
+                    ExpressionAttributeValues={
+                        ":desc": detail["description"],
+                        ":title": detail["title"],
+                        ":url": detail["url"],
+                        ":now": detail["scrapedAt"],
+                        ":len": len(detail["description"]),
+                        ":status": "COMPLETED" if detail["description"] else "EMPTY"
+                    }
+                )
+            except Exception as e:
+                logger.error(f"Failed to save detail: {e}")
+        
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "itemId": detail["itemId"],
+                "title": detail["title"],
+                "description": detail["description"],
+                "url": detail["url"],
+                "scrapedAt": detail["scrapedAt"]
+            }, ensure_ascii=False)
+        }
     
-    # ✅ 如果调用方没传过滤词，自动使用默认词库
+    # ========== 模式3：批量爬取商品详情 ==========
+    elif action == "batch_detail":
+        item_ids = event.get("item_ids") or event.get("itemIds") or []
+        if not item_ids:
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"error": "Missing item_ids"}, ensure_ascii=False)
+            }
+        
+        if isinstance(item_ids, str):
+            item_ids = [i.strip() for i in item_ids.split(",") if i.strip()]
+        
+        save_to_db = event.get("save_to_db", True)
+        search_type = event.get("search_type", "active")
+        
+        results = scrape_multiple_details(item_ids, save_to_db=save_to_db, search_type=search_type)
+        
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "total": len(item_ids),
+                "scraped": len(results),
+                "results": results[:10],  # 只返回前10条
+                "item_ids": item_ids[:10]
+            }, ensure_ascii=False, default=str)
+        }
+    
+    # ========== 模式4：搜索 + 详情爬取一体化 ==========
+    elif action == "scrape_and_parse":
+        keyword = event.get("keyword")
+        if not keyword:
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"error": "Missing keyword"}, ensure_ascii=False)
+            }
+        
+        search_type = event.get("search_type", "closed")
+        include_paypay = event.get("include_paypay", INCLUDE_PAYPAY)
+        exclude_keywords, include_keywords = get_filter_keywords(event)
+        
+        items = scrape_auctions(keyword, search_type, include_paypay,
+                                exclude_keywords, include_keywords, event.get("min_price"))
+        
+        if not items:
+            return {
+                "statusCode": 200,
+                "body": json.dumps({
+                    "search": {"scraped": 0, "saved": 0},
+                    "details": {"total": 0, "success": 0},
+                    "type": search_type
+                }, ensure_ascii=False)
+            }
+        
+        table = get_target_table(search_type)
+        saved = save_items(items, table)
+        
+        detail_stats = {
+            "completed": sum(1 for i in items if i.get("detailScrapeStatus") == "COMPLETED"),
+            "empty": sum(1 for i in items if i.get("detailScrapeStatus") == "EMPTY"),
+            "failed": sum(1 for i in items if i.get("detailScrapeStatus") == "FAILED"),
+        }
+        
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "search": {"scraped": len(items), "saved": saved},
+                "details": {
+                    "total": len(items),
+                    "success": detail_stats["completed"],
+                    "empty": detail_stats["empty"],
+                    "failed": detail_stats["failed"],
+                },
+                "type": search_type,
+                "item_ids": [item["itemId"] for item in items[:20]]
+            }, ensure_ascii=False, default=str)
+        }
+    
+    else:
+        return {
+            "statusCode": 400,
+            "body": json.dumps({"error": f"Unknown action: {action}"}, ensure_ascii=False)
+        }
+
+
+# ======================================
+# 搜索和解析函数
+# ======================================
+
+def scrape_auctions(keyword, search_type, include_paypay=True,
+                    exclude_keywords="", include_keywords="", min_price=None):
+    """抓取所有页面，并在解析列表时同步抓取详情"""
     if not exclude_keywords and USE_DEFAULT_EXCLUDE:
         exclude_keywords = os.getenv("CUSTOM_EXCLUDE_KEYWORDS", DEFAULT_EXCLUDE_KEYWORDS)
-        logger.info(f"自动启用默认排除关键词（前100字）: {exclude_keywords[:100]}...")
-    
+
     if not include_keywords:
         include_keywords = DEFAULT_INCLUDE_KEYWORDS
-    
+
     all_items = []
 
     for page in range(1, MAX_PAGES + 1):
@@ -258,293 +626,158 @@ def scrape_auctions(keyword, search_type, include_paypay=True,
         logger.info(f"Fetching page {page}: {url}")
 
         try:
-            resp = requests.get(
-                url,
-                timeout=REQUEST_TIMEOUT,
-                headers={"User-Agent": USER_AGENT}
-            )
+            resp = requests.get(url, timeout=REQUEST_TIMEOUT, headers={"User-Agent": USER_AGENT})
             resp.raise_for_status()
-            logger.info(f"Page {page} response status: {resp.status_code}, content length: {len(resp.text)}")
         except requests.exceptions.RequestException as e:
             logger.error(f"Request failed for page {page}: {e}")
             continue
 
         items = parse_html(resp.text, search_type, include_paypay)
         if not items:
-            logger.info(f"No items found on page {page}, stopping pagination")
             break
+
+        # ========== 关键：列表解析后立即进入详情页抓取 ==========
+        if ENABLE_DETAIL_SCRAPE_ON_SEARCH:
+            enriched_items = []
+            for index, item in enumerate(items):
+                try:
+                    enriched_item = enrich_item_with_detail(item)
+                    enriched_items.append(enriched_item)
+                except Exception as e:
+                    logger.error(f"详情补充失败 itemId={item.get('itemId')}: {e}")
+                    item["detailScrapeStatus"] = "FAILED"
+                    item["detailScrapeError"] = str(e)[:500]
+                    item["detailScrapedAt"] = datetime.now(timezone.utc).isoformat()
+                    enriched_items.append(item)
+
+                # 请求间隔
+                if index < len(items) - 1:
+                    time.sleep(DETAIL_REQUEST_INTERVAL)
+
+            items = enriched_items
 
         all_items.extend(items)
-        logger.info(f"Page {page}: found {len(items)} items (total accumulated: {len(all_items)})")
 
         if len(items) < ITEMS_PER_PAGE:
-            logger.info(f"Last page reached (got {len(items)} items < {ITEMS_PER_PAGE} per page)")
             break
 
-    logger.info(f"Total items scraped across all pages: {len(all_items)}")
+    logger.info(f"Total items scraped: {len(all_items)}")
     return all_items
 
-
-# ==================== 以下所有解析函数保持不变 ====================
 
 def parse_html(html, search_type, include_paypay=True):
     """解析 HTML，提取商品列表"""
     soup = BeautifulSoup(html, "html.parser")
     items = []
 
-    # 调试：打印页面结构
-    if DEBUG_LOG_HTML:
-        logger.info("=== DEBUG: Page structure ===")
-        for i, ul in enumerate(soup.find_all("ul")):
-            classes = " ".join(ul.get("class", []))
-            li_count = len(ul.find_all("li", recursive=False))
-            logger.info(f"UL #{i}: class='{classes}', li_count={li_count}")
-            
-            if li_count > 0:
-                first_li = ul.find("li", recursive=False)
-                li_class = " ".join(first_li.get("class", []))
-                logger.info(f"  First LI class: '{li_class}'")
-                logger.info(f"  First LI HTML: {str(first_li)[:300]}")
-        logger.info("=== END DEBUG ===")
-
-    # 根据搜索类型选择合适的容器
     if search_type == "closed":
         container = soup.select_one("#closedSearchItems")
-        logger.info(f"Looking for closed search container: #closedSearchItems - {'Found' if container else 'Not found'}")
     else:
-        selectors = [
-            ".Products__list",
-            ".ProductList",
-            "[data-auction-list]",
-            ".SearchResults__list",
-            "#auctionsItems",
-            ".Products__items"
-        ]
+        selectors = [".Products__list", ".ProductList", "[data-auction-list]",
+                     ".SearchResults__list", "#auctionsItems", ".Products__items"]
         container = None
         for selector in selectors:
             container = soup.select_one(selector)
             if container:
-                logger.info(f"Found active search container using selector: {selector}")
                 break
-        
-        if not container:
-            logger.warning("No specific container found for active search, will scan all UL elements")
 
-    # 如果没找到特定容器，扫描所有 ul
-    product_items = []
-    
-    if container:
-        logger.info(f"Scanning container for product items")
-        product_items = find_product_items_in_container(container, search_type, include_paypay)
-    else:
-        logger.info("Scanning entire body for product items")
-        product_items = find_product_items_in_container(soup.body, search_type, include_paypay)
-    
-    logger.info(f"Found {len(product_items)} potential product items")
-    
-    # 解析每个商品
-    skipped_count = 0
+    product_items = find_product_items_in_container(
+        container if container else soup.body, search_type, include_paypay
+    )
+
     for li in product_items:
         try:
-            if DEBUG_LOG_HTML:
-                logger.info(f"Parsing product LI: {str(li)[:500]}...")
-
             item = parse_item(li, include_paypay)
             if item:
                 items.append(item)
-            else:
-                skipped_count += 1
         except Exception as e:
             logger.warning(f"Failed to parse product item: {e}")
-            skipped_count += 1
-            continue
 
-    logger.info(f"Successfully parsed {len(items)} items, skipped {skipped_count} items")
+    logger.info(f"Parsed {len(items)} items")
     return items
 
 
 def find_product_items_in_container(container, search_type, include_paypay):
     """在容器中查找商品列表项"""
     product_items = []
-    
-    # 构建链接匹配模式
+
     if include_paypay:
         link_pattern = re.compile(r"(/auction/|paypayfleamarket\.yahoo\.co\.jp/item/)")
     else:
         link_pattern = re.compile(r"/auction/")
-    
-    # 查找所有 ul 元素
-    uls = container.find_all("ul")
-    logger.info(f"Found {len(uls)} UL elements in container")
-    
-    for ul_idx, ul in enumerate(uls):
+
+    for ul in container.find_all("ul"):
         ul_class = " ".join(ul.get("class", [])).lower()
-        
-        # 跳过明显的非商品列表
-        if any(skip_word in ul_class for skip_word in ["category", "nav", "menu", "footer", "header", "breadcrumb"]):
-            logger.info(f"Skipping UL #{ul_idx}: class='{ul_class}' (non-product container)")
+
+        if any(skip in ul_class for skip in ["category", "nav", "menu", "footer", "header", "breadcrumb"]):
             continue
-        
-        # 检查这个 ul 中是否有商品链接
-        has_product_links = False
-        for li in ul.find_all("li", recursive=False):
-            if li.find("a", href=link_pattern) or li.get("data-auction-id"):
-                has_product_links = True
-                break
-        
-        if has_product_links:
-            logger.info(f"UL #{ul_idx}: class='{ul_class}' - Found product links")
+
+        has_links = any(
+            li.find("a", href=link_pattern) or li.get("data-auction-id")
+            for li in ul.find_all("li", recursive=False)
+        )
+
+        if has_links:
             for li in ul.find_all("li", recursive=False):
                 li_class = " ".join(li.get("class", [])).lower()
-                
-                # 跳过分类项
                 if "category" in li_class:
-                    logger.info(f"  Skipping category LI: class='{li_class}'")
                     continue
-                
-                # 检查是否包含商品链接
                 if li.find("a", href=link_pattern) or li.get("data-auction-id"):
                     product_items.append(li)
-                    if DEBUG_LOG_HTML:
-                        logger.info(f"  Added product LI: class='{li_class}'")
-        else:
-            logger.info(f"UL #{ul_idx}: class='{ul_class}' - No product links found, skipping")
-    
+
     return product_items
 
 
 def parse_shipping_info(li):
-    """
-    解析运费信息
-    返回格式：{"shippingFee": 190, "shippingText": "＋送料190円", "isFreeShipping": False}
-    """
-    shipping = {
-        "shippingFee": None,
-        "shippingText": None,
-        "isFreeShipping": False
-    }
-    
-    # 策略1: 查找 Product__postage 元素
+    """解析运费信息"""
+    shipping = {"shippingFee": None, "shippingText": None, "isFreeShipping": False}
+
     postage_elem = li.select_one('.Product__postage')
     if postage_elem:
         shipping_text = postage_elem.get_text(strip=True)
         shipping["shippingText"] = shipping_text
-        logger.info(f"Found shipping text: '{shipping_text}'")
-        
+
         if not shipping_text:
             shipping["shippingFee"] = 0
             shipping["isFreeShipping"] = True
             shipping["shippingText"] = "送料込み"
-            logger.info("Empty shipping text, assuming free shipping (送料込み)")
             return shipping
-        
-        # 格式1: "＋送料190円" 或 "送料190円"
+
         match = re.search(r'送料(\d[\d,]*)円', shipping_text)
         if match:
             try:
                 shipping["shippingFee"] = int(match.group(1).replace(',', ''))
-                shipping["isFreeShipping"] = False
-                
-                if '〜' in shipping_text or '~' in shipping_text:
-                    logger.info(f"Shipping fee range detected: {shipping['shippingFee']}円〜 (minimum)")
-                else:
-                    logger.info(f"Shipping fee: {shipping['shippingFee']}円")
             except ValueError:
                 pass
-        
-        # 格式2: "送料無料"
         elif '無料' in shipping_text or '送料無料' in shipping_text:
             shipping["shippingFee"] = 0
             shipping["isFreeShipping"] = True
-            logger.info("Free shipping (送料無料)")
-        
-        # 格式3: "送料未定"
-        elif '未定' in shipping_text:
-            shipping["shippingFee"] = None
-            shipping["isFreeShipping"] = False
-            logger.info("Shipping fee undetermined (送料未定)")
-        
-        # 格式4: "着払い"
-        elif '着払' in shipping_text:
-            shipping["shippingFee"] = None
-            shipping["isFreeShipping"] = False
-            shipping["shippingText"] = "着払い"
-            logger.info("Cash on delivery (着払い)")
-        
-        # 格式5: 其他情况
-        else:
-            match = re.search(r'(\d[\d,]*)円', shipping_text)
-            if match:
-                try:
-                    shipping["shippingFee"] = int(match.group(1).replace(',', ''))
-                    shipping["isFreeShipping"] = False
-                    logger.info(f"Shipping fee extracted from general pattern: {shipping['shippingFee']}円")
-                except ValueError:
-                    pass
-    else:
-        # 策略2: 检查 Product__priceInfo
-        price_info = li.select_one('.Product__priceInfo')
-        if price_info:
-            price_info_text = price_info.get_text(strip=True)
-            if '送料無料' in price_info_text or '送料込み' in price_info_text:
-                shipping["shippingFee"] = 0
-                shipping["isFreeShipping"] = True
-                shipping["shippingText"] = "送料込み"
-                logger.info("Free shipping detected from price info")
-            else:
-                shipping["shippingFee"] = 0
-                shipping["isFreeShipping"] = True
-                shipping["shippingText"] = "送料込み(推定)"
-                logger.info("No shipping info found, assuming free shipping (送料込み)")
-        else:
-            logger.info("No shipping info element found")
-    
+
     return shipping
 
 
 def parse_seller_location(li):
-    """
-    解析发货地/所在地
-    返回：prefecture 字符串，如 "東京都"
-    """
+    """解析发货地"""
     prefecture = None
-    
-    # 策略1: 查找 .Product__sellFrom 中的 span.u-textGray
+
     sell_from = li.select_one('.Product__sellFrom')
     if sell_from:
         sell_from_span = sell_from.find('span', class_='u-textGray')
         if sell_from_span:
             sell_from_text = sell_from_span.get_text(strip=True)
-            logger.debug(f"Product__sellFrom text: '{sell_from_text}'")
-            
             match = re.search(r'(.+?)から発送', sell_from_text)
             if match:
                 prefecture = match.group(1).strip()
-                logger.info(f"Prefecture from Product__sellFrom: {prefecture}")
             else:
                 prefecture = sell_from_text.strip()
-                logger.info(f"Prefecture from Product__sellFrom (direct text): {prefecture}")
-    
-    # 策略2: 查找 "から発送" 文本
+
     if not prefecture:
         for p in li.find_all("p"):
             txt = p.get_text(strip=True)
             if "から発送" in txt:
                 prefecture = txt.replace("から発送", "").strip()
-                logger.info(f"Prefecture from 'から発送' pattern: {prefecture}")
                 break
-    
-    # 策略3: 查找 div 中的发货信息
-    if not prefecture:
-        sell_from_divs = li.select('div[class*="sellFrom"], div[class*="SellFrom"]')
-        for div in sell_from_divs:
-            txt = div.get_text(strip=True)
-            if txt:
-                prefecture = txt.strip()
-                logger.info(f"Prefecture from sellFrom div: {prefecture}")
-                break
-    
-    # 策略4: 全局搜索 "から発送"
+
     if not prefecture:
         for elem in li.find_all(['span', 'div', 'p']):
             txt = elem.get_text(strip=True)
@@ -552,97 +785,61 @@ def parse_seller_location(li):
                 match = re.search(r'(.+?)から発送', txt)
                 if match:
                     prefecture = match.group(1).strip()
-                    logger.info(f"Prefecture from general 'から発送' search: {prefecture}")
                     break
-    
-    # 策略5: 全局搜索都道府県名
+
     if not prefecture:
         li_text = li.get_text()
         for pref in PREFECTURES_LIST:
             if pref in li_text:
                 prefecture = pref
-                logger.info(f"Prefecture found by name matching: {prefecture}")
                 break
-    
+
     return prefecture
 
 
 def parse_item(li, include_paypay=True):
-    """解析单个商品列表项，提取所有信息"""
-    # ---- 1. 商品链接 & 标题 & ID ----
-    auction_link = None
-    title = None
-    item_id = None
-    item_type = None
-    
+    """解析单个商品列表项"""
     if include_paypay:
         link_pattern = re.compile(r"(/auction/|paypayfleamarket\.yahoo\.co\.jp/item/)")
     else:
         link_pattern = re.compile(r"/auction/")
 
-    # 优先使用CSS选择器
-    title_link = li.select_one('.Product__titleLink')
-    if title_link:
-        auction_link = title_link
-        href = title_link.get('href', '')
-        if DEBUG_LOG_HTML:
-            logger.info(f"Found title link via Product__titleLink: {href}")
-    else:
+    # 查找商品链接
+    auction_link = li.select_one('.Product__titleLink')
+    if not auction_link:
         h3 = li.find('h3', class_='Product__title')
         if h3:
             auction_link = h3.find('a', href=link_pattern)
-            if auction_link and DEBUG_LOG_HTML:
-                logger.info(f"Found title link via h3.Product__title: {auction_link.get('href', '')}")
-        
         if not auction_link:
-            for p in li.find_all("p"):
-                a = p.find("a", href=link_pattern)
-                if a:
-                    auction_link = a
-                    if DEBUG_LOG_HTML:
-                        logger.info(f"Found auction link in p tag: {a.get('href', '')}")
-                    break
+            auction_link = li.find("a", href=link_pattern)
 
     if not auction_link:
-        auction_link = li.find("a", href=link_pattern)
-        if auction_link and DEBUG_LOG_HTML:
-            logger.info(f"Found auction link in fallback: {auction_link.get('href', '')}")
-
-    if not auction_link:
-        if DEBUG_LOG_HTML:
-            all_links = [a.get('href', '') for a in li.find_all('a', href=True)]
-            logger.info(f"Skipping item - no matching links found. Available links: {all_links[:5]}")
         return None
 
     href = auction_link.get("href", "")
     if not href:
-        logger.warning("Empty href in auction link")
         return None
-    
+
     # 提取商品 ID 和类型
+    item_id = None
+    item_type = None
+
     data_id = auction_link.get('data-auction-id', '')
     if data_id:
         item_id = data_id
-        if item_id.startswith('z'):
-            item_type = "paypay"
-        else:
-            item_type = "auction"
-        logger.info(f"Found item via data-auction-id: {item_id} (type: {item_type})")
+        item_type = "paypay" if item_id.startswith('z') else "auction"
     else:
         m = re.search(r"/auction/([a-z0-9]+)", href)
         if m:
             item_id = m.group(1)
             item_type = "auction"
-            logger.info(f"Found auction item: {item_id}")
         else:
             m = re.search(r"/item/([a-z0-9]+)", href)
             if m:
                 item_id = m.group(1)
                 item_type = "paypay"
-                logger.info(f"Found PayPay item: {item_id}")
-    
+
     if not item_id:
-        logger.warning(f"Could not extract item ID from href: {href}")
         return None
 
     # 提取标题
@@ -652,25 +849,16 @@ def parse_item(li, include_paypay=True):
     if not title:
         title = auction_link.get("title", "").strip()
 
-    if not title:
-        logger.warning(f"Title missing for item {item_id} (type: {item_type})")
-    else:
-        logger.info(f"Title: {title[:100]}")
-
-    # ---- 2. 价格 ----
+    # 提取价格
     price = 0
-    price_found = False
-    
     data_price = auction_link.get('data-auction-price', '')
     if data_price:
         try:
             price = int(data_price)
-            price_found = True
-            logger.info(f"Price found from data-auction-price: {price}")
         except ValueError:
             pass
-    
-    if not price_found:
+
+    if price == 0:
         price_value = li.select_one('.Product__priceValue')
         if price_value:
             price_text = price_value.get_text(strip=True)
@@ -678,31 +866,24 @@ def parse_item(li, include_paypay=True):
             if match:
                 try:
                     price = int(match.group(1).replace(",", ""))
-                    price_found = True
-                    logger.info(f"Price found from Product__priceValue: {price}")
                 except ValueError:
                     pass
-    
-    if not price_found:
+
+    if price == 0:
         for span in li.find_all("span"):
             txt = span.get_text(strip=True)
             m = re.match(r"^([\d,]+)円$", txt)
             if m:
                 try:
                     price = int(m.group(1).replace(",", ""))
-                    price_found = True
-                    logger.info(f"Price found from span: {price}")
                     break
                 except ValueError:
                     pass
 
-    if not price_found:
-        logger.info(f"Price not found for item {item_id} (type: {item_type})")
-
-    # ---- 3. 运费信息 ----
+    # 运费
     shipping = parse_shipping_info(li)
 
-    # ---- 4. 即决价格（BuyNow） ----
+    # 即决价格
     buynow_price = None
     price_info_spans = li.select('.Product__price')
     for price_span in price_info_spans:
@@ -716,12 +897,11 @@ def parse_item(li, include_paypay=True):
                     if match:
                         try:
                             buynow_price = int(match.group(1).replace(',', ''))
-                            logger.info(f"BuyNow price: {buynow_price}円")
                         except ValueError:
                             pass
             break
 
-    # ---- 5. 入札数 ----
+    # 入札数
     bid_count = 0
     if item_type == "auction":
         bid_link = li.find("a", href=re.compile(r"bid_hist"))
@@ -729,17 +909,13 @@ def parse_item(li, include_paypay=True):
             bid_text = bid_link.get_text(strip=True)
             try:
                 bid_count = int(re.sub(r"\D", "", bid_text))
-                logger.info(f"Bid count: {bid_count}")
             except ValueError:
                 pass
 
-    # ---- 6. 结束时间 ----
+    # 结束时间
     end_time = None
-    
-    product_div = li.find_parent('div', class_='Product')
-    if not product_div:
-        product_div = li
-    
+    product_div = li.find_parent('div', class_='Product') or li
+
     endtime_elem = product_div.select_one('[data-auction-endtime]')
     if endtime_elem:
         endtime_value = endtime_elem.get('data-auction-endtime', '')
@@ -748,27 +924,21 @@ def parse_item(li, include_paypay=True):
                 timestamp = int(endtime_value)
                 dt = datetime.fromtimestamp(timestamp, tz=timezone(timedelta(hours=9)))
                 end_time = dt.isoformat()
-                logger.info(f"End time from data-auction-endtime: {end_time} (timestamp: {timestamp})")
-            except (ValueError, OSError) as e:
-                logger.warning(f"Failed to parse data-auction-endtime value: {endtime_value} - {e}")
-    
+            except (ValueError, OSError):
+                pass
+
     if not end_time:
         ended_elem = li.find(lambda tag: tag.name in ["span", "p"] and "終了" in tag.get_text())
         if ended_elem:
             time_text = ended_elem.get_text(strip=True)
             end_time = parse_end_time(time_text)
-            if end_time:
-                logger.info(f"End time from ended element: {end_time}")
-    
+
     if not end_time:
         all_text = li.get_text(separator=" ", strip=True)
         m = re.search(r"\d{1,2}/\d{1,2}\s+\d{1,2}:\d{2}", all_text)
         if m:
-            time_text = m.group()
-            end_time = parse_end_time(time_text)
-            if end_time:
-                logger.info(f"End time from regex: {end_time}")
-    
+            end_time = parse_end_time(m.group())
+
     if not end_time:
         timeleft_elem = li.select_one('[data-timeleft]')
         if timeleft_elem:
@@ -778,137 +948,71 @@ def parse_item(li, include_paypay=True):
                     seconds_left = int(timeleft)
                     now = datetime.now(timezone(timedelta(hours=9)))
                     end_time = (now + timedelta(seconds=seconds_left)).isoformat()
-                    logger.info(f"End time calculated from data-timeleft: {end_time}")
                 except ValueError:
                     pass
-    
-    if not end_time:
-        logger.info(f"No end time found for item {item_id} (type: {item_type})")
 
-    # ---- 7. 卖家 ID ----
+    # 卖家ID
     seller_id = None
-    
     seller_id_elem = product_div.select_one('[data-auction-auc-seller-id]')
     if seller_id_elem:
         seller_id = seller_id_elem.get('data-auction-auc-seller-id', '')
-        if seller_id:
-            logger.info(f"Seller ID from data-auction-auc-seller-id: {seller_id}")
-    
+
     if not seller_id:
         seller_patterns = [
-            re.compile(r"/user/"),
-            re.compile(r"/seller/"),
-            re.compile(r"userID=", re.IGNORECASE),
-            re.compile(r"/show/rating", re.IGNORECASE)
+            re.compile(r"/user/"), re.compile(r"/seller/"),
+            re.compile(r"userID=", re.IGNORECASE), re.compile(r"/show/rating", re.IGNORECASE)
         ]
-        
         seller_link = None
-        
         for pattern in seller_patterns:
             seller_link = li.find("a", href=pattern)
             if seller_link:
                 break
-        
         if seller_link:
             seller_href = seller_link.get("href", "")
-            
-            patterns = [
-                r"/user/([^/?#]+)",
-                r"/seller/([^/?#]+)",
-                r"[?&]userID=([^&#]+)"
-            ]
-            
-            for pattern in patterns:
+            for pattern in [r"/user/([^/?#]+)", r"/seller/([^/?#]+)", r"[?&]userID=([^&#]+)"]:
                 match = re.search(pattern, seller_href, re.IGNORECASE)
                 if match:
                     seller_id = match.group(1)
                     break
-            
-            if seller_id:
-                logger.info(f"Seller ID from link: {seller_id}")
-            else:
-                logger.info(f"Seller link found but ID could not be parsed: {seller_href}")
-        else:
-            logger.info(f"Seller not found for item {item_id} (type: {item_type})")
 
-    # ---- 8. 好评率 ----
+    # 好评率
     rating = None
-    
     rating_elem = li.select_one('.Product__ratingValue')
     if rating_elem:
         rating_text = rating_elem.get_text(strip=True)
         if rating_text and rating_text != "新規":
             rating = rating_text
-            logger.info(f"Rating found via Product__ratingValue: {rating}")
-        elif rating_text == "新規":
-            logger.info(f"Seller is new (新規) for item {item_id}")
-    
-    if not rating:
-        seller_link_check = li.find("a", href=re.compile(r"/seller/|/user/"))
-        if seller_link_check:
-            parent = seller_link_check.parent
-            if parent:
-                for _ in range(3):
-                    spans = parent.find_all("span")
-                    for sp in spans:
-                        txt = sp.get_text(strip=True)
-                        if re.match(r"^\d{1,3}\.\d%$", txt):
-                            rating = txt
-                            logger.info(f"Rating found near seller: {rating}")
-                            break
-                    if rating:
-                        break
-                    parent = parent.parent
-                    if not parent:
-                        break
 
     if not rating:
         for sp in li.find_all("span"):
             txt = sp.get_text(strip=True)
             if re.match(r"^\d{1,3}\.\d%$", txt):
                 rating = txt
-                logger.info(f"Rating found globally: {rating}")
                 break
 
-    if not rating:
-        logger.info(f"Rating not found for item {item_id} (type: {item_type})")
-
-    # ---- 9. 发货地 ----
+    # 发货地
     prefecture = parse_seller_location(li)
-    if not prefecture:
-        logger.info(f"Prefecture not found for item {item_id} (type: {item_type})")
 
-    # ---- 10. 卖家类型 ----
-    seller_type = "personal"
-    if li.select_one('.Product__icon--store'):
-        seller_type = "store"
-        logger.info(f"Seller type: store")
+    # 卖家类型
+    seller_type = "store" if li.select_one('.Product__icon--store') else "personal"
 
-    # ---- 11. 商品状态 ----
+    # 商品状态
     item_condition = None
     condition_icons = li.select('.Product__icon')
     for icon in condition_icons:
         icon_text = icon.get_text(strip=True)
         if icon_text in ['未使用', '新品', '中古', '新規']:
             item_condition = icon_text
-            logger.info(f"Item condition: {item_condition}")
             break
 
-    # ---- 12. 缩略图 URL ----
-    thumbnail_url = None
-    
-    data_img = auction_link.get('data-auction-img', '')
-    if data_img:
-        thumbnail_url = data_img
-        logger.info(f"Thumbnail URL found from data-auction-img")
-    else:
+    # 缩略图
+    thumbnail_url = auction_link.get('data-auction-img', '')
+    if not thumbnail_url:
         img = li.find("img")
         if img:
-            thumbnail_url = img.get("src") or img.get("data-src")
-            if thumbnail_url:
-                logger.info(f"Thumbnail URL found from img tag")
+            thumbnail_url = img.get("src") or img.get("data-src") or ""
 
-    # ---- 13. 构建返回对象 ----
+    # 构建返回对象
     item = {
         "itemId": item_id,
         "itemType": item_type,
@@ -930,60 +1034,42 @@ def parse_item(li, include_paypay=True):
         "scrapedAt": datetime.now(timezone.utc).isoformat()
     }
 
-    logger.info(f"Successfully parsed item: [{item_type}] {item_id} - {title[:50] if title else 'N/A'}...")
     return item
 
 
 def parse_end_time(text):
-    """
-    从时间文本中提取日期时间，返回 ISO 格式字符串（JST, UTC+9）
-    """
+    """解析结束时间"""
     if not text:
-        logger.debug("parse_end_time: empty text")
         return None
 
     text = text.replace("時", ":").replace("分", "")
-
     m = re.search(r"(\d{1,4})?[\/-]?(\d{1,2})[\/-](\d{1,2})\s+(\d{1,2}):(\d{2})", text)
     if not m:
-        logger.info(f"parse_end_time: could not parse '{text}'")
         return None
 
     if m.group(1) and len(m.group(1)) == 4:
-        year = int(m.group(1))
-        month = int(m.group(2))
-        day = int(m.group(3))
+        year, month, day = int(m.group(1)), int(m.group(2)), int(m.group(3))
     else:
-        year = datetime.now().year
-        month = int(m.group(2))
-        day = int(m.group(3))
+        year, month, day = datetime.now().year, int(m.group(2)), int(m.group(3))
 
-    hour = int(m.group(4))
-    minute = int(m.group(5))
+    hour, minute = int(m.group(4)), int(m.group(5))
 
     try:
         dt = datetime(year, month, day, hour, minute, tzinfo=timezone(timedelta(hours=9)))
-        logger.debug(f"parse_end_time: parsed '{text}' -> {dt.isoformat()}")
         return dt.isoformat()
-    except ValueError as e:
-        logger.warning(f"Invalid date/time: {text} - {e}")
+    except ValueError:
         return None
 
 
 def save_items(items, table):
-    """
-    保存商品到 DynamoDB，使用 ConditionExpression 防止重复插入
-    """
+    """保存商品到 DynamoDB，包含详情描述"""
     saved = 0
     skipped_duplicates = 0
     failed = 0
-    
-    logger.info(f"Starting to save {len(items)} items to DynamoDB table: {table.name}")
-    
+
     for item in items:
         try:
             item_key = item["itemId"]
-            
             table.put_item(
                 Item={
                     "itemID": item_key,
@@ -1004,18 +1090,56 @@ def save_items(items, table):
                     "url": item.get("url") or "",
                     "thumbnailUrl": item.get("thumbnailUrl") or "",
                     "scrapedAt": item.get("scrapedAt") or datetime.now(timezone.utc).isoformat(),
+                    
+                    # 详情字段
+                    "detailDescription": item.get("detailDescription", ""),
+                    "detailTitle": item.get("detailTitle", ""),
+                    "detailUrl": item.get("detailUrl", ""),
+                    "detailScrapedAt": item.get("detailScrapedAt", ""),
+                    "detailDescriptionLength": item.get("detailDescriptionLength", 0),
+                    "detailScrapeStatus": item.get("detailScrapeStatus", "NOT_SCRAPED"),
+                    "detailScrapeError": item.get("detailScrapeError", ""),
+                    
                     "ttl": int((datetime.now(timezone.utc) + timedelta(days=180)).timestamp())
                 },
                 ConditionExpression="attribute_not_exists(itemID)"
             )
             saved += 1
-            logger.info(f"Saved to DynamoDB: [{item.get('itemType')}] {item_key} - {item.get('title', 'N/A')[:50]}")
+
         except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
             skipped_duplicates += 1
-            logger.info(f"Skipped duplicate: {item_key}")
+            
+            # 已存在时也更新详情
+            try:
+                table.update_item(
+                    Key={"itemID": item["itemId"]},
+                    UpdateExpression="""
+                        SET detailDescription = :desc,
+                            detailTitle = :detail_title,
+                            detailUrl = :detail_url,
+                            detailScrapedAt = :detail_scraped_at,
+                            detailDescriptionLength = :detail_len,
+                            detailScrapeStatus = :detail_status,
+                            detailScrapeError = :detail_error,
+                            lastDetailUpdatedAt = :now
+                    """,
+                    ExpressionAttributeValues={
+                        ":desc": item.get("detailDescription", ""),
+                        ":detail_title": item.get("detailTitle", ""),
+                        ":detail_url": item.get("detailUrl", ""),
+                        ":detail_scraped_at": item.get("detailScrapedAt", ""),
+                        ":detail_len": item.get("detailDescriptionLength", 0),
+                        ":detail_status": item.get("detailScrapeStatus", "NOT_SCRAPED"),
+                        ":detail_error": item.get("detailScrapeError", ""),
+                        ":now": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+            except Exception as e:
+                logger.error(f"Failed to update detail for duplicate {item.get('itemId')}: {e}")
+
         except Exception as e:
             failed += 1
             logger.error(f"Failed to save {item.get('itemId')}: {e}")
 
-    logger.info(f"DynamoDB save completed: {saved} saved, {skipped_duplicates} duplicates skipped, {failed} failed")
+    logger.info(f"Saved: {saved}, Skipped: {skipped_duplicates}, Failed: {failed}")
     return saved
