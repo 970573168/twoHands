@@ -1,10 +1,3 @@
-以下是完整的修改后代码，主要变更：
-
-1. **放宽匹配条件**：variant（颜色/运营商）不参与价格匹配
-2. **存储容量归一化**：PC内存+硬盘格式标准化
-3. **只保留影响价格的关键参数**
-
-```python
 """
 Yahoo Auction 商品分析工作流 Lambda (多API模式切换版)
 支持通过环境变量 AI_MODE 切换 gemini / doubao / openai
@@ -1765,4 +1758,3 @@ def parse_ai_json(content: str) -> Optional[Dict]:
         except (json.JSONDecodeError, AttributeError): continue
     logger.error(f"AI応答を解析できません: {content[:500]}")
     return None
-```
