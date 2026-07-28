@@ -70,11 +70,11 @@ TABLE_NAME_CLOSED = _env_str("TABLE_NAME_CLOSED", "YahooAuctionItems")
 PRODUCT_TABLE_NAME = _env_str("PRODUCT_TABLE_NAME", "ProductCatalog-dev")
 
 # ============ AI 模式切换配置 ============
-AI_MODE = _env_str("AI_MODE", "gemini")  # gemini / doubao / openai
+AI_MODE = _env_str("AI_MODE", "doubao")  # gemini / doubao / openai
 
 # Gemini 配置（默认首选）
 GEMINI_API_KEY = _env_str("GEMINI_API_KEY", "")
-GEMINI_MODEL = _env_str("GEMINI_MODEL", "gemini-2.0-flash-latest")
+GEMINI_MODEL = _env_str("GEMINI_MODEL", "doubao-seed-2-0-mini-260428")
 GEMINI_URL = _env_str("GEMINI_URL", "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-latest:generateContent")
 GEMINI_TIMEOUT = _env_int("GEMINI_TIMEOUT", 60)
 GEMINI_MAX_TOKENS = _env_int("GEMINI_MAX_TOKENS", 4000)
@@ -102,8 +102,8 @@ DEFAULT_CLOSED_COUNT = _env_int("DEFAULT_CLOSED_COUNT", 100)
 MAX_ACTIVE_ITEMS = _env_int("MAX_ACTIVE_ITEMS", 100)
 MAX_CLOSED_ITEMS = _env_int("MAX_CLOSED_ITEMS", 100)
 
-MODEL_PARSE_BATCH_SIZE = _env_int("MODEL_PARSE_BATCH_SIZE", 15)
-CLOSED_PARSE_BATCH_SIZE = _env_int("CLOSED_PARSE_BATCH_SIZE", 15)
+MODEL_PARSE_BATCH_SIZE = _env_int("MODEL_PARSE_BATCH_SIZE", 100)
+CLOSED_PARSE_BATCH_SIZE = _env_int("CLOSED_PARSE_BATCH_SIZE", 100)
 
 BUY_MARGIN_THRESHOLD = _env_decimal("BUY_MARGIN_THRESHOLD", "0.20")
 REVIEW_MARGIN_THRESHOLD = _env_decimal("REVIEW_MARGIN_THRESHOLD", "0.10")
