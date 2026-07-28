@@ -249,26 +249,26 @@ Parameters:
 
   YahooAuctionItemsPerPage:
     Type: Number
-    Default: 50
+    Default: 100
     MinValue: 10
     MaxValue: 100
 
   # ============ Yahoo Auction Analyzer 参数 ============
   ModelParseBatchSize:
     Type: Number
-    Default: 10
+    Default: 100
     MinValue: 1
-    MaxValue: 50
+    MaxValue: 1000
 
   ClosedParseBatchSize:
     Type: Number
-    Default: 15
+    Default: 100
     MinValue: 1
-    MaxValue: 50
+    MaxValue: 1000
 
   MaxClosedPerModel:
     Type: Number
-    Default: 50
+    Default: 100
     MinValue: 10
     MaxValue: 200
 
