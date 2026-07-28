@@ -456,9 +456,9 @@ Parameters:
 
   CatalogScannerMaxModels:
     Type: Number
-    Default: 3
+    Default: 10
     MinValue: 1
-    MaxValue: 10
+    MaxValue: 100
 
 Conditions:
   # ============ Secret 创建条件 ============
