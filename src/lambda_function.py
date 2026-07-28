@@ -47,6 +47,12 @@ OPENAI_MAX_TOKENS = int(os.environ.get("OPENAI_MAX_TOKENS", "4000"))
 # 故障切换冷却时间
 AI_FAILOVER_COOLDOWN = int(os.environ.get("AI_FAILOVER_COOLDOWN", "300"))
 
+# ========== 官方售价过滤配置（新增） ==========
+MIN_OFFICIAL_PRICE_JPY = int(os.environ.get("MIN_OFFICIAL_PRICE_JPY", "50000"))
+SKIP_IF_OFFICIAL_PRICE_MISSING = os.environ.get(
+    "SKIP_IF_OFFICIAL_PRICE_MISSING", "false"
+).lower() == "true"
+
 # ========== 旧版配置（向后兼容） ==========
 SECRET_NAME = os.environ.get("SECRET_NAME", "")
 API_URL = os.environ.get("API_URL", "")
@@ -102,7 +108,66 @@ _total_tokens_used = 0
 _lambda_start_time = None
 
 # GSI 权限状态缓存
-_gsi_permission_granted = True  # 默认假设有权限
+_gsi_permission_granted = True
+
+# ============================================
+# 官方售价辅助函数（新增）
+# ============================================
+
+def safe_int_price(value, default: int = 0) -> int:
+    """安全转换整数（用于价格）"""
+    try:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            value = value.replace(",", "").replace("円", "").replace("¥", "").replace("¥", "").strip()
+            if not value:
+                return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def get_official_price_jpy(product_item: dict) -> int:
+    """
+    从 PRODUCT 记录中读取官方售价（日元）。
+    兼容多个可能字段名。
+    """
+    candidate_fields = [
+        "official_price_jpy", "officialPriceJpy",
+        "official_price", "officialPrice",
+        "msrp_jpy", "msrp",
+        "launch_price_jpy", "launchPriceJpy",
+        "retail_price_jpy", "retailPriceJpy",
+    ]
+    
+    for field in candidate_fields:
+        if field in product_item:
+            price = safe_int_price(product_item.get(field), 0)
+            if price > 0:
+                return price
+    
+    return 0
+
+
+def should_skip_by_official_price(product_item: dict) -> dict:
+    """
+    判断是否因为官方售价过低而跳过。
+    返回: {"skip": bool, "official_price_jpy": int, "reason": str}
+    """
+    official_price = get_official_price_jpy(product_item)
+    
+    if official_price <= 0:
+        if SKIP_IF_OFFICIAL_PRICE_MISSING:
+            return {"skip": True, "official_price_jpy": 0, "reason": "OFFICIAL_PRICE_MISSING"}
+        return {"skip": False, "official_price_jpy": 0, "reason": "OFFICIAL_PRICE_MISSING_BUT_ALLOWED"}
+    
+    if official_price < MIN_OFFICIAL_PRICE_JPY:
+        return {"skip": True, "official_price_jpy": official_price, "reason": "OFFICIAL_PRICE_TOO_LOW"}
+    
+    return {"skip": False, "official_price_jpy": official_price, "reason": "OFFICIAL_PRICE_OK"}
+
+# ============================================
 
 
 # ============================================
@@ -152,44 +217,27 @@ def get_ai_config(mode: str = None) -> dict:
     
     configs = {
         "gemini": {
-            "name": "gemini",
-            "type": "gemini",
-            "url": GEMINI_URL,
+            "name": "gemini", "type": "gemini", "url": GEMINI_URL,
             "key": GEMINI_API_KEY or _get_api_key_from_secrets("gemini"),
-            "model": GEMINI_MODEL,
-            "timeout": GEMINI_TIMEOUT,
-            "max_tokens": GEMINI_MAX_TOKENS,
+            "model": GEMINI_MODEL, "timeout": GEMINI_TIMEOUT, "max_tokens": GEMINI_MAX_TOKENS,
         },
         "doubao": {
-            "name": "doubao",
-            "type": "openai_compatible",
-            "url": DOUBAO_URL,
+            "name": "doubao", "type": "openai_compatible", "url": DOUBAO_URL,
             "key": DOUBAO_API_KEY or _get_api_key_from_secrets("doubao"),
-            "model": DOUBAO_MODEL,
-            "timeout": DOUBAO_TIMEOUT,
-            "max_tokens": DOUBAO_MAX_TOKENS,
+            "model": DOUBAO_MODEL, "timeout": DOUBAO_TIMEOUT, "max_tokens": DOUBAO_MAX_TOKENS,
         },
         "openai": {
-            "name": "openai",
-            "type": "openai_compatible",
-            "url": OPENAI_URL,
+            "name": "openai", "type": "openai_compatible", "url": OPENAI_URL,
             "key": OPENAI_API_KEY or _get_api_key_from_secrets("openai"),
-            "model": OPENAI_MODEL,
-            "timeout": OPENAI_TIMEOUT,
-            "max_tokens": OPENAI_MAX_TOKENS,
+            "model": OPENAI_MODEL, "timeout": OPENAI_TIMEOUT, "max_tokens": OPENAI_MAX_TOKENS,
         }
     }
     
-    # 向后兼容旧配置
     if mode not in configs and SECRET_NAME and API_URL:
         return {
-            "name": "legacy",
-            "type": "openai_compatible",
-            "url": API_URL,
-            "key": _get_legacy_api_key(),
-            "model": MODEL or "doubao-seed-2-1-pro-260628",
-            "timeout": REQUEST_TIMEOUT,
-            "max_tokens": int(os.environ.get("MAX_TOKENS", "4000")),
+            "name": "legacy", "type": "openai_compatible", "url": API_URL,
+            "key": _get_legacy_api_key(), "model": MODEL or "doubao-seed-2-1-pro-260628",
+            "timeout": REQUEST_TIMEOUT, "max_tokens": int(os.environ.get("MAX_TOKENS", "4000")),
         }
     
     if mode not in configs:
@@ -200,14 +248,11 @@ def get_ai_config(mode: str = None) -> dict:
 
 
 def _get_legacy_api_key() -> str:
-    """获取旧版 API Key（向后兼容）"""
-    if not SECRET_NAME:
-        return ""
+    if not SECRET_NAME: return ""
     try:
         response = secretsmanager.get_secret_value(SecretId=SECRET_NAME)
         secret_string = response.get("SecretString", "")
-        if not secret_string:
-            return ""
+        if not secret_string: return ""
         try:
             secret_data = json.loads(secret_string)
             return secret_data.get("apiKey") or secret_data.get("api_key") or secret_data.get("key") or ""
@@ -218,24 +263,17 @@ def _get_legacy_api_key() -> str:
 
 
 def get_available_ai_config() -> dict:
-    """获取可用的 AI 配置，考虑故障切换"""
     fallback_order = ["gemini", "doubao", "openai"]
-    
-    if AI_MODE in fallback_order:
-        ordered_modes = [AI_MODE] + [m for m in fallback_order if m != AI_MODE]
-    else:
-        ordered_modes = fallback_order
-    
+    ordered_modes = [AI_MODE] + [m for m in fallback_order if m != AI_MODE] if AI_MODE in fallback_order else fallback_order
     now = time.time()
     
     for mode in ordered_modes:
         if mode in _ai_mode_state["failed_modes"]:
             fail_time = _ai_mode_state["failed_modes"][mode]
             if now - fail_time < AI_FAILOVER_COOLDOWN:
-                log("INFO", f"AI 模式 '{mode}' 冷却中", remaining_seconds=int(AI_FAILOVER_COOLDOWN - (now - fail_time)))
+                log("INFO", f"AI 模式 '{mode}' 冷却中")
                 continue
             else:
-                log("INFO", f"AI 模式 '{mode}' 冷却结束，重新可用")
                 del _ai_mode_state["failed_modes"][mode]
         
         config = get_ai_config(mode)
@@ -243,7 +281,6 @@ def get_available_ai_config() -> dict:
             log("INFO", f"选择 AI 模式: '{mode}'")
             return config
     
-    # 尝试旧版配置
     if SECRET_NAME and API_URL:
         legacy_config = get_ai_config("legacy")
         if legacy_config["key"]:
@@ -254,13 +291,11 @@ def get_available_ai_config() -> dict:
 
 
 def mark_ai_mode_failed(mode: str, error: str = ""):
-    """标记 AI 模式故障"""
     _ai_mode_state["failed_modes"][mode] = time.time()
     log("WARN", f"AI 模式 '{mode}' 标记为故障", cooldown_seconds=AI_FAILOVER_COOLDOWN, error=error[:100])
 
 
 def reset_ai_state():
-    """重置 AI 状态"""
     _ai_mode_state["failed_modes"].clear()
     log("INFO", "AI 模式状态已重置")
 
@@ -270,133 +305,64 @@ def reset_ai_state():
 # ============================================
 
 def check_dynamodb_permissions():
-    """检查 DynamoDB 权限是否配置正确"""
     global _gsi_permission_granted
-    
     try:
-        # 检查表权限
         table.table_status
         log("INFO", "DynamoDB 表权限检查通过")
-        
-        # 检查 GSI 查询权限
         if ENABLE_GSI_QUERY:
             try:
-                response = table.query(
-                    IndexName="GSI1",
-                    KeyConditionExpression=Key("GSI1PK").eq("PERMISSION_CHECK"),
-                    Limit=1
-                )
+                table.query(IndexName="GSI1", KeyConditionExpression=Key("GSI1PK").eq("PERMISSION_CHECK"), Limit=1)
                 _gsi_permission_granted = True
                 log("INFO", "DynamoDB GSI 查询权限检查通过")
             except Exception as e:
                 if "AccessDeniedException" in str(e):
                     _gsi_permission_granted = False
-                    log("WARN", "DynamoDB GSI 查询权限不足，将使用备用查询方案", 
-                        suggestion="请添加 IAM 策略：dynamodb:Query on table/index/*")
-                else:
-                    log("WARN", "GSI 权限检查异常", error=str(e)[:200])
-        else:
-            _gsi_permission_granted = False
-            log("INFO", "GSI 查询已通过环境变量禁用")
-            
+                    log("WARN", "DynamoDB GSI 查询权限不足，将使用备用查询方案")
     except Exception as e:
         log("ERROR", "DynamoDB 权限检查失败", error=str(e)[:200])
-
-
-def get_latest_model_date_via_gsi(brand_key):
-    """通过 GSI 查询获取最新型号日期"""
-    response = table.query(
-        IndexName="GSI1",
-        KeyConditionExpression=Key("GSI1PK").eq(f"BRAND#{brand_key}"),
-        ScanIndexForward=False,
-        Limit=1
-    )
-    items = response.get("Items", [])
-    if items:
-        return items[0].get("release_date", "")
-    return None
-
-
-def get_latest_model_date_via_scan(brand):
-    """通过 Scan 获取最新型号日期（备用方案）"""
-    try:
-        response = table.scan(
-            FilterExpression="brand = :brand AND attribute_exists(release_date)",
-            ExpressionAttributeValues={":brand": brand},
-            ProjectionExpression="release_date, PK",
-            Limit=500
-        )
-        items = response.get("Items", [])
-        
-        # 提取有效日期并排序
-        valid_dates = []
-        for item in items:
-            date = item.get("release_date", "")
-            if date and re.match(r"^\d{4}-\d{2}-\d{2}", date):
-                valid_dates.append(date)
-        
-        if valid_dates:
-            return max(valid_dates)  # 返回最新日期
-        
-        return None
-        
-    except Exception as e:
-        log("WARN", "Scan 备用查询失败", brand=brand, error=str(e)[:200])
-        return None
 
 
 def get_latest_model_date(brand):
     """获取指定品牌的最新型号日期（带备用方案）"""
     global _gsi_permission_granted
-    
     brand_key = key_part(brand)
     
-    # 方案1：使用 GSI 查询（最快）
     if ENABLE_GSI_QUERY and _gsi_permission_granted:
         for attempt in range(GSI_QUERY_MAX_RETRIES):
             try:
-                return get_latest_model_date_via_gsi(brand_key)
-                
+                response = table.query(
+                    IndexName="GSI1",
+                    KeyConditionExpression=Key("GSI1PK").eq(f"BRAND#{brand_key}"),
+                    ScanIndexForward=False, Limit=1
+                )
+                items = response.get("Items", [])
+                if items:
+                    return items[0].get("release_date", "")
+                return None
             except Exception as e:
                 error_str = str(e)
-                
-                # 如果是权限错误，切换到备用方案并标记
                 if "AccessDeniedException" in error_str:
-                    log("WARN", "GSI 查询权限不足，切换到 Scan 备用方案", 
-                        brand=brand, suggestion="请添加 IAM 策略：dynamodb:Query on table/index/*")
                     _gsi_permission_granted = False
-                    break  # 直接跳出循环使用备用方案
-                
-                # 如果是限流错误，等待后重试
-                if any(err in error_str for err in [
-                    "ProvisionedThroughputExceededException",
-                    "ThrottlingException",
-                    "RequestLimitExceeded"
-                ]):
-                    if attempt < GSI_QUERY_MAX_RETRIES - 1:
-                        wait_time = (2 ** attempt) * 0.5
-                        log("WARN", f"GSI 查询限流，{wait_time:.1f}秒后重试", 
-                            brand=brand, attempt=attempt+1)
-                        time.sleep(wait_time)
-                        continue
-                    else:
-                        log("WARN", "GSI 查询限流重试耗尽，切换到备用方案", brand=brand)
-                        break
-                
-                # 其他错误，尝试重试
-                if attempt < GSI_QUERY_MAX_RETRIES - 1:
-                    time.sleep(0.5)
-                    continue
-                else:
-                    log("WARN", "GSI 查询失败（已达最大重试次数）", 
-                        brand=brand, error=error_str[:200])
                     break
+                if attempt < GSI_QUERY_MAX_RETRIES - 1:
+                    time.sleep((2 ** attempt) * 0.5)
+                    continue
+                break
     
-    # 方案2：使用 Scan 备用方案
-    if not _gsi_permission_granted or not ENABLE_GSI_QUERY:
-        log("INFO", "使用 Scan 备用方案查询最新型号日期", brand=brand)
-    
-    return get_latest_model_date_via_scan(brand)
+    # Scan 备用方案
+    try:
+        response = table.scan(
+            FilterExpression="brand = :brand AND attribute_exists(release_date)",
+            ExpressionAttributeValues={":brand": brand},
+            ProjectionExpression="release_date",
+            Limit=500
+        )
+        items = response.get("Items", [])
+        valid_dates = [item["release_date"] for item in items if item.get("release_date") and re.match(r"^\d{4}-\d{2}-\d{2}", item["release_date"])]
+        return max(valid_dates) if valid_dates else None
+    except Exception as e:
+        log("WARN", "Scan 备用查询失败", brand=brand, error=str(e)[:200])
+        return None
 
 
 # ============================================
@@ -404,7 +370,7 @@ def get_latest_model_date(brand):
 # ============================================
 
 class DiscoveryTracker:
-    """发现任务追踪器 - 记录Token消耗和时间花费"""
+    """发现任务追踪器"""
     
     def __init__(self):
         self.start_time = time.time()
@@ -419,103 +385,78 @@ class DiscoveryTracker:
             "total": {"api_calls": 0, "tokens": 0, "items": 0, "errors": 0}
         }
         
-        self.timing_details = {
-            "phases": {},
-            "api_calls": [],
-            "db_operations": []
-        }
+        self.timing_details = {"phases": {}, "api_calls": [], "db_operations": []}
         
-        self.summary = {
-            "categories_discovered": 0,
-            "brands_discovered": 0,
-            "models_discovered": 0,
-            "total_api_calls": 0,
-            "total_tokens_used": 0,
-            "elapsed_seconds": 0
+        # 价格过滤统计（新增）
+        self.price_filter_stats = {
+            "total_checked": 0,
+            "skipped_low_price": 0,
+            "skipped_missing_price": 0,
+            "passed": 0
         }
     
     def start_phase(self, phase_name, **metadata):
-        if self.current_phase:
-            self.end_phase()
+        if self.current_phase: self.end_phase()
         self.current_phase = phase_name
         self.phase_start_time = time.time()
         self.phase_stack.append(phase_name)
         log("INFO", f"开始阶段: {phase_name}", phase=phase_name, **metadata)
     
     def end_phase(self):
-        if not self.current_phase or not self.phase_start_time:
-            return
+        if not self.current_phase or not self.phase_start_time: return
         elapsed = time.time() - self.phase_start_time
         if self.current_phase not in self.timing_details["phases"]:
-            self.timing_details["phases"][self.current_phase] = {
-                "calls": 0, "total_seconds": 0, "min_seconds": float('inf'), "max_seconds": 0, "avg_seconds": 0
-            }
+            self.timing_details["phases"][self.current_phase] = {"calls": 0, "total_seconds": 0, "min_seconds": float('inf'), "max_seconds": 0}
         phase_stats = self.timing_details["phases"][self.current_phase]
         phase_stats["calls"] += 1
         phase_stats["total_seconds"] += elapsed
         phase_stats["min_seconds"] = min(phase_stats["min_seconds"], elapsed)
         phase_stats["max_seconds"] = max(phase_stats["max_seconds"], elapsed)
-        phase_stats["avg_seconds"] = phase_stats["total_seconds"] / phase_stats["calls"]
-        log("INFO", f"阶段完成: {self.current_phase}", phase=self.current_phase, duration_seconds=round(elapsed, 2))
-        if self.phase_stack and self.phase_stack[-1] == self.current_phase:
-            self.phase_stack.pop()
+        log("INFO", f"阶段完成: {self.current_phase}", duration_seconds=round(elapsed, 2))
         self.current_phase = None
         self.phase_start_time = None
     
     def record_api_call(self, task_type, tokens_used, item_count, success=True, error=None):
-        if task_type not in self.token_details:
-            task_type = "total"
+        if task_type not in self.token_details: task_type = "total"
         self.token_details[task_type]["api_calls"] += 1
         self.token_details[task_type]["tokens"] += tokens_used
         self.token_details[task_type]["items"] += item_count
-        if not success:
-            self.token_details[task_type]["errors"] += 1
+        if not success: self.token_details[task_type]["errors"] += 1
         self.token_details["total"]["api_calls"] += 1
         self.token_details["total"]["tokens"] += tokens_used
         self.token_details["total"]["items"] += item_count
-        if not success:
-            self.token_details["total"]["errors"] += 1
-        self.timing_details["api_calls"].append({
-            "timestamp": time.time(), "task_type": task_type, "tokens_used": tokens_used,
-            "item_count": item_count, "success": success, "error": str(error) if error else None
-        })
+        if not success: self.token_details["total"]["errors"] += 1
     
     def record_db_operation(self, operation_type, item_count, success=True):
         self.timing_details["db_operations"].append({
             "timestamp": time.time(), "operation_type": operation_type, "item_count": item_count, "success": success
         })
     
+    def record_price_filter(self, skipped: bool, reason: str):
+        """记录价格过滤结果（新增）"""
+        self.price_filter_stats["total_checked"] += 1
+        if skipped:
+            if "MISSING" in reason:
+                self.price_filter_stats["skipped_missing_price"] += 1
+            else:
+                self.price_filter_stats["skipped_low_price"] += 1
+        else:
+            self.price_filter_stats["passed"] += 1
+    
     def get_summary(self):
         total_elapsed = time.time() - self.start_time
-        if self.current_phase:
-            self.end_phase()
-        phase_stats = {}
-        for phase_name, stats in self.timing_details["phases"].items():
-            phase_stats[phase_name] = {
-                "calls": stats["calls"], "total_seconds": round(stats["total_seconds"], 2),
-                "avg_seconds": round(stats["avg_seconds"], 2),
-                "min_seconds": round(stats["min_seconds"], 2) if stats["min_seconds"] != float('inf') else 0,
-                "max_seconds": round(stats["max_seconds"], 2)
-            }
+        if self.current_phase: self.end_phase()
         return {
             "total_elapsed_seconds": round(total_elapsed, 2),
             "total_api_calls": self.token_details["total"]["api_calls"],
             "total_tokens_used": self.token_details["total"]["tokens"],
             "total_items_discovered": self.token_details["total"]["items"],
             "total_errors": self.token_details["total"]["errors"],
-            "phase_stats": phase_stats,
             "ai_mode_used": _ai_mode_state.get("current_mode", AI_MODE),
             "gsi_query_enabled": ENABLE_GSI_QUERY and _gsi_permission_granted,
+            "price_filter": self.price_filter_stats,  # 新增
+            "min_official_price_jpy": MIN_OFFICIAL_PRICE_JPY,
         }
-    
-    def log_summary(self):
-        summary = self.get_summary()
-        log("INFO", "=== 任务执行摘要 ===")
-        log("INFO", "总耗时", seconds=summary["total_elapsed_seconds"], api_calls=summary["total_api_calls"],
-            total_tokens=summary["total_tokens_used"], total_items=summary["total_items_discovered"],
-            errors=summary["total_errors"], ai_mode=summary["ai_mode_used"],
-            gsi_enabled=summary.get("gsi_query_enabled", False))
-        return summary
 
 
 # ============================================
@@ -529,20 +470,15 @@ def log(level, message, **fields):
 
 
 def get_elapsed_seconds():
-    if _lambda_start_time is None:
-        return 0
-    return time.time() - _lambda_start_time
+    return 0 if _lambda_start_time is None else time.time() - _lambda_start_time
 
 
 def get_remaining_seconds():
-    elapsed = get_elapsed_seconds()
-    remaining = LAMBDA_TIMEOUT_SECONDS - elapsed - LAMBDA_TIMEOUT_BUFFER
-    return max(0, remaining)
+    return max(0, LAMBDA_TIMEOUT_SECONDS - get_elapsed_seconds() - LAMBDA_TIMEOUT_BUFFER)
 
 
 def check_timeout():
-    remaining = get_remaining_seconds()
-    if remaining <= 0:
+    if get_remaining_seconds() <= 0:
         raise RuntimeError(f"Lambda超时倒计时: 已运行{get_elapsed_seconds():.1f}秒")
 
 
@@ -562,9 +498,7 @@ def normalize(value):
         'ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺ'
         'ａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ'
         '０１２３４５６７８９',
-        'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
-        'abcdefghijklmnopqrstuvwxyz'
-        '0123456789'
+        'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'
     ))
     return re.sub(r"\s+", " ", value)
 
@@ -581,21 +515,18 @@ def stable_id(*values):
 
 
 def clean_json_content(content):
-    if isinstance(content, dict):
-        return content
+    if isinstance(content, dict): return content
     if isinstance(content, list):
         text_parts = []
         for part in content:
-            if isinstance(part, dict):
-                if part.get("type") in ("input_text", "text"):
-                    text_parts.append(str(part.get("text", "")))
+            if isinstance(part, dict) and part.get("type") in ("input_text", "text"):
+                text_parts.append(str(part.get("text", "")))
         content = "".join(text_parts)
     text = str(content or "").strip()
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\s*```$", "", text)
     json_match = re.search(r'\{[\s\S]*\}', text)
-    if json_match:
-        text = json_match.group(0)
+    if json_match: text = json_match.group(0)
     return json.loads(text)
 
 
@@ -611,28 +542,24 @@ def build_prompt(task):
     task_type = task.get("task_type")
     max_items = int(task.get("max_items", 20))
     search_date = task.get("search_date", "")
+    min_price = task.get("min_official_price_jpy", MIN_OFFICIAL_PRICE_JPY)
 
     if task_type == "DISCOVER_CATEGORIES":
-        instruction = (
-            "一般的な商品のカテゴリをリストアップしてください。"
-            "各エントリにはcategoryフィールドのみを含めてください。"
-        )
+        instruction = "一般的な商品のカテゴリをリストアップしてください。"
     elif task_type == "DISCOVER_BRANDS":
         category = normalize(task.get("category"))
-        instruction = (
-            f"商品カテゴリ「{category}」の実際のブランドをリストアップしてください。"
-            "各エントリにはcategoryとbrandフィールドを含めてください。"
-        )
+        instruction = f"商品カテゴリ「{category}」の実際のブランドをリストアップしてください。"
     elif task_type == "DISCOVER_MODELS":
         category = normalize(task.get("category"))
         brand = normalize(task.get("brand"))
         date_condition = ""
         if search_date:
             date_condition = f"{search_date}以降に発売された製品のみを含めてください。発売日の降順でリストしてください。"
+        price_condition = f"公式販売価格が{min_price}円以上の製品のみを含めてください。" if min_price > 0 else ""
         instruction = (
             f"ブランド「{brand}」のカテゴリ「{category}」における具体的な製品モデルをリストアップしてください。"
-            f"{date_condition}"
-            "各エントリにはcategory、brand、model、confidence、release_dateフィールドを含めてください。"
+            f"{date_condition}{price_condition}"
+            "各エントリにはcategory、brand、model、confidence、release_date、official_price_jpyフィールドを含めてください。"
         )
     else:
         raise ValueError(f"Unknown task_type: {task_type}")
@@ -647,6 +574,7 @@ def build_prompt(task):
     - model: 文字列または空
     - confidence: 0-1の数値またはnull
     - release_date: YYYY-MM-DD形式の文字列または空
+    - official_price_jpy: 公式販売価格（日本円、税込）数値またはnull
 
     ルール：
     - JSONのみを返し、マークダウンや説明は不要
@@ -660,9 +588,7 @@ def build_prompt(task):
 # ============================================
 
 def call_api(task):
-    """调用 AI API - 支持多模式切换"""
     global _tracker
-    
     check_limits()
     
     max_mode_switches = 3
@@ -676,32 +602,21 @@ def call_api(task):
         
         mode_name = config["name"]
         _ai_mode_state["current_mode"] = mode_name
-        timeout = config["timeout"]
         
-        remaining = get_remaining_seconds()
-        if remaining < timeout + 10:
-            raise RuntimeError(f"剩余时间不足: {remaining:.1f}秒")
-        
-        # 单个模式重试
         for attempt in range(MAX_RETRIES):
             try:
                 api_start_time = time.time()
-                
                 if config["type"] == "gemini":
                     items, tokens_used = call_gemini_api(config, task)
                 else:
                     items, tokens_used = call_openai_compatible_api(config, task)
                 
                 api_elapsed = time.time() - api_start_time
-                
-                log("INFO", "API请求完成",
-                    mode=mode_name, model=config["model"],
-                    item_count=len(items), tokens_used=tokens_used,
-                    api_duration_seconds=round(api_elapsed, 2))
+                log("INFO", "API请求完成", mode=mode_name, model=config["model"],
+                    item_count=len(items), tokens_used=tokens_used, api_duration_seconds=round(api_elapsed, 2))
                 
                 task_type_key = task.get("task_type", "").split('_')[1].lower()
-                if _tracker:
-                    _tracker.record_api_call(task_type_key, tokens_used, len(items), success=True)
+                if _tracker: _tracker.record_api_call(task_type_key, tokens_used, len(items), success=True)
                 
                 return items
                 
@@ -713,106 +628,52 @@ def call_api(task):
                 log("ERROR", f"[{mode_name}] API调用失败 (尝试{attempt+1}/{MAX_RETRIES})", error=str(e))
             
             if attempt < MAX_RETRIES - 1:
-                delay = (2 ** attempt) + random.random()
-                time.sleep(delay)
+                time.sleep((2 ** attempt) + random.random())
         
-        # 当前模式所有重试失败
         mark_ai_mode_failed(mode_name, str(last_error))
     
     raise RuntimeError(f"所有 AI 模式均调用失败: {last_error}")
 
 
 def call_gemini_api(config: dict, task: dict) -> tuple:
-    """调用 Gemini API"""
     prompt = build_prompt(task)
+    body = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": TEMPERATURE, "maxOutputTokens": config["max_tokens"], "topP": TOP_P}}
     
-    body = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": TEMPERATURE,
-            "maxOutputTokens": config["max_tokens"],
-            "topP": TOP_P
-        }
-    }
-    
-    encoded_body = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    
-    request = urllib.request.Request(
-        config["url"],
-        data=encoded_body,
-        headers={
-            "x-goog-api-key": config["key"],
-            "Content-Type": "application/json"
-        },
-        method="POST"
-    )
+    request = urllib.request.Request(config["url"], data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                                     headers={"x-goog-api-key": config["key"], "Content-Type": "application/json"}, method="POST")
     
     with urllib.request.urlopen(request, timeout=config["timeout"]) as response:
         result = json.loads(response.read().decode("utf-8"))
-        
         tokens_used = 0
         usage = result.get("usageMetadata", {})
-        if usage:
-            tokens_used = usage.get("promptTokenCount", 0) + usage.get("candidatesTokenCount", 0)
-            update_token_usage({"total_tokens": tokens_used})
+        if usage: tokens_used = usage.get("promptTokenCount", 0) + usage.get("candidatesTokenCount", 0); update_token_usage({"total_tokens": tokens_used})
         
         content = ""
-        if "candidates" in result and len(result["candidates"]) > 0:
-            candidate = result["candidates"][0]
-            if candidate.get("finishReason") == "SAFETY":
-                raise RuntimeError("Gemini 安全过滤触发")
-            if "content" in candidate and "parts" in candidate["content"]:
-                parts = candidate["content"]["parts"]
-                content = "".join(part.get("text", "") for part in parts)
+        if "candidates" in result and result["candidates"]:
+            if result["candidates"][0].get("finishReason") == "SAFETY": raise RuntimeError("Gemini 安全过滤触发")
+            if "content" in result["candidates"][0] and "parts" in result["candidates"][0]["content"]:
+                content = "".join(p.get("text", "") for p in result["candidates"][0]["content"]["parts"])
         
         parsed = clean_json_content(content)
-        items = parsed.get("items", [])
-        if not isinstance(items, list):
-            items = []
-        
-        return items, tokens_used
+        return parsed.get("items", []) or [], tokens_used
 
 
 def call_openai_compatible_api(config: dict, task: dict) -> tuple:
-    """调用 OpenAI 兼容 API（豆包、OpenAI 等）"""
     prompt = build_prompt(task)
+    body = {"model": config["model"], "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}], "temperature": TEMPERATURE, "max_tokens": config["max_tokens"], "top_p": TOP_P}
+    if config["name"] == "doubao": body["response_format"] = {"type": "json_object"}
     
-    body = {
-        "model": config["model"],
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": TEMPERATURE,
-        "max_tokens": config["max_tokens"],
-        "top_p": TOP_P
-    }
-    
-    # 豆包支持 response_format
-    if config["name"] == "doubao":
-        body["response_format"] = {"type": "json_object"}
-    
-    encoded_body = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    
-    request = urllib.request.Request(
-        config["url"],
-        data=encoded_body,
-        headers={
-            "Authorization": f"Bearer {config['key']}",
-            "Content-Type": "application/json"
-        },
-        method="POST"
-    )
+    request = urllib.request.Request(config["url"], data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                                     headers={"Authorization": f"Bearer {config['key']}", "Content-Type": "application/json"}, method="POST")
     
     with urllib.request.urlopen(request, timeout=config["timeout"]) as response:
         result = json.loads(response.read().decode("utf-8"))
-        
         usage = result.get("usage", {})
         tokens_used = usage.get("total_tokens", 0)
         update_token_usage(usage)
         
         content = ""
-        if "choices" in result and len(result["choices"]) > 0:
+        if "choices" in result and result["choices"]:
             content = result["choices"][0].get("message", {}).get("content", "")
         else:
             content = result.get("content") or result.get("text") or json.dumps(result)
@@ -820,14 +681,9 @@ def call_openai_compatible_api(config: dict, task: dict) -> tuple:
         parsed = clean_json_content(content)
         items = parsed.get("items", [])
         if not isinstance(items, list):
-            for key, value in parsed.items():
-                if isinstance(value, list):
-                    items = value
-                    break
-            if not isinstance(items, list):
-                items = []
-        
-        return items, tokens_used
+            for v in parsed.values():
+                if isinstance(v, list): items = v; break
+        return items if isinstance(items, list) else [], tokens_used
 
 
 # ============================================
@@ -837,67 +693,68 @@ def call_openai_compatible_api(config: dict, task: dict) -> tuple:
 def upsert_category(category):
     global _tracker
     category = normalize(category)
-    if not category:
-        return
+    if not category: return
     try:
         now = int(time.time())
         table.update_item(
             Key={"PK": f"CATEGORY#{key_part(category)}", "SK": "META"},
-            UpdateExpression=(
-                "SET entity_type = :type, #name = :name, #status = :status, "
-                "first_seen_at = if_not_exists(first_seen_at, :now), "
-                "last_seen_at = :now, #source = :source"
-            ),
+            UpdateExpression="SET entity_type = :type, #name = :name, #status = :status, first_seen_at = if_not_exists(first_seen_at, :now), last_seen_at = :now, #source = :source",
             ExpressionAttributeNames={"#name": "name", "#status": "status", "#source": "source"},
-            ExpressionAttributeValues={
-                ":type": "CATEGORY", ":name": category, ":status": "ACTIVE",
-                ":now": now, ":source": DATA_SOURCE
-            }
+            ExpressionAttributeValues={":type": "CATEGORY", ":name": category, ":status": "ACTIVE", ":now": now, ":source": DATA_SOURCE}
         )
-        if _tracker:
-            _tracker.record_db_operation("upsert_category", 1, success=True)
+        if _tracker: _tracker.record_db_operation("upsert_category", 1)
     except Exception as e:
-        if _tracker:
-            _tracker.record_db_operation("upsert_category", 0, success=False)
+        if _tracker: _tracker.record_db_operation("upsert_category", 0, success=False)
         raise
 
 
 def upsert_brand(category, brand):
     global _tracker
-    category = normalize(category)
-    brand = normalize(brand)
-    if not category or not brand:
-        return
+    category, brand = normalize(category), normalize(brand)
+    if not category or not brand: return
     try:
         now = int(time.time())
         table.update_item(
             Key={"PK": f"CATEGORY#{key_part(category)}", "SK": f"BRAND#{key_part(brand)}"},
-            UpdateExpression=(
-                "SET entity_type = :type, category = :category, brand = :brand, "
-                "#status = :status, first_seen_at = if_not_exists(first_seen_at, :now), "
-                "last_seen_at = :now, #source = :source"
-            ),
+            UpdateExpression="SET entity_type = :type, category = :category, brand = :brand, #status = :status, first_seen_at = if_not_exists(first_seen_at, :now), last_seen_at = :now, #source = :source",
             ExpressionAttributeNames={"#status": "status", "#source": "source"},
-            ExpressionAttributeValues={
-                ":type": "BRAND", ":category": category, ":brand": brand,
-                ":status": "ACTIVE", ":now": now, ":source": DATA_SOURCE
-            }
+            ExpressionAttributeValues={":type": "BRAND", ":category": category, ":brand": brand, ":status": "ACTIVE", ":now": now, ":source": DATA_SOURCE}
         )
-        if _tracker:
-            _tracker.record_db_operation("upsert_brand", 1, success=True)
+        if _tracker: _tracker.record_db_operation("upsert_brand", 1)
     except Exception as e:
-        if _tracker:
-            _tracker.record_db_operation("upsert_brand", 0, success=False)
+        if _tracker: _tracker.record_db_operation("upsert_brand", 0, success=False)
         raise
 
 
-def upsert_product(category, brand, model, confidence=None, release_date=None):
+def upsert_product(category, brand, model, confidence=None, release_date=None, official_price_jpy=None):
+    """
+    保存产品型号到 DynamoDB。
+    新增：检查官方售价过滤。
+    """
     global _tracker
-    category = normalize(category)
-    brand = normalize(brand)
-    model = normalize(model)
-    if not category or not brand or not model:
+    category, brand, model = normalize(category), normalize(brand), normalize(model)
+    if not category or not brand or not model: return
+    
+    # ============ 官方售价过滤（新增） ============
+    if official_price_jpy is not None:
+        price_check = should_skip_by_official_price({"official_price_jpy": official_price_jpy})
+    else:
+        # AI 没有返回价格，构造一个临时 item 检查
+        temp_item = {}
+        price_check = should_skip_by_official_price(temp_item)
+    
+    if _tracker:
+        _tracker.record_price_filter(price_check["skip"], price_check["reason"])
+    
+    if price_check["skip"]:
+        log("INFO", "官方售价低于阈值，跳过保存",
+            category=category, brand=brand, model=model,
+            official_price_jpy=price_check["official_price_jpy"],
+            min_price=MIN_OFFICIAL_PRICE_JPY,
+            reason=price_check["reason"])
         return
+    # ==========================================
+    
     try:
         now = int(time.time())
         product_id = stable_id(category, brand, model)
@@ -914,17 +771,23 @@ def upsert_product(category, brand, model, confidence=None, release_date=None):
             ":model": model, ":normalized_model": normalize(model).casefold(),
             ":status": "ACTIVE", ":unverified": "UNVERIFIED", ":now": now, ":source": DATA_SOURCE
         }
+        
         if confidence is not None:
             try:
                 values[":confidence"] = str(max(0.0, min(1.0, float(confidence))))
                 expression += ", confidence = :confidence"
-            except (TypeError, ValueError):
-                pass
+            except (TypeError, ValueError): pass
+        
         if release_date:
             release_date = normalize(release_date)
             if re.match(r"^\d{4}-\d{2}-\d{2}", release_date):
                 expression += ", release_date = :release_date"
                 values[":release_date"] = release_date
+        
+        # 保存官方售价（新增）
+        if official_price_jpy is not None and official_price_jpy > 0:
+            expression += ", official_price_jpy = :official_price_jpy"
+            values[":official_price_jpy"] = official_price_jpy
 
         table.update_item(
             Key={"PK": product_pk, "SK": "META"},
@@ -942,15 +805,13 @@ def upsert_product(category, brand, model, confidence=None, release_date=None):
             "category": category, "brand": brand, "model": model,
             "product_pk": product_pk, "last_seen_at": now
         }
-        if release_date:
-            gsi1_item["release_date"] = release_date
+        if release_date: gsi1_item["release_date"] = release_date
+        if official_price_jpy: gsi1_item["official_price_jpy"] = official_price_jpy
         table.put_item(Item=gsi1_item)
         
-        if _tracker:
-            _tracker.record_db_operation("upsert_product", 1, success=True)
+        if _tracker: _tracker.record_db_operation("upsert_product", 1)
     except Exception as e:
-        if _tracker:
-            _tracker.record_db_operation("upsert_product", 0, success=False)
+        if _tracker: _tracker.record_db_operation("upsert_product", 0, success=False)
         raise
 
 
@@ -965,15 +826,16 @@ def process_discovery(event):
     _lambda_start_time = time.time()
     reset_ai_state()
     
-    # 检查 DynamoDB 权限
     check_dynamodb_permissions()
     
     _tracker = DiscoveryTracker()
-    _tracker.start_phase("discovery_start", ai_mode=AI_MODE, gsi_enabled=ENABLE_GSI_QUERY and _gsi_permission_granted)
+    _tracker.start_phase("discovery_start", ai_mode=AI_MODE, gsi_enabled=ENABLE_GSI_QUERY and _gsi_permission_granted,
+                         min_official_price=MIN_OFFICIAL_PRICE_JPY)
     
     task_type = event.get("task_type", "DISCOVER_CATEGORIES")
     
-    log("INFO", "开始发现处理", task_type=task_type, ai_mode=AI_MODE, 
+    log("INFO", "开始发现处理", task_type=task_type, ai_mode=AI_MODE,
+        min_official_price=MIN_OFFICIAL_PRICE_JPY,
         gsi_enabled=ENABLE_GSI_QUERY and _gsi_permission_granted)
     
     try:
@@ -981,15 +843,12 @@ def process_discovery(event):
             target_categories = event.get("target_categories", None)
             
             if target_categories:
-                # 如果指定了目标品类，直接使用
                 categories = target_categories
                 for category in categories:
                     category = normalize(category)
-                    if category:
-                        upsert_category(category)
+                    if category: upsert_category(category)
                 log("INFO", "使用指定品类", categories=categories)
             else:
-                # 原有逻辑：AI 发现品类
                 _tracker.start_phase("discover_categories")
                 task = {"task_type": "DISCOVER_CATEGORIES", "max_items": MAX_CATEGORIES}
                 items = call_api(task)
@@ -998,21 +857,15 @@ def process_discovery(event):
                 for item in items:
                     if isinstance(item, dict) and "category" in item:
                         category = normalize(item["category"])
-                        if category:
-                            upsert_category(category)
-                            categories.append(category)
+                        if category: upsert_category(category); categories.append(category)
                 
                 _tracker.end_phase()
                 log("INFO", "品类发现完成", count=len(categories))
             
-            # 后续品牌和型号发现的逻辑
             category_count = 0
             for category in categories[:CATEGORY_LIMIT]:
-                if _total_tokens_used >= MAX_TOTAL_TOKENS:
-                    log("WARN", "Token用量接近上限，停止")
-                    break
-                if get_remaining_seconds() < 60:
-                    log("WARN", "剩余时间不足，停止")
+                if _total_tokens_used >= MAX_TOTAL_TOKENS or get_remaining_seconds() < 60:
+                    log("WARN", "停止: Token或时间不足")
                     break
                 
                 _tracker.start_phase(f"discover_brands_{category}")
@@ -1025,48 +878,42 @@ def process_discovery(event):
                 for item in brand_items:
                     if isinstance(item, dict) and "brand" in item:
                         brand = normalize(item["brand"])
-                        if brand and category:
-                            upsert_brand(category, brand)
-                            brands.append((category, brand))
+                        if brand and category: upsert_brand(category, brand); brands.append((category, brand))
                 
                 _tracker.end_phase()
                 
                 brand_count = 0
                 for cat, brand in brands[:BRAND_LIMIT]:
-                    if _total_tokens_used >= MAX_TOTAL_TOKENS:
-                        break
-                    if get_remaining_seconds() < 60:
-                        break
+                    if _total_tokens_used >= MAX_TOTAL_TOKENS or get_remaining_seconds() < 60: break
                     
                     _tracker.start_phase(f"discover_models_{brand}")
                     time.sleep(API_CALL_DELAY)
                     
                     latest_date = get_latest_model_date(brand)
                     model_task = {
-                        "task_type": "DISCOVER_MODELS", "category": cat,
-                        "brand": brand, "max_items": MAX_MODELS, "search_date": latest_date
+                        "task_type": "DISCOVER_MODELS", "category": cat, "brand": brand,
+                        "max_items": MAX_MODELS, "search_date": latest_date,
+                        "min_official_price_jpy": MIN_OFFICIAL_PRICE_JPY
                     }
                     model_items = call_api(model_task)
                     
-                    model_count = 0
                     for item in model_items:
                         if isinstance(item, dict) and "model" in item:
                             upsert_product(cat, brand, item.get("model"),
-                                           item.get("confidence"), item.get("release_date"))
-                            model_count += 1
+                                           item.get("confidence"), item.get("release_date"),
+                                           item.get("official_price_jpy"))
                     
                     _tracker.end_phase()
                     brand_count += 1
                 
                 category_count += 1
             
-            summary = _tracker.log_summary()
+            summary = _tracker.get_summary()
             
             return {
                 "statusCode": 200,
                 "body": json.dumps({
                     "message": "发现处理完成",
-                    "categories_discovered": len(categories),
                     "total_tokens_used": _total_tokens_used,
                     "elapsed_seconds": get_elapsed_seconds(),
                     "gsi_query_available": ENABLE_GSI_QUERY and _gsi_permission_granted,
@@ -1083,24 +930,23 @@ def process_discovery(event):
             _tracker.start_phase(f"discover_models_{brand}")
             latest_date = get_latest_model_date(brand)
             task = {"task_type": "DISCOVER_MODELS", "category": category, "brand": brand,
-                    "max_items": MAX_MODELS, "search_date": latest_date}
+                    "max_items": MAX_MODELS, "search_date": latest_date,
+                    "min_official_price_jpy": MIN_OFFICIAL_PRICE_JPY}
             items = call_api(task)
             
-            model_count = 0
             for item in items:
                 if isinstance(item, dict) and "model" in item:
                     upsert_product(category, brand, item.get("model"),
-                                   item.get("confidence"), item.get("release_date"))
-                    model_count += 1
+                                   item.get("confidence"), item.get("release_date"),
+                                   item.get("official_price_jpy"))
             
             _tracker.end_phase()
-            summary = _tracker.log_summary()
+            summary = _tracker.get_summary()
             
             return {
                 "statusCode": 200,
                 "body": json.dumps({
                     "message": "型号发现完成",
-                    "models_discovered": model_count,
                     "total_tokens_used": _total_tokens_used,
                     "elapsed_seconds": get_elapsed_seconds(),
                     "gsi_query_available": ENABLE_GSI_QUERY and _gsi_permission_granted,
@@ -1130,8 +976,7 @@ def process_discovery(event):
             }
         raise
     except Exception as e:
-        if _tracker:
-            _tracker.end_phase()
+        if _tracker: _tracker.end_phase()
         log("ERROR", "处理异常", error_type=type(e).__name__, error=str(e))
         raise
 
@@ -1142,7 +987,7 @@ def lambda_handler(event, context):
     _tracker = None
     
     try:
-        log("INFO", "Lambda执行开始", ai_mode=AI_MODE)
+        log("INFO", "Lambda执行开始", ai_mode=AI_MODE, min_official_price=MIN_OFFICIAL_PRICE_JPY)
         return process_discovery(event)
     except Exception as error:
         log("ERROR", "处理失败", error_type=type(error).__name__, error=str(error))
