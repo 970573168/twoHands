@@ -83,6 +83,10 @@ RETRYABLE_CODES = {408, 409, 429, 500, 502, 503, 504}
 # 数据来源标识
 DATA_SOURCE = os.environ.get("DATA_SOURCE", "AI_DISCOVERY")
 
+# GSI 查询回退配置
+ENABLE_GSI_QUERY = os.environ.get("ENABLE_GSI_QUERY", "true").lower() == "true"
+GSI_QUERY_MAX_RETRIES = int(os.environ.get("GSI_QUERY_MAX_RETRIES", "2"))
+
 # ============================================
 
 # AI 模式状态管理
@@ -96,6 +100,9 @@ _total_tokens_used = 0
 
 # 记录Lambda开始时间
 _lambda_start_time = None
+
+# GSI 权限状态缓存
+_gsi_permission_granted = True  # 默认假设有权限
 
 
 # ============================================
@@ -259,6 +266,140 @@ def reset_ai_state():
 
 
 # ============================================
+# DynamoDB 权限检查和 GSI 查询
+# ============================================
+
+def check_dynamodb_permissions():
+    """检查 DynamoDB 权限是否配置正确"""
+    global _gsi_permission_granted
+    
+    try:
+        # 检查表权限
+        table.table_status
+        log("INFO", "DynamoDB 表权限检查通过")
+        
+        # 检查 GSI 查询权限
+        if ENABLE_GSI_QUERY:
+            try:
+                response = table.query(
+                    IndexName="GSI1",
+                    KeyConditionExpression=Key("GSI1PK").eq("PERMISSION_CHECK"),
+                    Limit=1
+                )
+                _gsi_permission_granted = True
+                log("INFO", "DynamoDB GSI 查询权限检查通过")
+            except Exception as e:
+                if "AccessDeniedException" in str(e):
+                    _gsi_permission_granted = False
+                    log("WARN", "DynamoDB GSI 查询权限不足，将使用备用查询方案", 
+                        suggestion="请添加 IAM 策略：dynamodb:Query on table/index/*")
+                else:
+                    log("WARN", "GSI 权限检查异常", error=str(e)[:200])
+        else:
+            _gsi_permission_granted = False
+            log("INFO", "GSI 查询已通过环境变量禁用")
+            
+    except Exception as e:
+        log("ERROR", "DynamoDB 权限检查失败", error=str(e)[:200])
+
+
+def get_latest_model_date_via_gsi(brand_key):
+    """通过 GSI 查询获取最新型号日期"""
+    response = table.query(
+        IndexName="GSI1",
+        KeyConditionExpression=Key("GSI1PK").eq(f"BRAND#{brand_key}"),
+        ScanIndexForward=False,
+        Limit=1
+    )
+    items = response.get("Items", [])
+    if items:
+        return items[0].get("release_date", "")
+    return None
+
+
+def get_latest_model_date_via_scan(brand):
+    """通过 Scan 获取最新型号日期（备用方案）"""
+    try:
+        response = table.scan(
+            FilterExpression="brand = :brand AND attribute_exists(release_date)",
+            ExpressionAttributeValues={":brand": brand},
+            ProjectionExpression="release_date, PK",
+            Limit=500
+        )
+        items = response.get("Items", [])
+        
+        # 提取有效日期并排序
+        valid_dates = []
+        for item in items:
+            date = item.get("release_date", "")
+            if date and re.match(r"^\d{4}-\d{2}-\d{2}", date):
+                valid_dates.append(date)
+        
+        if valid_dates:
+            return max(valid_dates)  # 返回最新日期
+        
+        return None
+        
+    except Exception as e:
+        log("WARN", "Scan 备用查询失败", brand=brand, error=str(e)[:200])
+        return None
+
+
+def get_latest_model_date(brand):
+    """获取指定品牌的最新型号日期（带备用方案）"""
+    global _gsi_permission_granted
+    
+    brand_key = key_part(brand)
+    
+    # 方案1：使用 GSI 查询（最快）
+    if ENABLE_GSI_QUERY and _gsi_permission_granted:
+        for attempt in range(GSI_QUERY_MAX_RETRIES):
+            try:
+                return get_latest_model_date_via_gsi(brand_key)
+                
+            except Exception as e:
+                error_str = str(e)
+                
+                # 如果是权限错误，切换到备用方案并标记
+                if "AccessDeniedException" in error_str:
+                    log("WARN", "GSI 查询权限不足，切换到 Scan 备用方案", 
+                        brand=brand, suggestion="请添加 IAM 策略：dynamodb:Query on table/index/*")
+                    _gsi_permission_granted = False
+                    break  # 直接跳出循环使用备用方案
+                
+                # 如果是限流错误，等待后重试
+                if any(err in error_str for err in [
+                    "ProvisionedThroughputExceededException",
+                    "ThrottlingException",
+                    "RequestLimitExceeded"
+                ]):
+                    if attempt < GSI_QUERY_MAX_RETRIES - 1:
+                        wait_time = (2 ** attempt) * 0.5
+                        log("WARN", f"GSI 查询限流，{wait_time:.1f}秒后重试", 
+                            brand=brand, attempt=attempt+1)
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        log("WARN", "GSI 查询限流重试耗尽，切换到备用方案", brand=brand)
+                        break
+                
+                # 其他错误，尝试重试
+                if attempt < GSI_QUERY_MAX_RETRIES - 1:
+                    time.sleep(0.5)
+                    continue
+                else:
+                    log("WARN", "GSI 查询失败（已达最大重试次数）", 
+                        brand=brand, error=error_str[:200])
+                    break
+    
+    # 方案2：使用 Scan 备用方案
+    if not _gsi_permission_granted or not ENABLE_GSI_QUERY:
+        log("INFO", "使用 Scan 备用方案查询最新型号日期", brand=brand)
+    
+    return get_latest_model_date_via_scan(brand)
+
+
+# ============================================
 # 详细追踪器类
 # ============================================
 
@@ -364,6 +505,7 @@ class DiscoveryTracker:
             "total_errors": self.token_details["total"]["errors"],
             "phase_stats": phase_stats,
             "ai_mode_used": _ai_mode_state.get("current_mode", AI_MODE),
+            "gsi_query_enabled": ENABLE_GSI_QUERY and _gsi_permission_granted,
         }
     
     def log_summary(self):
@@ -371,7 +513,8 @@ class DiscoveryTracker:
         log("INFO", "=== 任务执行摘要 ===")
         log("INFO", "总耗时", seconds=summary["total_elapsed_seconds"], api_calls=summary["total_api_calls"],
             total_tokens=summary["total_tokens_used"], total_items=summary["total_items_discovered"],
-            errors=summary["total_errors"], ai_mode=summary["ai_mode_used"])
+            errors=summary["total_errors"], ai_mode=summary["ai_mode_used"],
+            gsi_enabled=summary.get("gsi_query_enabled", False))
         return summary
 
 
@@ -454,24 +597,6 @@ def clean_json_content(content):
     if json_match:
         text = json_match.group(0)
     return json.loads(text)
-
-
-def get_latest_model_date(brand):
-    brand_key = key_part(brand)
-    try:
-        response = table.query(
-            IndexName="GSI1",
-            KeyConditionExpression=Key("GSI1PK").eq(f"BRAND#{brand_key}"),
-            ScanIndexForward=False,
-            Limit=1
-        )
-        items = response.get("Items", [])
-        if items:
-            return items[0].get("release_date", "")
-        return None
-    except Exception as e:
-        log("WARN", "获取最新型号日期失败", brand=brand, error=str(e))
-        return None
 
 
 def update_token_usage(usage):
@@ -840,16 +965,18 @@ def process_discovery(event):
     _lambda_start_time = time.time()
     reset_ai_state()
     
+    # 检查 DynamoDB 权限
+    check_dynamodb_permissions()
+    
     _tracker = DiscoveryTracker()
-    _tracker.start_phase("discovery_start", ai_mode=AI_MODE)
+    _tracker.start_phase("discovery_start", ai_mode=AI_MODE, gsi_enabled=ENABLE_GSI_QUERY and _gsi_permission_granted)
     
     task_type = event.get("task_type", "DISCOVER_CATEGORIES")
     
-    log("INFO", "开始发现处理", task_type=task_type, ai_mode=AI_MODE)
+    log("INFO", "开始发现处理", task_type=task_type, ai_mode=AI_MODE, 
+        gsi_enabled=ENABLE_GSI_QUERY and _gsi_permission_granted)
     
     try:
-        # 在 process_discovery 函数中，DISCOVER_CATEGORIES 部分修改为：
-
         if task_type == "DISCOVER_CATEGORIES":
             target_categories = event.get("target_categories", None)
             
@@ -878,8 +1005,7 @@ def process_discovery(event):
                 _tracker.end_phase()
                 log("INFO", "品类发现完成", count=len(categories))
             
-            # 后续品牌和型号发现的逻辑保持不变...
-            
+            # 后续品牌和型号发现的逻辑
             category_count = 0
             for category in categories[:CATEGORY_LIMIT]:
                 if _total_tokens_used >= MAX_TOTAL_TOKENS:
@@ -943,6 +1069,7 @@ def process_discovery(event):
                     "categories_discovered": len(categories),
                     "total_tokens_used": _total_tokens_used,
                     "elapsed_seconds": get_elapsed_seconds(),
+                    "gsi_query_available": ENABLE_GSI_QUERY and _gsi_permission_granted,
                     "summary": summary
                 }, ensure_ascii=False)
             }
@@ -976,6 +1103,7 @@ def process_discovery(event):
                     "models_discovered": model_count,
                     "total_tokens_used": _total_tokens_used,
                     "elapsed_seconds": get_elapsed_seconds(),
+                    "gsi_query_available": ENABLE_GSI_QUERY and _gsi_permission_granted,
                     "summary": summary
                 }, ensure_ascii=False)
             }
@@ -996,6 +1124,7 @@ def process_discovery(event):
                     "message": "任务已安全中断", "reason": error_msg,
                     "total_tokens_used": _total_tokens_used,
                     "elapsed_seconds": get_elapsed_seconds(),
+                    "gsi_query_available": ENABLE_GSI_QUERY and _gsi_permission_granted,
                     "summary": summary if _tracker else None
                 }, ensure_ascii=False)
             }
