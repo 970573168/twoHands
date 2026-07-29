@@ -883,8 +883,6 @@ Resources:
           OPENAI_URL: !Ref OpenaiUrl
           OPENAI_TIMEOUT: !Ref OpenaiTimeout
           OPENAI_MAX_TOKENS: !Ref OpenaiMaxTokens
-          AI_FAILOVER_COOLDOWN: !Ref AiFailoverCooldown
-
           DEFAULT_SEARCH_COUNT: !Ref DefaultSearchCount
           DEFAULT_ACTIVE_COUNT: !Ref MaxActiveItems
           DEFAULT_CLOSED_COUNT: !Ref MaxClosedPerModel
