@@ -26,6 +26,8 @@ USER_AGENT = os.getenv("USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) 
 DEBUG_LOG_HTML = os.getenv("DEBUG_LOG_HTML", "false").lower() == "true"
 ITEMS_PER_PAGE = int(os.getenv("ITEMS_PER_PAGE", "50"))
 INCLUDE_PAYPAY = os.getenv("INCLUDE_PAYPAY", "true").lower() == "true"
+#限定STORE以及AUCTION用于限定拍卖
+AUCTION_ABATCH = os.getenv("AUCTION_ABATCH", "2,1")
 
 # ============ 详情爬取控制 ============
 ENABLE_DETAIL_SCRAPE_ON_SEARCH = os.getenv("ENABLE_DETAIL_SCRAPE_ON_SEARCH", "true").lower() == "true"
@@ -135,6 +137,7 @@ def build_url(keyword, page, search_type, exclude_keywords="", include_keywords=
     
     params.update(get_auction_params())
     params["va"] = keyword
+    params["abatch"] = AUCTION_ABATCH
     
     if include_keywords:
         params["vo"] = include_keywords
