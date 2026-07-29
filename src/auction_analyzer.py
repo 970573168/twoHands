@@ -314,41 +314,67 @@ def check_limits():
 # AI Service
 # ======================================
 
-def _get_key(mode: str) -> str:
-    env = os.getenv("ENVIRONMENT", "dev")
-    secret_name = f"{mode}-api-key-{env}"
-    
-    logger.info(f"Reading secret: {secret_name}")
-    
+def _extract_secret_value(secret_string: str, mode: str) -> str:
+    """从 Secrets Manager 的 SecretString 中提取 API Key。"""
+    if not secret_string:
+        return ""
+
     try:
-        r = secrets.get_secret_value(SecretId=secret_name)
-        s = r.get("SecretString", "")
-        logger.info(f"Secret retrieved, length={len(s)}")
-        
-        # 尝试 JSON 解析
-        d = json.loads(s)
-        logger.info(f"Secret JSON keys: {list(d.keys())}")
-        
-        # 取第一个值（兼容各种 key 名）
-        for key_name in ["apiKey", "api_key", "key", f"{mode.upper()}_API_KEY"]:
-            val = d.get(key_name, "")
-            if val:
-                logger.info(f"Found key via '{key_name}'")
-                return val
-        
-        # 都没匹配到，取 JSON 里第一个值
-        first_val = list(d.values())[0] if d else ""
-        if first_val:
-            logger.info(f"Using first value from JSON")
-            return first_val
-        
+        secret_dict = json.loads(secret_string)
     except json.JSONDecodeError:
-        # 纯文本
-        logger.info("Secret is plaintext")
-        return s.strip()
-    except Exception as e:
-        logger.error(f"Secret read failed: {type(e).__name__}: {e}")
-    
+        return secret_string.strip()
+
+    if not isinstance(secret_dict, dict):
+        return ""
+
+    logger.info("Secret JSON keys: %s", list(secret_dict.keys()))
+    for key_name in (
+        "apiKey",
+        "api_key",
+        "key",
+        "GEMINI_API_KEY",
+        "DOUBAO_API_KEY",
+        "OPENAI_API_KEY",
+        f"{mode.upper()}_API_KEY",
+    ):
+        val = secret_dict.get(key_name)
+        if val:
+            logger.info("Found key via '%s'", key_name)
+            return str(val).strip()
+
+    first_val = next((v for v in secret_dict.values() if v), "")
+    if first_val:
+        logger.info("Using first non-empty value from JSON secret")
+        return str(first_val).strip()
+
+    return ""
+
+
+def _get_key(mode: str) -> str:
+    """仅从 Secrets Manager 获取 AI API Key。
+
+    API Key 不从 Lambda 环境变量读取，统一通过
+    <mode>-api-key-<ENVIRONMENT> 管理；SECRET_NAME 仅作为旧版 Secret 名称兜底。
+    """
+    env = os.getenv("ENVIRONMENT", "dev")
+    secret_names = [f"{mode}-api-key-{env}"]
+
+    legacy_secret = os.getenv("SECRET_NAME", "").strip()
+    if legacy_secret:
+        secret_names.append(legacy_secret)
+
+    for secret_name in dict.fromkeys(secret_names):
+        logger.info("Reading secret: %s", secret_name)
+        try:
+            response = secrets.get_secret_value(SecretId=secret_name)
+            secret_string = response.get("SecretString", "")
+            logger.info("Secret retrieved, length=%s", len(secret_string))
+            key = _extract_secret_value(secret_string, mode)
+            if key:
+                return key
+        except Exception as e:
+            logger.error("Secret read failed for %s: %s: %s", secret_name, type(e).__name__, e)
+
     return ""
 
 def get_ai_cfg():
