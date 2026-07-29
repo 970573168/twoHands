@@ -126,7 +126,6 @@ closed_db = dynamodb.Table(TABLE_CLOSED)
 secrets = boto3.client("secretsmanager")
 _total_tokens = 0
 _start_time = None
-_ai_state = {"failed_modes": {}}
 
 # ======================================
 # Repository
@@ -377,11 +376,42 @@ def _get_key(mode: str) -> str:
 
     return ""
 
-def get_ai_cfg():
-    """获取AI配置，key 只从 Secrets Manager 读"""
+
+def _get_key(mode: str) -> str:
+    """仅从 Secrets Manager 获取 AI API Key。
+
+    API Key 不从 Lambda 环境变量读取，统一通过
+    <mode>-api-key-<ENVIRONMENT> 管理；SECRET_NAME 仅作为旧版 Secret 名称兜底。
+    """
+    env = os.getenv("ENVIRONMENT", "dev")
+    secret_names = [f"{mode}-api-key-{env}"]
+
+    legacy_secret = os.getenv("SECRET_NAME", "").strip()
+    if legacy_secret:
+        secret_names.append(legacy_secret)
+
+    for secret_name in dict.fromkeys(secret_names):
+        logger.info("Reading secret: %s", secret_name)
+        try:
+            response = secrets.get_secret_value(SecretId=secret_name)
+            secret_string = response.get("SecretString", "")
+            logger.info("Secret retrieved, length=%s", len(secret_string))
+            key = _extract_secret_value(secret_string, mode)
+            if key:
+                return key
+        except Exception as e:
+            logger.error("Secret read failed for %s: %s: %s", secret_name, type(e).__name__, e)
+
+    return ""
+
+def get_ai_cfg(excluded_modes=None):
+    """获取 AI 配置，key 只从 Secrets Manager 读取。
+
+    excluded_modes 只用于一次 call_ai 调用内的故障转移，避免失败状态跨批次保留。
+    """
+    excluded_modes = set(excluded_modes or ())
     order = [AI_MODE] + [m for m in ["gemini","doubao","openai"] if m != AI_MODE]
-    now = time.time()
-    
+
     for mode in order:
         if mode in _ai_state["failed_modes"]:
             cooldown = _env("AI_FAILOVER_COOLDOWN", 300, int)
@@ -430,9 +460,10 @@ def get_ai_cfg():
 def call_ai(prompt: str) -> Tuple[Optional[Dict],Optional[str]]:
     global _total_tokens
     logger.info(f"AI call: prompt length={len(prompt)}, current tokens={_total_tokens}")
-    
+
+    failed_modes = set()
     for attempt in range(3):
-        cfg = get_ai_cfg()
+        cfg = get_ai_cfg(failed_modes)
         if not cfg:
             logger.error("All AI modes unavailable")
             return None,"ALL_MODES_UNAVAILABLE"
@@ -532,7 +563,7 @@ def call_ai(prompt: str) -> Tuple[Optional[Dict],Optional[str]]:
             if retry < AI_RETRIES-1:
                 time.sleep(2**retry+random.uniform(0,1))
         
-        _ai_state["failed_modes"][mode]=time.time()
+        failed_modes.add(mode)
         logger.warning(f"Mode {mode} failed, switching to next")
     
     return None,"ALL_MODES_EXHAUSTED"
