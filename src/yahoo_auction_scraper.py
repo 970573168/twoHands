@@ -3,6 +3,7 @@ import re
 import json
 import time
 import logging
+from decimal import Decimal
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode, quote
 
@@ -170,16 +171,41 @@ def build_detail_url(item_id):
 # 详情爬虫函数
 # ======================================
 
-def clean_description(text):
-    """清理商品描述，移除运输相关内容，保留影响价格的关键信息"""
+DETAIL_NOISE_SECTION_PATTERN = re.compile(
+    r"^(?:[【\[（(〈《<]*\s*)?"
+    r"(?:お?問(?:い)?合わせ|出品拠点情報|注意事項|返品|落札後|"
+    r"お?支払い|発送|配送|送料|状態ランク基準|店舗情報|会社概要|営業(?:時間|日))"
+)
+DETAIL_PRODUCT_SECTION_PATTERN = re.compile(
+    r"^(?:[【\[（(〈《<]*\s*)?"
+    r"(?:商品説明|商品詳細|商品の状態|状態|仕様|スペック|付属品|動作確認|製品情報)"
+)
+DETAIL_NOISE_LINE_PATTERNS = (
+    re.compile(r"(?:〒\s*\d{3}-?\d{4}|住所[：:]|所在地[：:]|店舗住所[：:])"),
+    re.compile(r"(?:営業時間|定休日|問い合わせ番号|お問い合わせ番号|管理番号)[：:]?"),
+    re.compile(r"(?:電話|TEL|FAX)[：:]?\s*\d{2,}", re.IGNORECASE),
+    re.compile(r"Yahoo!?\s*(?:JAPAN|オークション).*(?:トップ|ヘルプ|利用規約|プライバシー)"),
+    re.compile(r"^(?:Yahoo!?\s*JAPAN|ヘルプ・お問い合わせ|利用規約|プライバシー(?:センター|ポリシー))$"),
+    re.compile(r"Copyright\s*\(?(?:C|©)|無断転載", re.IGNORECASE),
+)
+
+
+def _description_to_text(text):
+    """将详情 HTML 转为保留换行的纯文本。"""
     if not text:
         return ""
 
     soup = BeautifulSoup(text, "html.parser")
-    plain_text = soup.get_text(separator="\n", strip=True)
+    return soup.get_text(separator="\n", strip=True)
+
+
+def clean_detail_description(text):
+    """删除店铺、交易、配送及 Yahoo 页脚信息，保留商品本身的描述。"""
+    plain_text = _description_to_text(text)
 
     lines = plain_text.split("\n")
     cleaned_lines = []
+    skipping_noise_section = False
 
     for line in lines:
         line = line.strip()
@@ -190,6 +216,19 @@ def clean_description(text):
             continue
 
         if len(line) < 2 and not re.search(r"[A-Za-z0-9ぁ-んァ-ン一-龥]", line):
+            continue
+
+        if DETAIL_PRODUCT_SECTION_PATTERN.match(line):
+            skipping_noise_section = False
+
+        if DETAIL_NOISE_SECTION_PATTERN.match(line):
+            skipping_noise_section = True
+            continue
+
+        if skipping_noise_section:
+            continue
+
+        if any(pattern.search(line) for pattern in DETAIL_NOISE_LINE_PATTERNS):
             continue
 
         if any(keyword in line for keyword in SHIPPING_RELATED_KEYWORDS):
@@ -208,6 +247,11 @@ def clean_description(text):
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
 
     return cleaned.strip()
+
+
+def clean_description(text):
+    """兼容旧调用名称。"""
+    return clean_detail_description(text)
 
 
 def scrape_item_detail(item_id):
@@ -258,8 +302,8 @@ def scrape_item_detail(item_id):
     if not title:
         title = "Unknown Title"
     
-    # 提取描述
-    description = ""
+    # 提取原始描述；清洗在完整提取后统一执行
+    raw_description = ""
     
     # 从 __NEXT_DATA__ JSON 提取
     next_data = soup.find("script", id="__NEXT_DATA__")
@@ -286,27 +330,47 @@ def scrape_item_detail(item_id):
             
             raw_desc = find_desc(data) or ""
             if raw_desc:
-                description = clean_description(raw_desc)
+                raw_description = _description_to_text(raw_desc)
         except (json.JSONDecodeError, KeyError):
             pass
     
     # 兜底：从 template 或 body 提取
-    if not description:
+    if not raw_description:
         template_tag = soup.find("template", attrs={"shadowrootmode": "open"})
         target = template_tag or soup.find("body")
         if target:
-            raw_text = target.get_text(separator="\n", strip=True)
-            description = clean_description(raw_text)[:DETAIL_DESCRIPTION_MAX_CHARS]
+            raw_description = target.get_text(separator="\n", strip=True)
+
+    cleaned_description = clean_detail_description(raw_description)
+    cleaned_description = cleaned_description[:DETAIL_DESCRIPTION_MAX_CHARS]
+    raw_length = len(raw_description)
+    cleaned_length = len(cleaned_description)
+    clean_ratio = (
+        (Decimal(cleaned_length) / Decimal(raw_length)).quantize(Decimal("0.0001"))
+        if raw_length else Decimal("0")
+    )
+    cleaned_at = datetime.now(timezone.utc).isoformat()
     
     result = {
         "itemId": item_id,
         "title": title,
-        "description": description[:DETAIL_DESCRIPTION_MAX_CHARS] if description else "",
+        "description": cleaned_description,
+        "detailDescription": cleaned_description,
+        "detailDescriptionRaw": raw_description,
+        "detailDescriptionCleaned": cleaned_description,
+        "detailDescriptionRawLength": raw_length,
+        "detailDescriptionCleanedLength": cleaned_length,
+        "detailDescriptionLength": cleaned_length,
+        "detailDescriptionCleanRatio": clean_ratio,
+        "detailCleanedAt": cleaned_at,
         "url": url,
         "scrapedAt": datetime.now(timezone.utc).isoformat()
     }
     
-    logger.info(f"Detail scraped for {item_id}: desc_len={len(description) if description else 0}")
+    logger.info(
+        "Detail scraped for %s: raw_len=%s cleaned_len=%s clean_ratio=%s",
+        item_id, raw_length, cleaned_length, clean_ratio
+    )
     return result
 
 
@@ -326,18 +390,30 @@ def enrich_item_with_detail(item):
         item["detailScrapeError"] = "scrape_item_detail returned None"
         item["detailScrapedAt"] = datetime.now(timezone.utc).isoformat()
         item["detailDescription"] = ""
+        item["detailDescriptionRaw"] = ""
+        item["detailDescriptionCleaned"] = ""
+        item["detailDescriptionRawLength"] = 0
+        item["detailDescriptionCleanedLength"] = 0
         item["detailTitle"] = ""
         item["detailUrl"] = build_detail_url(item_id)
         item["detailDescriptionLength"] = 0
+        item["detailDescriptionCleanRatio"] = Decimal("0")
+        item["detailCleanedAt"] = ""
         return item
 
     description = detail.get("description", "") or ""
 
-    item["detailDescription"] = description[:DETAIL_DESCRIPTION_MAX_CHARS]
+    item["detailDescriptionRaw"] = detail.get("detailDescriptionRaw", "")
+    item["detailDescriptionCleaned"] = detail.get("detailDescriptionCleaned", description)
+    item["detailDescription"] = item["detailDescriptionCleaned"]
+    item["detailDescriptionRawLength"] = detail.get("detailDescriptionRawLength", 0)
+    item["detailDescriptionCleanedLength"] = detail.get("detailDescriptionCleanedLength", len(description))
     item["detailTitle"] = detail.get("title", "")
     item["detailUrl"] = detail.get("url", "")
     item["detailScrapedAt"] = detail.get("scrapedAt", datetime.now(timezone.utc).isoformat())
-    item["detailDescriptionLength"] = len(description)
+    item["detailDescriptionLength"] = detail.get("detailDescriptionLength", len(description))
+    item["detailDescriptionCleanRatio"] = detail.get("detailDescriptionCleanRatio", Decimal("0"))
+    item["detailCleanedAt"] = detail.get("detailCleanedAt", "")
     item["detailScrapeStatus"] = "COMPLETED" if description else "EMPTY"
     item["detailScrapeError"] = ""
 
@@ -369,6 +445,12 @@ def scrape_multiple_details(item_ids, save_to_db=False, search_type="active"):
                         Key={"itemID": item_id},
                         UpdateExpression="""
                             SET detailDescription = :desc,
+                                detailDescriptionRaw = :raw,
+                                detailDescriptionCleaned = :cleaned,
+                                detailDescriptionRawLength = :raw_length,
+                                detailDescriptionCleanedLength = :cleaned_length,
+                                detailDescriptionCleanRatio = :clean_ratio,
+                                detailCleanedAt = :cleaned_at,
                                 detailTitle = :title,
                                 detailUrl = :url,
                                 detailScrapedAt = :now,
@@ -377,6 +459,12 @@ def scrape_multiple_details(item_ids, save_to_db=False, search_type="active"):
                         """,
                         ExpressionAttributeValues={
                             ":desc": desc[:DETAIL_DESCRIPTION_MAX_CHARS],
+                            ":raw": detail.get("detailDescriptionRaw", ""),
+                            ":cleaned": detail.get("detailDescriptionCleaned", desc),
+                            ":raw_length": detail.get("detailDescriptionRawLength", 0),
+                            ":cleaned_length": detail.get("detailDescriptionCleanedLength", len(desc)),
+                            ":clean_ratio": detail.get("detailDescriptionCleanRatio", Decimal("0")),
+                            ":cleaned_at": detail.get("detailCleanedAt", ""),
                             ":title": detail.get("title", ""),
                             ":url": detail.get("url", ""),
                             ":now": detail.get("scrapedAt", datetime.now(timezone.utc).isoformat()),
@@ -496,6 +584,12 @@ def lambda_handler(event, context):
                     Key={"itemID": item_id},
                     UpdateExpression="""
                         SET detailDescription = :desc,
+                            detailDescriptionRaw = :raw,
+                            detailDescriptionCleaned = :cleaned,
+                            detailDescriptionRawLength = :raw_len,
+                            detailDescriptionCleanedLength = :cleaned_len,
+                            detailDescriptionCleanRatio = :clean_ratio,
+                            detailCleanedAt = :cleaned_at,
                             detailTitle = :title,
                             detailUrl = :url,
                             detailScrapedAt = :now,
@@ -504,6 +598,12 @@ def lambda_handler(event, context):
                     """,
                     ExpressionAttributeValues={
                         ":desc": detail["description"],
+                        ":raw": detail.get("detailDescriptionRaw", ""),
+                        ":cleaned": detail.get("detailDescriptionCleaned", detail["description"]),
+                        ":raw_len": detail.get("detailDescriptionRawLength", 0),
+                        ":cleaned_len": detail.get("detailDescriptionCleanedLength", len(detail["description"])),
+                        ":clean_ratio": detail.get("detailDescriptionCleanRatio", Decimal("0")),
+                        ":cleaned_at": detail.get("detailCleanedAt", ""),
                         ":title": detail["title"],
                         ":url": detail["url"],
                         ":now": detail["scrapedAt"],
@@ -520,9 +620,16 @@ def lambda_handler(event, context):
                 "itemId": detail["itemId"],
                 "title": detail["title"],
                 "description": detail["description"],
+                "detailDescriptionRaw": detail.get("detailDescriptionRaw", ""),
+                "detailDescriptionCleaned": detail.get("detailDescriptionCleaned", ""),
+                "detailDescriptionRawLength": detail.get("detailDescriptionRawLength", 0),
+                "detailDescriptionCleanedLength": detail.get("detailDescriptionCleanedLength", 0),
+                "detailDescriptionLength": detail.get("detailDescriptionLength", 0),
+                "detailDescriptionCleanRatio": detail.get("detailDescriptionCleanRatio", Decimal("0")),
+                "detailCleanedAt": detail.get("detailCleanedAt", ""),
                 "url": detail["url"],
                 "scrapedAt": detail["scrapedAt"]
-            }, ensure_ascii=False)
+            }, ensure_ascii=False, default=str)
         }
     
     # ========== 模式3：批量爬取商品详情 ==========
@@ -1096,6 +1203,12 @@ def save_items(items, table):
                     
                     # 详情字段
                     "detailDescription": item.get("detailDescription", ""),
+                    "detailDescriptionRaw": item.get("detailDescriptionRaw", ""),
+                    "detailDescriptionCleaned": item.get("detailDescriptionCleaned", ""),
+                    "detailDescriptionRawLength": item.get("detailDescriptionRawLength", 0),
+                    "detailDescriptionCleanedLength": item.get("detailDescriptionCleanedLength", 0),
+                    "detailDescriptionCleanRatio": item.get("detailDescriptionCleanRatio", Decimal("0")),
+                    "detailCleanedAt": item.get("detailCleanedAt", ""),
                     "detailTitle": item.get("detailTitle", ""),
                     "detailUrl": item.get("detailUrl", ""),
                     "detailScrapedAt": item.get("detailScrapedAt", ""),
@@ -1118,6 +1231,12 @@ def save_items(items, table):
                     Key={"itemID": item["itemId"]},
                     UpdateExpression="""
                         SET detailDescription = :desc,
+                            detailDescriptionRaw = :raw,
+                            detailDescriptionCleaned = :cleaned,
+                            detailDescriptionRawLength = :raw_len,
+                            detailDescriptionCleanedLength = :cleaned_len,
+                            detailDescriptionCleanRatio = :clean_ratio,
+                            detailCleanedAt = :cleaned_at,
                             detailTitle = :detail_title,
                             detailUrl = :detail_url,
                             detailScrapedAt = :detail_scraped_at,
@@ -1128,6 +1247,12 @@ def save_items(items, table):
                     """,
                     ExpressionAttributeValues={
                         ":desc": item.get("detailDescription", ""),
+                        ":raw": item.get("detailDescriptionRaw", ""),
+                        ":cleaned": item.get("detailDescriptionCleaned", ""),
+                        ":raw_len": item.get("detailDescriptionRawLength", 0),
+                        ":cleaned_len": item.get("detailDescriptionCleanedLength", 0),
+                        ":clean_ratio": item.get("detailDescriptionCleanRatio", Decimal("0")),
+                        ":cleaned_at": item.get("detailCleanedAt", ""),
                         ":detail_title": item.get("detailTitle", ""),
                         ":detail_url": item.get("detailUrl", ""),
                         ":detail_scraped_at": item.get("detailScrapedAt", ""),
