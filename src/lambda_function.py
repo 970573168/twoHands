@@ -47,11 +47,16 @@ OPENAI_MAX_TOKENS = int(os.environ.get("OPENAI_MAX_TOKENS", "4000"))
 # 故障切换冷却时间
 AI_FAILOVER_COOLDOWN = int(os.environ.get("AI_FAILOVER_COOLDOWN", "300"))
 
-# ========== 官方售价过滤配置（新增） ==========
+# ========== 官方售价过滤配置 ==========
 MIN_OFFICIAL_PRICE_JPY = int(os.environ.get("MIN_OFFICIAL_PRICE_JPY", "50000"))
 SKIP_IF_OFFICIAL_PRICE_MISSING = os.environ.get(
     "SKIP_IF_OFFICIAL_PRICE_MISSING", "false"
 ).lower() == "true"
+
+# ========== 品类筛选配置（新增） ==========
+AUCTION_ANALYSIS_MIN_SCORE = int(os.environ.get("AUCTION_ANALYSIS_MIN_SCORE", "6"))
+BLOCK_HIGH_COUNTERFEIT = os.environ.get("BLOCK_HIGH_COUNTERFEIT", "false").lower() == "true"
+CATALOG_SAVE_BUT_DISABLE_SCAN = os.environ.get("CATALOG_SAVE_BUT_DISABLE_SCAN", "true").lower() == "true"
 
 # ========== 旧版配置（向后兼容） ==========
 SECRET_NAME = os.environ.get("SECRET_NAME", "")
@@ -95,6 +100,123 @@ GSI_QUERY_MAX_RETRIES = int(os.environ.get("GSI_QUERY_MAX_RETRIES", "2"))
 
 # ============================================
 
+# ============================================
+# 品类定义（新增）
+# ============================================
+
+# 优先品类：小型 + 保值 + 低假货风险
+HIGH_PRIORITY_CATEGORIES = {
+    # 数码/小型电子
+    "スマートフォン", "スマホ", "携帯電話",
+    "タブレット", "iPad",
+    "パソコン", "ノートパソコン", "PC", "Mac", "MacBook",
+    "カメラ", "デジタルカメラ", "ミラーレスカメラ", "一眼レフ",
+    "レンズ", "交換レンズ",
+    "ゲーム機", "ポータブルゲーム機", "Nintendo Switch", "PS5", "PS4",
+    "オーディオ", "ヘッドホン", "イヤホン", "スピーカー", "イヤフォン",
+    "スマートウォッチ", "ウェアラブル",
+    "モニター", "ディスプレイ",
+    "グラフィックボード", "GPU",
+    "CPU", "メモリ", "SSD",
+    "マザーボード",
+    
+    # 工具/测量仪器
+    "工具", "電動工具", "測定器", "レーザー測定器",
+    "インパクトドライバー", "ドリル", "マルチツール",
+    
+    # 高端文具
+    "万年筆", "筆記具", "高級文具",
+    
+    # 收藏类（低风险）
+    "フィギュア", "模型", "ホビー", "プラモデル",
+    
+    # 音频/乐器
+    "ギター", "エレキギター", "アコースティックギター",
+    "ベース", "シンセサイザー", "DJ機器",
+    "マイク", "オーディオインターフェース",
+    
+    # 家电（小型高价值）
+    "ロボット掃除機", "空気清浄機", "加湿器",
+    "コーヒーメーカー", "エスプレッソマシン",
+    "ミシン", "アイロン",
+    
+    # 户外/运动（小型装备）
+    "ゴルフクラブ", "テニスラケット",
+    "双眼鏡", "望遠鏡",
+    "GPS機器", "アクションカメラ",
+}
+
+# 中风险品类：可能有假货但制造难度较高
+MEDIUM_RISK_CATEGORIES = {
+    # 收藏类（中风险）
+    "トレーディングカード", "カードゲーム",
+    "レトロゲーム", "レトロゲームソフト",
+    "限定品", "コレクターズアイテム",
+    
+    # 品牌配件
+    "ブランド時計",
+    "腕時計",
+    
+    # 小型奢侈配件
+    "サングラス", "眼鏡",
+    "ライター",
+    "筆箱", "ペンケース",
+}
+
+# 高风险品类：假货较多
+HIGH_COUNTERFEIT_RISK_CATEGORIES = {
+    "ブランドバッグ", "バッグ",
+    "財布", "ブランド財布",
+    "ジュエリー", "貴金属", "宝石",
+    "スニーカー", "スニーカー限定",
+    "衣類", "ブランド衣類",
+    "ベルト", "ブランドベルト",
+    "時計",  # 泛称时风险更高
+}
+
+# 绝对排除品类
+BLOCKED_CATEGORIES = {
+    "食品", "飲料", "酒", "調味料",
+    "健康食品", "サプリメント",
+    "家具", "大型家具", "インテリア家具",
+    "ベッド", "ソファ", "チェスト", "テレビ台",
+    "日用品", "消耗品", "化粧品",
+    "雑貨", "ペット用品", "ベビー用品",
+    "本", "コミック", "CD", "DVD", "ブルーレイ",
+    "文房具",  # 普通文具
+    "衣類", "服", "ファッション",  # 普通衣类
+    "靴", "サンダル",
+    "カーテン", "ラグ", "クッション",
+    "シーツ", "布団",
+    "食器", "キッチン用品",
+    "おもちゃ", "ぬいぐるみ",
+}
+
+# 高假货风险品牌（即使品类允许，这些品牌也需特别处理）
+HIGH_COUNTERFEIT_BRANDS = {
+    "ROLEX", "ロレックス",
+    "OMEGA", "オメガ",
+    "LOUIS VUITTON", "ルイヴィトン", "ルイ・ヴィトン",
+    "CHANEL", "シャネル",
+    "HERMES", "エルメス",
+    "GUCCI", "グッチ",
+    "PRADA", "プラダ",
+    "CARTIER", "カルティエ",
+    "TIFFANY", "ティファニー",
+    "BVLGARI", "ブルガリ",
+    "SUPREME", "シュプリーム",
+    "NIKE", "ナイキ",  # 限定款假货多
+    "ADIDAS", "アディダス",  # 限定款假货多
+    "YEEZY", "イージー",
+    "JORDAN", "ジョーダン",
+    "OFF-WHITE", "オフホワイト",
+    "BALENCIAGA", "バレンシアガ",
+    "MONCLER", "モンクレール",
+    "CANADA GOOSE", "カナダグース",
+}
+
+# ============================================
+
 # AI 模式状态管理
 _ai_mode_state = {
     "current_mode": None,
@@ -111,7 +233,7 @@ _lambda_start_time = None
 _gsi_permission_granted = True
 
 # ============================================
-# 官方售价辅助函数（新增）
+# 官方售价辅助函数
 # ============================================
 
 def safe_int_price(value, default: int = 0) -> int:
@@ -166,6 +288,143 @@ def should_skip_by_official_price(product_item: dict) -> dict:
         return {"skip": True, "official_price_jpy": official_price, "reason": "OFFICIAL_PRICE_TOO_LOW"}
     
     return {"skip": False, "official_price_jpy": official_price, "reason": "OFFICIAL_PRICE_OK"}
+
+
+# ============================================
+# 品类适合度评分（新增）
+# ============================================
+
+def is_good_for_auction_analysis(
+    category: str,
+    brand: str = "",
+    model: str = "",
+    official_price_jpy: int = 0
+) -> dict:
+    """
+    判断商品是否适合 Yahoo Auction 自动分析。
+    返回: {
+        "allowed": bool,
+        "risk_level": str,  # "LOW", "MEDIUM", "COUNTERFEIT_REVIEW", "HIGH"
+        "reason": str,
+        "score": int,
+        "catalog_scan_disabled": bool,
+        "catalog_scan_disabled_reason": str,
+    }
+    """
+    category_norm = normalize(category)
+    brand_norm = normalize(brand).upper()
+    model_norm = normalize(model)
+    
+    result = {
+        "allowed": False,
+        "risk_level": "HIGH",
+        "reason": "",
+        "score": 0,
+        "catalog_scan_disabled": True,
+        "catalog_scan_disabled_reason": "",
+    }
+    
+    # 绝对排除品类
+    for blocked in BLOCKED_CATEGORIES:
+        if blocked in category_norm:
+            result["reason"] = f"BLOCKED_CATEGORY:{blocked}"
+            result["catalog_scan_disabled_reason"] = f"品类已被排除: {blocked}"
+            return result
+    
+    # 官方售价过滤
+    if official_price_jpy > 0 and official_price_jpy < MIN_OFFICIAL_PRICE_JPY:
+        result["reason"] = "OFFICIAL_PRICE_TOO_LOW"
+        result["catalog_scan_disabled_reason"] = f"官方售价过低: {official_price_jpy} < {MIN_OFFICIAL_PRICE_JPY}"
+        return result
+    
+    score = 0
+    category_matched = "NONE"
+    
+    # 1. 品类匹配度
+    for allowed_cat in HIGH_PRIORITY_CATEGORIES:
+        if allowed_cat in category_norm:
+            score += 4
+            category_matched = "HIGH_PRIORITY"
+            break
+    
+    if category_matched == "NONE":
+        for med_cat in MEDIUM_RISK_CATEGORIES:
+            if med_cat in category_norm:
+                score += 2
+                category_matched = "MEDIUM_RISK"
+                break
+    
+    if category_matched == "NONE":
+        for risky_cat in HIGH_COUNTERFEIT_RISK_CATEGORIES:
+            if risky_cat in category_norm:
+                score += 1
+                category_matched = "COUNTERFEIT_RISK"
+                break
+    
+    # 2. 价格评分
+    if official_price_jpy >= MIN_OFFICIAL_PRICE_JPY:
+        score += 2
+    elif official_price_jpy >= MIN_OFFICIAL_PRICE_JPY * 0.5:
+        score += 1
+    
+    # 3. 品牌型号明确度
+    if len(brand_norm) >= 2:
+        score += 1
+    if len(model_norm) >= 2:
+        score += 1
+    
+    # 4. 高假货风险品牌检查
+    counterfeit_brand = False
+    for risky_brand in HIGH_COUNTERFEIT_BRANDS:
+        if risky_brand in brand_norm:
+            counterfeit_brand = True
+            score -= 2
+            break
+    
+    result["score"] = score
+    
+    # 5. 高假货风险品类处理
+    if category_matched == "COUNTERFEIT_RISK" or counterfeit_brand:
+        if BLOCK_HIGH_COUNTERFEIT:
+            result["reason"] = "HIGH_COUNTERFEIT_RISK_BLOCKED"
+            result["risk_level"] = "HIGH"
+            result["catalog_scan_disabled_reason"] = "高风险品类/品牌，已阻止自动分析"
+            return result
+        elif score >= AUCTION_ANALYSIS_MIN_SCORE:
+            result["allowed"] = True
+            result["risk_level"] = "COUNTERFEIT_REVIEW"
+            result["reason"] = "COUNTERFEIT_REVIEW_REQUIRED"
+            result["catalog_scan_disabled"] = CATALOG_SAVE_BUT_DISABLE_SCAN
+            result["catalog_scan_disabled_reason"] = "高风险品类，需人工审核"
+            return result
+        else:
+            result["reason"] = "HIGH_COUNTERFEIT_LOW_SCORE"
+            result["catalog_scan_disabled_reason"] = f"高风险品类且评分不足: {score} < {AUCTION_ANALYSIS_MIN_SCORE}"
+            return result
+    
+    # 6. 中风险品类处理
+    if category_matched == "MEDIUM_RISK":
+        if score >= AUCTION_ANALYSIS_MIN_SCORE:
+            result["allowed"] = True
+            result["risk_level"] = "MEDIUM"
+            result["reason"] = "MEDIUM_RISK_PASSED"
+            result["catalog_scan_disabled"] = False
+        else:
+            result["reason"] = "MEDIUM_RISK_LOW_SCORE"
+            result["catalog_scan_disabled_reason"] = f"中风险品类评分不足: {score} < {AUCTION_ANALYSIS_MIN_SCORE}"
+        return result
+    
+    # 7. 低风险品类处理
+    if score >= AUCTION_ANALYSIS_MIN_SCORE:
+        result["allowed"] = True
+        result["risk_level"] = "LOW"
+        result["reason"] = "PASSED"
+        result["catalog_scan_disabled"] = False
+    else:
+        result["reason"] = f"LOW_SCORE:{score}"
+        result["catalog_scan_disabled_reason"] = f"评分不足: {score} < {AUCTION_ANALYSIS_MIN_SCORE}"
+    
+    return result
 
 # ============================================
 
@@ -387,12 +646,22 @@ class DiscoveryTracker:
         
         self.timing_details = {"phases": {}, "api_calls": [], "db_operations": []}
         
-        # 价格过滤统计（新增）
+        # 价格过滤统计
         self.price_filter_stats = {
             "total_checked": 0,
             "skipped_low_price": 0,
             "skipped_missing_price": 0,
             "passed": 0
+        }
+        
+        # 品类适合度统计（新增）
+        self.auction_suitability_stats = {
+            "total_checked": 0,
+            "allowed": 0,
+            "blocked": 0,
+            "review_required": 0,
+            "by_reason": {},
+            "by_risk_level": {"LOW": 0, "MEDIUM": 0, "COUNTERFEIT_REVIEW": 0, "HIGH": 0},
         }
     
     def start_phase(self, phase_name, **metadata):
@@ -433,7 +702,7 @@ class DiscoveryTracker:
         })
     
     def record_price_filter(self, skipped: bool, reason: str):
-        """记录价格过滤结果（新增）"""
+        """记录价格过滤结果"""
         self.price_filter_stats["total_checked"] += 1
         if skipped:
             if "MISSING" in reason:
@@ -442,6 +711,25 @@ class DiscoveryTracker:
                 self.price_filter_stats["skipped_low_price"] += 1
         else:
             self.price_filter_stats["passed"] += 1
+    
+    def record_auction_suitability(self, result: dict):
+        """记录拍卖适合度检查结果（新增）"""
+        self.auction_suitability_stats["total_checked"] += 1
+        reason = result.get("reason", "UNKNOWN")
+        risk_level = result.get("risk_level", "UNKNOWN")
+        
+        if result.get("allowed"):
+            self.auction_suitability_stats["allowed"] += 1
+        else:
+            self.auction_suitability_stats["blocked"] += 1
+        
+        if risk_level == "COUNTERFEIT_REVIEW":
+            self.auction_suitability_stats["review_required"] += 1
+        
+        self.auction_suitability_stats["by_reason"][reason] = \
+            self.auction_suitability_stats["by_reason"].get(reason, 0) + 1
+        self.auction_suitability_stats["by_risk_level"][risk_level] = \
+            self.auction_suitability_stats["by_risk_level"].get(risk_level, 0) + 1
     
     def get_summary(self):
         total_elapsed = time.time() - self.start_time
@@ -454,8 +742,10 @@ class DiscoveryTracker:
             "total_errors": self.token_details["total"]["errors"],
             "ai_mode_used": _ai_mode_state.get("current_mode", AI_MODE),
             "gsi_query_enabled": ENABLE_GSI_QUERY and _gsi_permission_granted,
-            "price_filter": self.price_filter_stats,  # 新增
+            "price_filter": self.price_filter_stats,
             "min_official_price_jpy": MIN_OFFICIAL_PRICE_JPY,
+            "auction_suitability": self.auction_suitability_stats,  # 新增
+            "auction_analysis_min_score": AUCTION_ANALYSIS_MIN_SCORE,  # 新增
         }
 
 
@@ -545,10 +835,22 @@ def build_prompt(task):
     min_price = task.get("min_official_price_jpy", MIN_OFFICIAL_PRICE_JPY)
 
     if task_type == "DISCOVER_CATEGORIES":
-        instruction = "一般的な商品のカテゴリをリストアップしてください。"
+        instruction = (
+            "中古市場で価値が落ちにくく、小型または中型で配送しやすく、"
+            "偽物のリスクが比較的低い、または偽物の製造難易度が高い商品カテゴリをリストアップしてください。"
+            "電子製品に限定しないでください。"
+            "ブランド名・型番・モデル名で価格比較しやすいカテゴリを優先してください。"
+            "食品、飲料、消耗品、大型家具、日用品、低単価商品、偽物が非常に多いカテゴリは含めないでください。"
+            "例：スマートフォン、カメラ、レンズ、ゲーム機、スマートウォッチ、"
+            "電動工具、測定器、万年筆、フィギュア、模型、オーディオ機器。"
+        )
     elif task_type == "DISCOVER_BRANDS":
         category = normalize(task.get("category"))
-        instruction = f"商品カテゴリ「{category}」の実際のブランドをリストアップしてください。"
+        instruction = (
+            f"商品カテゴリ「{category}」の実際のブランドをリストアップしてください。"
+            "中古市場で価値が落ちにくく、偽物リスクが低いブランドを優先してください。"
+            "高級ブランドでも偽物が多いものは含めないでください。"
+        )
     elif task_type == "DISCOVER_MODELS":
         category = normalize(task.get("category"))
         brand = normalize(task.get("brand"))
@@ -557,8 +859,11 @@ def build_prompt(task):
             date_condition = f"{search_date}以降に発売された製品のみを含めてください。発売日の降順でリストしてください。"
         price_condition = f"公式販売価格が{min_price}円以上の製品のみを含めてください。" if min_price > 0 else ""
         instruction = (
-            f"ブランド「{brand}」のカテゴリ「{category}」における具体的な製品モデルをリストアップしてください。"
+            f"ブランド「{brand}」のカテゴリ「{category}」において、"
+            "中古市場で価値が落ちにくく、小型または中型で配送しやすく、"
+            "偽物リスクが低い、または偽物の製造難易度が高い具体的な商品モデルのみをリストアップしてください。"
             f"{date_condition}{price_condition}"
+            "食品、飲料、消耗品、大型家具、日用品、低単価商品、偽物が非常に多い商品は絶対に含めないでください。"
             "各エントリにはcategory、brand、model、confidence、release_date、official_price_jpyフィールドを含めてください。"
         )
     else:
@@ -729,29 +1034,32 @@ def upsert_brand(category, brand):
 def upsert_product(category, brand, model, confidence=None, release_date=None, official_price_jpy=None):
     """
     保存产品型号到 DynamoDB。
-    新增：检查官方售价过滤。
+    包含：官方售价过滤 + 拍卖适合度检查
     """
     global _tracker
     category, brand, model = normalize(category), normalize(brand), normalize(model)
     if not category or not brand or not model: return
     
-    # ============ 官方售价过滤（新增） ============
-    if official_price_jpy is not None:
-        price_check = should_skip_by_official_price({"official_price_jpy": official_price_jpy})
-    else:
-        # AI 没有返回价格，构造一个临时 item 检查
-        temp_item = {}
-        price_check = should_skip_by_official_price(temp_item)
+    # ============ 拍卖适合度检查（新增） ============
+    official_price = safe_int_price(official_price_jpy, 0)
+    
+    auction_check = is_good_for_auction_analysis(
+        category=category,
+        brand=brand,
+        model=model,
+        official_price_jpy=official_price
+    )
     
     if _tracker:
-        _tracker.record_price_filter(price_check["skip"], price_check["reason"])
+        _tracker.record_auction_suitability(auction_check)
     
-    if price_check["skip"]:
-        log("INFO", "官方售价低于阈值，跳过保存",
+    if not auction_check["allowed"]:
+        log("INFO", "商品不适合 Auction 分析，跳过保存",
             category=category, brand=brand, model=model,
-            official_price_jpy=price_check["official_price_jpy"],
-            min_price=MIN_OFFICIAL_PRICE_JPY,
-            reason=price_check["reason"])
+            official_price_jpy=official_price,
+            reason=auction_check["reason"],
+            score=auction_check["score"],
+            risk_level=auction_check["risk_level"])
         return
     # ==========================================
     
@@ -784,10 +1092,22 @@ def upsert_product(category, brand, model, confidence=None, release_date=None, o
                 expression += ", release_date = :release_date"
                 values[":release_date"] = release_date
         
-        # 保存官方售价（新增）
-        if official_price_jpy is not None and official_price_jpy > 0:
+        # 保存官方售价
+        if official_price > 0:
             expression += ", official_price_jpy = :official_price_jpy"
-            values[":official_price_jpy"] = official_price_jpy
+            values[":official_price_jpy"] = official_price
+        
+        # 保存拍卖适合度信息（新增）
+        expression += (
+            ", auction_analysis_score = :auction_score"
+            ", auction_analysis_risk_level = :auction_risk"
+            ", catalog_scan_disabled = :catalog_scan_disabled"
+            ", catalog_scan_disabled_reason = :catalog_disabled_reason"
+        )
+        values[":auction_score"] = auction_check["score"]
+        values[":auction_risk"] = auction_check["risk_level"]
+        values[":catalog_scan_disabled"] = auction_check["catalog_scan_disabled"]
+        values[":catalog_disabled_reason"] = auction_check.get("catalog_scan_disabled_reason", "")
 
         table.update_item(
             Key={"PK": product_pk, "SK": "META"},
@@ -803,11 +1123,20 @@ def upsert_product(category, brand, model, confidence=None, release_date=None, o
             "GSI1SK": release_date if release_date else "0000-00-00",
             "entity_type": "BRAND_MODEL",
             "category": category, "brand": brand, "model": model,
-            "product_pk": product_pk, "last_seen_at": now
+            "product_pk": product_pk, "last_seen_at": now,
+            "auction_analysis_score": auction_check["score"],
+            "auction_analysis_risk_level": auction_check["risk_level"],
+            "catalog_scan_disabled": auction_check["catalog_scan_disabled"],
         }
         if release_date: gsi1_item["release_date"] = release_date
-        if official_price_jpy: gsi1_item["official_price_jpy"] = official_price_jpy
+        if official_price: gsi1_item["official_price_jpy"] = official_price
         table.put_item(Item=gsi1_item)
+        
+        log("INFO", "产品保存成功",
+            category=category, brand=brand, model=model,
+            auction_score=auction_check["score"],
+            risk_level=auction_check["risk_level"],
+            catalog_scan_disabled=auction_check["catalog_scan_disabled"])
         
         if _tracker: _tracker.record_db_operation("upsert_product", 1)
     except Exception as e:
@@ -829,13 +1158,17 @@ def process_discovery(event):
     check_dynamodb_permissions()
     
     _tracker = DiscoveryTracker()
-    _tracker.start_phase("discovery_start", ai_mode=AI_MODE, gsi_enabled=ENABLE_GSI_QUERY and _gsi_permission_granted,
-                         min_official_price=MIN_OFFICIAL_PRICE_JPY)
+    _tracker.start_phase("discovery_start", 
+                         ai_mode=AI_MODE, 
+                         gsi_enabled=ENABLE_GSI_QUERY and _gsi_permission_granted,
+                         min_official_price=MIN_OFFICIAL_PRICE_JPY,
+                         auction_analysis_min_score=AUCTION_ANALYSIS_MIN_SCORE)
     
     task_type = event.get("task_type", "DISCOVER_CATEGORIES")
     
     log("INFO", "开始发现处理", task_type=task_type, ai_mode=AI_MODE,
         min_official_price=MIN_OFFICIAL_PRICE_JPY,
+        auction_analysis_min_score=AUCTION_ANALYSIS_MIN_SCORE,
         gsi_enabled=ENABLE_GSI_QUERY and _gsi_permission_granted)
     
     try:
@@ -987,7 +1320,10 @@ def lambda_handler(event, context):
     _tracker = None
     
     try:
-        log("INFO", "Lambda执行开始", ai_mode=AI_MODE, min_official_price=MIN_OFFICIAL_PRICE_JPY)
+        log("INFO", "Lambda执行开始", 
+            ai_mode=AI_MODE, 
+            min_official_price=MIN_OFFICIAL_PRICE_JPY,
+            auction_analysis_min_score=AUCTION_ANALYSIS_MIN_SCORE)
         return process_discovery(event)
     except Exception as error:
         log("ERROR", "处理失败", error_type=type(error).__name__, error=str(error))
