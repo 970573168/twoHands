@@ -79,7 +79,7 @@ AI_CONFIGS = {
         "type": "openai",
         "url": _env("DOUBAO_URL", "https://ws-8lxmxlbemcgcus5u.ap-northeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions"),
         "model": _env("DOUBAO_MODEL", "qwen-plus-character"),
-        "timeout": _env("DOUBAO_TIMEOUT", 90, int),
+        "timeout": _env("DOUBAO_TIMEOUT", 300, int),
         "max_tokens": _env("DOUBAO_MAX_TOKENS", 250000, int),
     },
     "openai": {
