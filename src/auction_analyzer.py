@@ -394,7 +394,7 @@ def get_ai_cfg():
         # 不直接修改全局配置
         cfg = dict(original)
         
-        key = cfg.get("key") or _get_key(mode)
+        key =  _get_key(mode)
         url = str(cfg.get("url") or "").strip()
         model = str(cfg.get("model") or "").strip()
         
