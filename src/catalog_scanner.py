@@ -4,7 +4,7 @@
 1. 扫描 PRODUCT 表找到今天未分析的型号
 2. 标记为 QUEUED
 3. 异步触发 YahooAuctionAnalyzer
-4. 不等待结果，不管理状态
+4. 不等待结果，不管理状态-
 """
 
 import os
