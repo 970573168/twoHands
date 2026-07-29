@@ -181,10 +181,15 @@ jobs:
             aws lambda update-function-code \
               --function-name "$FUNCTION_NAME" \
               --s3-bucket "${{ env.s3_bucket }}" \
-              --s3-key "${{ env.s3_key }}"
+              --s3-key "${{ env.s3_key }}" \
+              --publish  # ★ 加这个参数强制发布新版本
             
             echo "⏳ 等待函数更新完成..."
             aws lambda wait function-updated --function-name "$FUNCTION_NAME"
+            
+            # ★ 强制使用最新版本
+            LATEST_VERSION=$(aws lambda publish-version --function-name "$FUNCTION_NAME" --query 'Version' --output text)
+            echo "最新版本: $LATEST_VERSION"
             
             echo "✅ YahooAuctionAnalyzer 更新完成"
           else
