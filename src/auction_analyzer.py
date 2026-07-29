@@ -315,54 +315,40 @@ def check_limits():
 # ======================================
 
 def _get_key(mode: str) -> str:
-    """从 Secrets Manager 获取 API Key，支持多种字段名格式"""
     env = os.getenv("ENVIRONMENT", "dev")
-    names = [
-        f"{mode}-api-key-{env}",
-        f"{mode}-api-key",
-        f"{mode}/api-key/{env}",
-    ]
+    secret_name = f"{mode}-api-key-{env}"
     
-    logger.info(f"Looking for AI key: mode={mode}, ENVIRONMENT={env}")
+    logger.info(f"Reading secret: {secret_name}")
     
-    for n in names:
-        try:
-            logger.info(f"Trying secret: {n}")
-            r = secrets.get_secret_value(SecretId=n)
-            s = r.get("SecretString", "")
-            
-            if not s:
-                logger.warning(f"Secret empty: {n}")
-                continue
-            
-            try:
-                d = json.loads(s)
-                # ★ 支持多种字段名格式
-                k = (
-                    d.get("apiKey") or
-                    d.get("api_key") or
-                    d.get("key") or
-                    d.get("GEMINI_API_KEY") or
-                    d.get("DOUBAO_API_KEY") or
-                    d.get("OPENAI_API_KEY") or
-                    ""
-                )
-                logger.info(
-                    f"Secret JSON loaded: {n}, keys={list(d.keys())}, has_key={bool(k)}"
-                )
-            except Exception:
-                # 如果不是 JSON，当作纯文本 key
-                k = s.strip()
-                logger.info(f"Secret plaintext loaded: {n}, has_key={bool(k)}")
-            
-            if k:
-                logger.info(f"Loaded AI key from secret: {n}, mode={mode}")
-                return k
-            
-        except Exception as e:
-            logger.warning(f"Failed to load secret {n}: {type(e).__name__}: {e}")
+    try:
+        r = secrets.get_secret_value(SecretId=secret_name)
+        s = r.get("SecretString", "")
+        logger.info(f"Secret retrieved, length={len(s)}")
+        
+        # 尝试 JSON 解析
+        d = json.loads(s)
+        logger.info(f"Secret JSON keys: {list(d.keys())}")
+        
+        # 取第一个值（兼容各种 key 名）
+        for key_name in ["apiKey", "api_key", "key", f"{mode.upper()}_API_KEY"]:
+            val = d.get(key_name, "")
+            if val:
+                logger.info(f"Found key via '{key_name}'")
+                return val
+        
+        # 都没匹配到，取 JSON 里第一个值
+        first_val = list(d.values())[0] if d else ""
+        if first_val:
+            logger.info(f"Using first value from JSON")
+            return first_val
+        
+    except json.JSONDecodeError:
+        # 纯文本
+        logger.info("Secret is plaintext")
+        return s.strip()
+    except Exception as e:
+        logger.error(f"Secret read failed: {type(e).__name__}: {e}")
     
-    logger.warning(f"No usable key found for mode={mode}")
     return ""
 
 def get_ai_cfg():
