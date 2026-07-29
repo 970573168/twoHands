@@ -37,17 +37,22 @@ find "$LAMBDA_DIR" -maxdepth 3 -name "*.py" -type f | sort
 
 echo ""
 echo "🔍 Checking latest auction code in source..."
-grep -R "AUCTION_ABATCH" -n "$LAMBDA_DIR" || {
+rg -n "AUCTION_ABATCH" "$LAMBDA_DIR" || {
   echo "❌ AUCTION_ABATCH not found in $LAMBDA_DIR"
   echo "说明 src 目录里的代码不是你以为的最新代码，或者你改的文件不在 src 目录。"
   exit 1
 }
 
-grep -R "params\[\"abatch\"\]" -n "$LAMBDA_DIR" || {
+rg -n 'params\["abatch"\]' "$LAMBDA_DIR" || {
   echo "❌ params[\"abatch\"] not found in $LAMBDA_DIR"
   echo "说明 src 目录里的代码没有 params[\"abatch\"] = AUCTION_ABATCH"
   exit 1
 }
+
+if rg -n '_ai_state' "$LAMBDA_DIR/auction_analyzer.py"; then
+  echo "❌ auction_analyzer.py still contains removed cross-batch AI state"
+  exit 1
+fi
 
 echo ""
 echo "📦 Installing dependencies into build directory..."
@@ -64,15 +69,20 @@ echo ""
 echo "🔍 Checking copied files in build directory..."
 find "$BUILD_DIR" -maxdepth 2 -name "*.py" -type f | sort
 
-grep -R "AUCTION_ABATCH" -n "$BUILD_DIR" || {
+rg -n "AUCTION_ABATCH" "$BUILD_DIR" || {
   echo "❌ AUCTION_ABATCH not found in build directory"
   exit 1
 }
 
-grep -R "params\[\"abatch\"\]" -n "$BUILD_DIR" || {
+rg -n 'params\["abatch"\]' "$BUILD_DIR" || {
   echo "❌ params[\"abatch\"] not found in build directory"
   exit 1
 }
+
+if rg -n '_ai_state' "$BUILD_DIR/auction_analyzer.py"; then
+  echo "❌ Copied auction_analyzer.py contains removed cross-batch AI state"
+  exit 1
+fi
 
 echo ""
 echo "🗜️ Creating deployment package..."
@@ -99,15 +109,20 @@ find /tmp/lambda-check -maxdepth 2 -name "*.py" -type f | sort
 
 echo ""
 echo "🔍 Verifying latest code inside lambda.zip..."
-grep -R "AUCTION_ABATCH" -n /tmp/lambda-check || {
+rg -n "AUCTION_ABATCH" /tmp/lambda-check || {
   echo "❌ AUCTION_ABATCH not found inside lambda.zip"
   exit 1
 }
 
-grep -R "params\[\"abatch\"\]" -n /tmp/lambda-check || {
+rg -n 'params\["abatch"\]' /tmp/lambda-check || {
   echo "❌ params[\"abatch\"] not found inside lambda.zip"
   exit 1
 }
+
+if rg -n '_ai_state' /tmp/lambda-check/auction_analyzer.py; then
+  echo "❌ Packaged auction_analyzer.py contains removed cross-batch AI state"
+  exit 1
+fi
 
 echo ""
 echo "🔐 Calculating local CodeSha256..."
