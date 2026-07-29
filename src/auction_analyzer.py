@@ -376,6 +376,34 @@ def _get_key(mode: str) -> str:
 
     return ""
 
+
+def _get_key(mode: str) -> str:
+    """仅从 Secrets Manager 获取 AI API Key。
+
+    API Key 不从 Lambda 环境变量读取，统一通过
+    <mode>-api-key-<ENVIRONMENT> 管理；SECRET_NAME 仅作为旧版 Secret 名称兜底。
+    """
+    env = os.getenv("ENVIRONMENT", "dev")
+    secret_names = [f"{mode}-api-key-{env}"]
+
+    legacy_secret = os.getenv("SECRET_NAME", "").strip()
+    if legacy_secret:
+        secret_names.append(legacy_secret)
+
+    for secret_name in dict.fromkeys(secret_names):
+        logger.info("Reading secret: %s", secret_name)
+        try:
+            response = secrets.get_secret_value(SecretId=secret_name)
+            secret_string = response.get("SecretString", "")
+            logger.info("Secret retrieved, length=%s", len(secret_string))
+            key = _extract_secret_value(secret_string, mode)
+            if key:
+                return key
+        except Exception as e:
+            logger.error("Secret read failed for %s: %s: %s", secret_name, type(e).__name__, e)
+
+    return ""
+
 def get_ai_cfg(excluded_modes=None):
     """获取 AI 配置，key 只从 Secrets Manager 读取。
 
@@ -385,8 +413,18 @@ def get_ai_cfg(excluded_modes=None):
     order = [AI_MODE] + [m for m in ["gemini","doubao","openai"] if m != AI_MODE]
 
     for mode in order:
-        if mode in excluded_modes:
-            continue
+        if mode in _ai_state["failed_modes"]:
+            cooldown = _env("AI_FAILOVER_COOLDOWN", 300, int)
+            elapsed = now - _ai_state["failed_modes"][mode]
+            if elapsed < cooldown:
+                logger.warning(
+                    "AI mode %s skipped: in failover cooldown %.1fs/%.1fs",
+                    mode,
+                    elapsed,
+                    cooldown,
+                )
+                continue
+            del _ai_state["failed_modes"][mode]
         
         original = AI_CONFIGS.get(mode, {})
         if not original:
