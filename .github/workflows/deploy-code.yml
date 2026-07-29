@@ -1,6 +1,13 @@
 name: Deploy Lambda Code
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/**'
+      - 'requirements.txt'
+      - 'build.sh'
   workflow_dispatch:
     inputs:
       environment:
@@ -50,7 +57,8 @@ permissions:
 jobs:
   deploy-code:
     runs-on: ubuntu-latest
-    environment: ${{ github.event.inputs.environment }}
+    # 自动触发时默认用 dev 环境，手动触发时用选择的环境
+    environment: ${{ github.event.inputs.environment || 'dev' }}
 
     steps:
       - name: 检出代码
@@ -69,54 +77,61 @@ jobs:
       - name: 检查是否需要构建
         id: check
         run: |
+          # 自动触发时更新所有函数，手动触发时按选择
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            UPDATE_AUCTION="true"
+            UPDATE_ANALYZER="true"
+            UPDATE_CATALOG="true"
+            UPDATE_CATALOG_SCANNER="true"
+            ENVIRONMENT="dev"
+          else
+            UPDATE_AUCTION="${{ github.event.inputs.update_auction }}"
+            UPDATE_ANALYZER="${{ github.event.inputs.update_analyzer }}"
+            UPDATE_CATALOG="${{ github.event.inputs.update_catalog }}"
+            UPDATE_CATALOG_SCANNER="${{ github.event.inputs.update_catalog_scanner }}"
+            ENVIRONMENT="${{ github.event.inputs.environment }}"
+          fi
+          
+          echo "environment=$ENVIRONMENT" >> $GITHUB_ENV
+          
           NEED_BUILD="false"
           BUILD_REASONS=""
           
-          # 检查是否需要更新 auction
-          if [[ "${{ github.event.inputs.update_auction }}" == "true" ]]; then
+          if [[ "$UPDATE_AUCTION" == "true" ]]; then
             echo "✅ 需要更新 Yahoo Auction Scraper"
             NEED_BUILD="true"
             BUILD_REASONS="${BUILD_REASONS} AuctionScraper"
           fi
           
-          # 检查是否需要更新 analyzer
-          if [[ "${{ github.event.inputs.update_analyzer }}" == "true" ]]; then
+          if [[ "$UPDATE_ANALYZER" == "true" ]]; then
             echo "✅ 需要更新 Yahoo Auction Analyzer"
             NEED_BUILD="true"
             BUILD_REASONS="${BUILD_REASONS} Analyzer"
           fi
           
-          # 检查是否需要更新 catalog
-          if [[ "${{ github.event.inputs.update_catalog }}" == "true" ]]; then
+          if [[ "$UPDATE_CATALOG" == "true" ]]; then
             echo "✅ 需要更新 ProductCatalog Discovery"
             NEED_BUILD="true"
             BUILD_REASONS="${BUILD_REASONS} Catalog"
           fi
           
-          # 检查是否需要更新 catalog scanner
-          if [[ "${{ github.event.inputs.update_catalog_scanner }}" == "true" ]]; then
+          if [[ "$UPDATE_CATALOG_SCANNER" == "true" ]]; then
             echo "✅ 需要更新 Catalog Scanner"
             NEED_BUILD="true"
             BUILD_REASONS="${BUILD_REASONS} CatalogScanner"
           fi
           
-          if [[ "$NEED_BUILD" == "false" ]]; then
-            echo "⚠️ 没有选择任何要更新的函数，跳过构建"
-          else
-            echo "🔨 构建原因:${BUILD_REASONS}"
-          fi
-          
           echo "need_build=$NEED_BUILD" >> $GITHUB_OUTPUT
+          echo "update_auction=$UPDATE_AUCTION" >> $GITHUB_OUTPUT
+          echo "update_analyzer=$UPDATE_ANALYZER" >> $GITHUB_OUTPUT
+          echo "update_catalog=$UPDATE_CATALOG" >> $GITHUB_OUTPUT
+          echo "update_catalog_scanner=$UPDATE_CATALOG_SCANNER" >> $GITHUB_OUTPUT
 
       - name: 构建 Lambda 包
         if: steps.check.outputs.need_build == 'true'
         run: |
           echo "🔨 正在构建 Lambda 包..."
           chmod +x build.sh
-          
-          # 传递环境变量给构建脚本
-          export BUILD_ENV="${{ github.event.inputs.environment }}"
-          
           ./build.sh
 
       - name: 配置 AWS 凭证
@@ -130,17 +145,12 @@ jobs:
         if: steps.check.outputs.need_build == 'true'
         run: |
           TIMESTAMP=$(date +%Y%m%d%H%M%S)
-          S3_BUCKET="${{ github.event.inputs.s3_bucket }}"
+          S3_BUCKET="${{ github.event.inputs.s3_bucket || 'productcatalog-lambda-code-767076981380' }}"
           S3_KEY="productcatalog/lambda-${TIMESTAMP}.zip"
           
           echo "📤 正在上传 Lambda 代码到 S3..."
-          echo "存储桶: $S3_BUCKET"
-          echo "路径: $S3_KEY"
-          
-          # 上传并验证
           aws s3 cp lambda.zip "s3://$S3_BUCKET/$S3_KEY"
           
-          # 验证上传
           if aws s3 ls "s3://$S3_BUCKET/$S3_KEY" > /dev/null 2>&1; then
             echo "✅ 上传成功"
           else
@@ -152,9 +162,9 @@ jobs:
           echo "s3_bucket=$S3_BUCKET" >> $GITHUB_ENV
 
       - name: 更新 Yahoo Auction Scraper 函数
-        if: steps.check.outputs.need_build == 'true' && github.event.inputs.update_auction == 'true'
+        if: steps.check.outputs.need_build == 'true' && steps.check.outputs.update_auction == 'true'
         run: |
-          FUNCTION_NAME="YahooAuctionScraper-${{ github.event.inputs.environment }}"
+          FUNCTION_NAME="YahooAuctionScraper-${{ env.environment }}"
           echo "🔄 正在更新 $FUNCTION_NAME..."
           
           if aws lambda get-function --function-name "$FUNCTION_NAME" >/dev/null 2>&1; then
@@ -162,44 +172,33 @@ jobs:
               --function-name "$FUNCTION_NAME" \
               --s3-bucket "${{ env.s3_bucket }}" \
               --s3-key "${{ env.s3_key }}"
-            
-            echo "⏳ 等待函数更新完成..."
             aws lambda wait function-updated --function-name "$FUNCTION_NAME"
-            
-            echo "✅ YahooAuctionScraper 更新完成"
+            echo "✅ $FUNCTION_NAME 更新完成"
           else
-            echo "⚠️ 函数 $FUNCTION_NAME 不存在，跳过更新"
+            echo "⚠️ 函数 $FUNCTION_NAME 不存在，跳过"
           fi
 
       - name: 更新 Yahoo Auction Analyzer 函数
-        if: steps.check.outputs.need_build == 'true' && github.event.inputs.update_analyzer == 'true'
+        if: steps.check.outputs.need_build == 'true' && steps.check.outputs.update_analyzer == 'true'
         run: |
-          FUNCTION_NAME="YahooAuctionAnalyzer-${{ github.event.inputs.environment }}"
+          FUNCTION_NAME="YahooAuctionAnalyzer-${{ env.environment }}"
           echo "🔄 正在更新 $FUNCTION_NAME..."
           
           if aws lambda get-function --function-name "$FUNCTION_NAME" >/dev/null 2>&1; then
             aws lambda update-function-code \
               --function-name "$FUNCTION_NAME" \
               --s3-bucket "${{ env.s3_bucket }}" \
-              --s3-key "${{ env.s3_key }}" \
-              --publish  # ★ 加这个参数强制发布新版本
-            
-            echo "⏳ 等待函数更新完成..."
+              --s3-key "${{ env.s3_key }}"
             aws lambda wait function-updated --function-name "$FUNCTION_NAME"
-            
-            # ★ 强制使用最新版本
-            LATEST_VERSION=$(aws lambda publish-version --function-name "$FUNCTION_NAME" --query 'Version' --output text)
-            echo "最新版本: $LATEST_VERSION"
-            
-            echo "✅ YahooAuctionAnalyzer 更新完成"
+            echo "✅ $FUNCTION_NAME 更新完成"
           else
-            echo "⚠️ 函数 $FUNCTION_NAME 不存在，跳过更新"
+            echo "⚠️ 函数 $FUNCTION_NAME 不存在，跳过"
           fi
 
       - name: 更新 ProductCatalog Discovery 函数
-        if: steps.check.outputs.need_build == 'true' && github.event.inputs.update_catalog == 'true'
+        if: steps.check.outputs.need_build == 'true' && steps.check.outputs.update_catalog == 'true'
         run: |
-          FUNCTION_NAME="ProductCatalog-Discovery-${{ github.event.inputs.environment }}"
+          FUNCTION_NAME="ProductCatalog-Discovery-${{ env.environment }}"
           echo "🔄 正在更新 $FUNCTION_NAME..."
           
           if aws lambda get-function --function-name "$FUNCTION_NAME" >/dev/null 2>&1; then
@@ -207,19 +206,16 @@ jobs:
               --function-name "$FUNCTION_NAME" \
               --s3-bucket "${{ env.s3_bucket }}" \
               --s3-key "${{ env.s3_key }}"
-            
-            echo "⏳ 等待函数更新完成..."
             aws lambda wait function-updated --function-name "$FUNCTION_NAME"
-            
-            echo "✅ ProductCatalog-Discovery 更新完成"
+            echo "✅ $FUNCTION_NAME 更新完成"
           else
-            echo "⚠️ 函数 $FUNCTION_NAME 不存在，跳过更新"
+            echo "⚠️ 函数 $FUNCTION_NAME 不存在，跳过"
           fi
 
       - name: 更新 Catalog Scanner 函数
-        if: steps.check.outputs.need_build == 'true' && github.event.inputs.update_catalog_scanner == 'true'
+        if: steps.check.outputs.need_build == 'true' && steps.check.outputs.update_catalog_scanner == 'true'
         run: |
-          FUNCTION_NAME="CatalogScanner-${{ github.event.inputs.environment }}"
+          FUNCTION_NAME="CatalogScanner-${{ env.environment }}"
           echo "🔄 正在更新 $FUNCTION_NAME..."
           
           if aws lambda get-function --function-name "$FUNCTION_NAME" >/dev/null 2>&1; then
@@ -227,58 +223,18 @@ jobs:
               --function-name "$FUNCTION_NAME" \
               --s3-bucket "${{ env.s3_bucket }}" \
               --s3-key "${{ env.s3_key }}"
-            
-            echo "⏳ 等待函数更新完成..."
             aws lambda wait function-updated --function-name "$FUNCTION_NAME"
-            
-            echo "✅ CatalogScanner 更新完成"
+            echo "✅ $FUNCTION_NAME 更新完成"
           else
-            echo "⚠️ 函数 $FUNCTION_NAME 不存在，跳过更新"
+            echo "⚠️ 函数 $FUNCTION_NAME 不存在，跳过"
           fi
 
-      - name: 显示部署信息
+      - name: 部署成功
         if: success()
         run: |
           echo "=========================================="
-          echo "✅ 部署成功完成！"
-          echo "部署时间: $(date '+%Y-%m-%d %H:%M:%S')"
-          echo "环境: ${{ github.event.inputs.environment }}"
-          
-          if [[ "${{ steps.check.outputs.need_build }}" == "true" ]]; then
-            echo ""
-            echo "📦 包路径: s3://${{ env.s3_bucket }}/${{ env.s3_key }}"
-          fi
-          
-          echo ""
-          echo "⚡ 函数更新状态:"
-          if [[ "${{ github.event.inputs.update_auction }}" == "true" ]]; then
-            echo "   ✅ YahooAuctionScraper-${{ github.event.inputs.environment }}"
-          else
-            echo "   ⏭️  YahooAuctionScraper-${{ github.event.inputs.environment }} (跳过)"
-          fi
-          if [[ "${{ github.event.inputs.update_analyzer }}" == "true" ]]; then
-            echo "   ✅ YahooAuctionAnalyzer-${{ github.event.inputs.environment }}"
-          else
-            echo "   ⏭️  YahooAuctionAnalyzer-${{ github.event.inputs.environment }} (跳过)"
-          fi
-          if [[ "${{ github.event.inputs.update_catalog }}" == "true" ]]; then
-            echo "   ✅ ProductCatalog-Discovery-${{ github.event.inputs.environment }}"
-          else
-            echo "   ⏭️  ProductCatalog-Discovery-${{ github.event.inputs.environment }} (跳过)"
-          fi
-          if [[ "${{ github.event.inputs.update_catalog_scanner }}" == "true" ]]; then
-            echo "   ✅ CatalogScanner-${{ github.event.inputs.environment }}"
-          else
-            echo "   ⏭️  CatalogScanner-${{ github.event.inputs.environment }} (跳过)"
-          fi
-          echo "=========================================="
-
-      - name: 部署失败通知
-        if: failure()
-        run: |
-          echo "=========================================="
-          echo "❌ 部署失败！"
-          echo "环境: ${{ github.event.inputs.environment }}"
+          echo "✅ 部署成功！"
+          echo "环境: ${{ env.environment }}"
           echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
-          echo "请检查日志获取详细错误信息"
+          echo "包路径: s3://${{ env.s3_bucket }}/${{ env.s3_key }}"
           echo "=========================================="
