@@ -1,6 +1,11 @@
 name: Deploy Infrastructure
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'cloudformation/**'
   workflow_dispatch:
     inputs:
       environment:
