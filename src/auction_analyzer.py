@@ -63,42 +63,32 @@ TABLE_CLOSED = _env("TABLE_NAME_CLOSED", "YahooAuctionItems")
 AI_MODE = _env("AI_MODE", "doubao")
 
 # ★★★ FIX 2: API URL默认值 ★★★
+# AI_CONFIGS 里去掉 key 字段
 AI_CONFIGS = {
     "gemini": {
         "name": "gemini",
         "type": "gemini",
-        "url": _env(
-            "GEMINI_URL",
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
-        ),
+        "url": _env("GEMINI_URL", "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"),
         "model": _env("GEMINI_MODEL", "gemini-2.0-flash"),
         "timeout": _env("GEMINI_TIMEOUT", 60, int),
-        "max_tokens": _env("GEMINI_MAX_TOKENS", 250000, int),  # ★ FIX 3: 25万
-        "key": _env("GEMINI_API_KEY", ""),
+        "max_tokens": _env("GEMINI_MAX_TOKENS", 250000, int),
+        # ★ 不再从环境变量读 key
     },
     "doubao": {
         "name": "doubao",
         "type": "openai",
-        "url": _env(
-            "DOUBAO_URL",
-            "https://ws-8lxmxlbemcgcus5u.ap-northeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions"
-        ),
+        "url": _env("DOUBAO_URL", "https://ws-8lxmxlbemcgcus5u.ap-northeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions"),
         "model": _env("DOUBAO_MODEL", "qwen-plus-character"),
         "timeout": _env("DOUBAO_TIMEOUT", 90, int),
-        "max_tokens": _env("DOUBAO_MAX_TOKENS", 250000, int),  # ★ FIX 3: 25万
-        "key": _env("DOUBAO_API_KEY", ""),
+        "max_tokens": _env("DOUBAO_MAX_TOKENS", 250000, int),
     },
     "openai": {
         "name": "openai",
         "type": "openai",
-        "url": _env(
-            "OPENAI_URL",
-            "https://api.openai.com/v1/chat/completions"
-        ),
+        "url": _env("OPENAI_URL", "https://api.openai.com/v1/chat/completions"),
         "model": _env("OPENAI_MODEL", "gpt-4o-mini"),
         "timeout": _env("OPENAI_TIMEOUT", 60, int),
-        "max_tokens": _env("OPENAI_MAX_TOKENS", 250000, int),  # ★ FIX 3: 25万
-        "key": _env("OPENAI_API_KEY", ""),
+        "max_tokens": _env("OPENAI_MAX_TOKENS", 250000, int),
     },
 }
 
@@ -376,8 +366,8 @@ def _get_key(mode: str) -> str:
     return ""
 
 def get_ai_cfg():
-    """获取AI配置，检查key和URL"""
-    order = [AI_MODE]+[m for m in ["gemini","doubao","openai"] if m!=AI_MODE]
+    """获取AI配置，key 只从 Secrets Manager 读"""
+    order = [AI_MODE] + [m for m in ["gemini","doubao","openai"] if m != AI_MODE]
     now = time.time()
     
     for mode in order:
@@ -391,16 +381,15 @@ def get_ai_cfg():
         if not original:
             continue
         
-        # 不直接修改全局配置
         cfg = dict(original)
         
-        key =  _get_key(mode)
+        # ★ 只从 Secrets Manager 读 key
+        key = _get_key(mode)
         url = str(cfg.get("url") or "").strip()
         model = str(cfg.get("model") or "").strip()
         
-        # ★ FIX 2: 检查URL ★
         if not key:
-            logger.warning("AI mode %s skipped: API key missing", mode)
+            logger.warning("AI mode %s skipped: API key missing from Secrets Manager", mode)
             continue
         
         if not url:
@@ -413,12 +402,7 @@ def get_ai_cfg():
         
         cfg["key"] = key
         
-        logger.info(
-            "Selected AI mode=%s model=%s url=%s",
-            mode,
-            model,
-            url
-        )
+        logger.info("Selected AI mode=%s model=%s url=%s", mode, model, url)
         return cfg
     
     return None
