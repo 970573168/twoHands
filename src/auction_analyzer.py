@@ -384,8 +384,15 @@ def get_ai_cfg():
     
     for mode in order:
         if mode in _ai_state["failed_modes"]:
-            cooldown = _env("AI_COOLDOWN", 300, int)
-            if now - _ai_state["failed_modes"][mode] < cooldown:
+            cooldown = _env("AI_FAILOVER_COOLDOWN", 300, int)
+            elapsed = now - _ai_state["failed_modes"][mode]
+            if elapsed < cooldown:
+                logger.warning(
+                    "AI mode %s skipped: in failover cooldown %.1fs/%.1fs",
+                    mode,
+                    elapsed,
+                    cooldown,
+                )
                 continue
             del _ai_state["failed_modes"][mode]
         
@@ -417,6 +424,7 @@ def get_ai_cfg():
         logger.info("Selected AI mode=%s model=%s url=%s", mode, model, url)
         return cfg
     
+    logger.error("No AI config available after checking modes: %s", order)
     return None
 
 def call_ai(prompt: str) -> Tuple[Optional[Dict],Optional[str]]:
