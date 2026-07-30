@@ -137,6 +137,8 @@ TIMEOUT_BUFFER = _env("TIMEOUT_BUFFER", 30, int)
 DETAIL_DESC_MAX = _env("DETAIL_DESC_MAX", 3000, int)
 ENABLE_FALLBACK = _env("FALLBACK_MATCH", True, lambda x: x.lower() in ("true","1"))
 ENABLE_FAMILY = _env("FAMILY_MATCH", True, lambda x: x.lower() in ("true","1"))
+LOG_AI_REQUEST_JSON = _env("LOG_AI_REQUEST_JSON", False, lambda x: x.lower() in ("true", "1"))
+LOG_AI_RESPONSE_JSON = _env("LOG_AI_RESPONSE_JSON", False, lambda x: x.lower() in ("true", "1"))
 
 # ======================================
 # DynamoDB & State
@@ -473,6 +475,14 @@ def call_ai(prompt: str, max_tokens: int) -> Tuple[Optional[Dict],Optional[str]]
         if mode=="doubao":
             body["response_format"]={"type":"json_object"}
         headers = {"x-goog-api-key":cfg["key"],"Content-Type":"application/json"} if is_gem else {"Authorization":f"Bearer {cfg['key']}","Content-Type":"application/json"}
+
+        # 调试开关默认关闭，避免常规运行时输出大量商品文本。
+        # 请求日志只记录 JSON body，不记录含 API Key 的 headers。
+        if LOG_AI_REQUEST_JSON:
+            logger.info(
+                "AI_REQUEST_JSON=%s",
+                json.dumps(body, ensure_ascii=False, separators=(",", ":"), default=str),
+            )
         
         for retry in range(AI_RETRIES):
             try:
@@ -485,6 +495,12 @@ def call_ai(prompt: str, max_tokens: int) -> Tuple[Optional[Dict],Optional[str]]
                 )
                 with urllib.request.urlopen(req,timeout=cfg["timeout"]) as r:
                     result = json.loads(r.read().decode())
+
+                if LOG_AI_RESPONSE_JSON:
+                    logger.info(
+                        "AI_RESPONSE_JSON=%s",
+                        json.dumps(result, ensure_ascii=False, separators=(",", ":"), default=str),
+                    )
                 
                 u = result.get("usageMetadata",{}) or result.get("usage",{})
                 tokens_used = u.get("total_tokens",u.get("totalTokenCount",0))

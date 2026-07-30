@@ -354,6 +354,22 @@ Parameters:
     MinValue: 500
     MaxValue: 10000
 
+  LogAiRequestJson:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: 是否在 Analyzer 日志中打印发送给 AI 的完整 JSON（不包含 API Key）
+
+  LogAiResponseJson:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: 是否在 Analyzer 日志中打印 AI 返回的完整 JSON
+
   # ============ Yahoo Auction 详情抓取参数 ============
   EnableDetailScrape:
     Type: String
@@ -915,6 +931,8 @@ Resources:
           MAX_TOKENS: !Ref MaxTotalTokens
           SIMPLE_MAX_TOKENS: "4000"
           DETAIL_MAX_TOKENS: "12000"
+          LOG_AI_REQUEST_JSON: !Ref LogAiRequestJson
+          LOG_AI_RESPONSE_JSON: !Ref LogAiResponseJson
           LAMBDA_TIMEOUT: "900"
           TIMEOUT_BUFFER: !Ref LambdaTimeoutBuffer
           
