@@ -18,15 +18,6 @@ on:
           - test
           - prod
 
-      deploy_secret:
-        description: "Deploy API Secret?"
-        required: true
-        default: "true"
-        type: choice
-        options:
-          - "true"
-          - "false"
-
       deploy_main_app:
         description: "Deploy Main Application?"
         required: true
@@ -75,11 +66,6 @@ on:
         default: "3"
         type: string
 
-      api_key:
-        description: "API Key (required if deploy_secret=true)"
-        required: false
-        type: string
-
       s3_bucket:
         description: "S3 bucket name for Lambda code"
         required: true
@@ -111,7 +97,19 @@ permissions:
 jobs:
   deploy-infrastructure:
     runs-on: ubuntu-latest
-    environment: ${{ github.event.inputs.environment }}
+    environment: ${{ inputs.environment || 'dev' }}
+    env:
+      DEPLOY_ENVIRONMENT: ${{ inputs.environment || 'dev' }}
+      DEPLOY_MAIN_APP: ${{ inputs.deploy_main_app || 'true' }}
+      DEPLOY_SCRAPER: ${{ inputs.deploy_scraper || 'true' }}
+      DEPLOY_CATALOG_SCANNER: ${{ inputs.deploy_catalog_scanner || 'true' }}
+      CATALOG_SCANNER_ENABLED: ${{ inputs.catalog_scanner_enabled || 'false' }}
+      CATALOG_SCANNER_INTERVAL: ${{ inputs.catalog_scanner_interval || '120' }}
+      CATALOG_SCANNER_MAX_MODELS: ${{ inputs.catalog_scanner_max_models || '3' }}
+      S3_BUCKET_PREFIX: ${{ inputs.s3_bucket || 'productcatalog-lambda-code' }}
+      YAHOO_AUCTION_MAX_PAGES: ${{ inputs.max_pages || '1' }}
+      LOG_RETENTION_DAYS: ${{ inputs.log_retention || '14' }}
+      EXTRA_STACK_PARAMS: ${{ inputs.stack_params || '{}' }}
 
     steps:
       - name: Checkout
@@ -131,11 +129,11 @@ jobs:
 
       - name: Prepare S3 Bucket Name
         run: |
-          S3_BUCKET="${{ github.event.inputs.s3_bucket }}-${AWS_ACCOUNT_ID}"
+          S3_BUCKET="${S3_BUCKET_PREFIX}-${AWS_ACCOUNT_ID}"
           echo "S3_BUCKET=$S3_BUCKET" >> "$GITHUB_ENV"
 
       - name: Create S3 Bucket if not exists
-        if: ${{ github.event.inputs.deploy_main_app == 'true' || github.event.inputs.deploy_scraper == 'true' }}
+        if: ${{ env.DEPLOY_MAIN_APP == 'true' || env.DEPLOY_SCRAPER == 'true' || env.DEPLOY_CATALOG_SCANNER == 'true' }}
         run: |
           if aws s3api head-bucket --bucket "$S3_BUCKET" 2>/dev/null; then
             echo "Bucket exists: $S3_BUCKET"
@@ -150,7 +148,7 @@ jobs:
           aws s3api put-public-access-block --bucket "$S3_BUCKET" --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
 
       - name: Build and Upload Lambda Code
-        if: ${{ github.event.inputs.deploy_main_app == 'true' || github.event.inputs.deploy_scraper == 'true' || github.event.inputs.deploy_catalog_scanner == 'true' }}
+        if: ${{ env.DEPLOY_MAIN_APP == 'true' || env.DEPLOY_SCRAPER == 'true' || env.DEPLOY_CATALOG_SCANNER == 'true' }}
         run: |
           BUILD_DIR="build"
           rm -rf "$BUILD_DIR" lambda.zip
@@ -179,39 +177,33 @@ jobs:
 
       - name: Deploy Stack
         run: |
-          STACK_NAME="productcatalog-app-${{ github.event.inputs.environment }}"
+          STACK_NAME="productcatalog-app-${DEPLOY_ENVIRONMENT}"
           
           PARAMS=(
-            "Environment=${{ github.event.inputs.environment }}"
-            "DeploySecret=${{ github.event.inputs.deploy_secret }}"
-            "DeployMainApp=${{ github.event.inputs.deploy_main_app }}"
-            "DeployScraper=${{ github.event.inputs.deploy_scraper }}"
+            "Environment=${DEPLOY_ENVIRONMENT}"
+            "DeployMainApp=${DEPLOY_MAIN_APP}"
+            "DeployScraper=${DEPLOY_SCRAPER}"
             "LambdaCodeS3Bucket=$S3_BUCKET"
             "LambdaCodeS3Key=${S3_KEY:-productcatalog/lambda.zip}"
-            "YahooAuctionMaxPages=${{ github.event.inputs.max_pages }}"
-            "LogRetentionDays=${{ github.event.inputs.log_retention }}"
+            "YahooAuctionMaxPages=${YAHOO_AUCTION_MAX_PAGES}"
+            "LogRetentionDays=${LOG_RETENTION_DAYS}"
             "AiMaxRetries=3"
           )
           
           # 添加 Catalog Scanner 参数
-          if [ "${{ github.event.inputs.deploy_catalog_scanner }}" = "true" ]; then
+          if [ "$DEPLOY_CATALOG_SCANNER" = "true" ]; then
             PARAMS+=(
               "DeployCatalogScanner=true"
-              "CatalogScannerEnabled=${{ github.event.inputs.catalog_scanner_enabled }}"
-              "CatalogScannerIntervalMinutes=${{ github.event.inputs.catalog_scanner_interval }}"
-              "CatalogScannerMaxModels=${{ github.event.inputs.catalog_scanner_max_models }}"
+              "CatalogScannerEnabled=${CATALOG_SCANNER_ENABLED}"
+              "CatalogScannerIntervalMinutes=${CATALOG_SCANNER_INTERVAL}"
+              "CatalogScannerMaxModels=${CATALOG_SCANNER_MAX_MODELS}"
             )
           else
             PARAMS+=("DeployCatalogScanner=false")
           fi
           
-          # 🔧 修复: ApiKey 使用 Key=Value 格式
-          if [ "${{ github.event.inputs.deploy_secret }}" = "true" ] && [ -n "${{ github.event.inputs.api_key }}" ]; then
-            PARAMS+=("ApiKey=${{ github.event.inputs.api_key }}")
-          fi
-          
           # 🔧 修复: stack_params 使用 Key=Value 格式
-          EXTRA_PARAMS='${{ github.event.inputs.stack_params }}'
+          EXTRA_PARAMS="$EXTRA_STACK_PARAMS"
           if [ "$EXTRA_PARAMS" != "{}" ]; then
             while IFS="=" read -r k v; do
               [ -n "$k" ] && PARAMS+=("$k=$v")
@@ -234,14 +226,19 @@ jobs:
         if: success()
         run: |
           aws cloudformation describe-stacks \
-            --stack-name "productcatalog-app-${{ github.event.inputs.environment }}" \
+            --stack-name "productcatalog-app-${DEPLOY_ENVIRONMENT}" \
             --query 'Stacks[0].Outputs[*].[OutputKey,OutputValue]' \
             --output table
 
       - name: Show Failed Resources
         if: failure()
         run: |
-          aws cloudformation describe-stack-events \
-            --stack-name "productcatalog-app-${{ github.event.inputs.environment }}" \
-            --query "StackEvents[?contains(ResourceStatus,'FAILED')].[LogicalResourceId,ResourceStatus,ResourceStatusReason,Timestamp]" \
-            --output table
+          STACK_NAME="productcatalog-app-${DEPLOY_ENVIRONMENT}"
+          if aws cloudformation describe-stacks --stack-name "$STACK_NAME" >/dev/null 2>&1; then
+            aws cloudformation describe-stack-events \
+              --stack-name "$STACK_NAME" \
+              --query "StackEvents[?contains(ResourceStatus,'FAILED')].[LogicalResourceId,ResourceStatus,ResourceStatusReason,Timestamp]" \
+              --output table
+          else
+            echo "Stack $STACK_NAME does not exist; no stack events to display."
+          fi
