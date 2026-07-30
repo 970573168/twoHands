@@ -14,7 +14,7 @@ title + detailDescription 详细AI解析
 7. 增强日志输出
 """
 
-import os, re, json, time, random, logging, urllib.request, urllib.error, socket
+import os, re, json, time, random, logging, unicodedata, urllib.request, urllib.error, socket
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from typing import List, Dict, Optional, Any, Set, Tuple, Union
@@ -264,6 +264,29 @@ def norm(text: str) -> str:
     t = str(text).strip().translate(str.maketrans("ＡＢＣＤＥＦＧＨＩＪＫＬＭＮＯＰＱＲＳＴＵＶＷＸＹＺａｂｃｄｅｆｇｈｉｊｋｌｍｎｏｐｑｒｓｔｕｖｗｘｙｚ０１２３４５６７８９","ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"))
     return re.sub(r"\s+"," ",t)
 
+def normalize_pricing_key(value: str) -> str:
+    """生成仅含 A-Z、0-9 的通用机器匹配键。"""
+    if value is None:
+        return ""
+    normalized_parts = []
+    for character in str(value):
+        normalized_character = unicodedata.normalize("NFKC", character)
+        # NFKC 会把 ™ 等符号展开成 ASCII 字母；符号本身仍应作为分隔符
+        # 丢弃，不能让展示标记改变产品身份。
+        if unicodedata.category(character)[0] in {"P", "S", "Z"}:
+            continue
+        normalized_parts.append(normalized_character)
+    normalized = "".join(normalized_parts).upper()
+    return re.sub(r"[^A-Z0-9]", "", normalized)
+
+def pricing_key_with_condition(value: str, condition_class: str) -> str:
+    """规范化价格键，并在键尚未包含状态时补充状态。"""
+    key = normalize_pricing_key(value)
+    condition = normalize_pricing_key(condition_class)
+    if key and condition and not key.endswith(condition):
+        key += condition
+    return key
+
 def norm_storage(v) -> str:
     if not v:
         return ""
@@ -305,19 +328,19 @@ def gen_key(brand, model, storage="", variant=""):
     parts = [b,m]
     if s:
         parts.append(s)
-    return re.sub(r"[^A-Z0-9\s+\-/]"," "," ".join(parts)).strip()
+    return normalize_pricing_key(" ".join(parts))
 
 def gen_fallback_key(brand, model, storage=""):
     b = norm(brand).upper() if brand else "UNKNOWN"
     m = norm(model).upper() if model else "UNKNOWN"
     s = norm_storage(storage)
     fam = extract_family(m)
-    base = re.sub(r"[^A-Z0-9\s+\-/]"," ",f"{b} {fam}").strip()
-    full = re.sub(r"[^A-Z0-9\s+\-/]"," ",f"{b} {m}"+(f" {s}" if s else "")).strip()
-    if base==full or base==f"{b} {m}":
+    base = normalize_pricing_key(f"{b} {fam}")
+    full = normalize_pricing_key(f"{b} {m}"+(f" {s}" if s else ""))
+    model_key = normalize_pricing_key(f"{b} {m}")
+    if base==full or base==model_key:
         if s:
-            ns = re.sub(r"[^A-Z0-9\s+\-/]"," ",f"{b} {m}").strip()
-            return ns if ns!=full else ""
+            return model_key if model_key!=full else ""
         return ""
     return base
 
@@ -781,8 +804,7 @@ def gen_detailed_key(parsed: Dict) -> str:
     parts.append(get_condition_class(parsed))
     
     combined = " ".join(p for p in parts if p)
-    combined = re.sub(r"[^A-Z0-9ぁ-んァ-ン一-龥\s+\-/\.]"," ",combined)
-    return re.sub(r"\s+"," ",combined).strip()
+    return normalize_pricing_key(combined)
 
 def parse_ai_result(parsed: Dict) -> Tuple[List[Dict], str, str, int, List[str], str]:
     brand = norm(parsed.get("brand",""))
@@ -1011,17 +1033,13 @@ def build_index(closed_ids: Set[str]) -> Dict[str,List[Dict]]:
                 continue
             
             condition_class = get_condition_class(m, get_condition_class(item))
-            pk = norm(m.get("pricingModelKey","")).upper()
-            if pk and not pk.endswith(f" {condition_class}"):
-                pk = f"{pk} {condition_class}"
+            pk = pricing_key_with_condition(m.get("pricingModelKey", ""), condition_class)
             if pk and pk not in keys:
                 keys.add(pk)
                 idx.setdefault(pk,[]).append(item)
             
             if ENABLE_FALLBACK:
-                fk = norm(m.get("fallbackPricingKey","")).upper()
-                if fk and not fk.endswith(f" {condition_class}"):
-                    fk = f"{fk} {condition_class}"
+                fk = pricing_key_with_condition(m.get("fallbackPricingKey", ""), condition_class)
                 if fk and fk!=pk:
                     fq = f"FB:{fk}"
                     if fq not in keys:
@@ -1033,7 +1051,7 @@ def build_index(closed_ids: Set[str]) -> Dict[str,List[Dict]]:
                 if fm and fm!=mn:
                     b = norm(m.get("brand","")).upper()
                     if b:
-                        fam = re.sub(r"[^A-Z0-9\s+\-/]"," ",f"{b} {fm} {condition_class}").strip()
+                        fam = normalize_pricing_key(f"{b} {fm} {condition_class}")
                         fq = f"FAM:{fam}"
                         if fq not in keys:
                             keys.add(fq)
@@ -1060,9 +1078,7 @@ def find_comp(item: Dict, idx: Dict[str,List[Dict]]) -> Tuple[List[Dict],Dict]:
             continue
         
         condition_class = get_condition_class(m, get_condition_class(item))
-        pk = norm(m.get("pricingModelKey","")).upper()
-        if pk and not pk.endswith(f" {condition_class}"):
-            pk = f"{pk} {condition_class}"
+        pk = pricing_key_with_condition(m.get("pricingModelKey", ""), condition_class)
         if pk:
             for ci in idx.get(pk,[]):
                 iid = str(ci.get("itemID",""))
@@ -1072,9 +1088,7 @@ def find_comp(item: Dict, idx: Dict[str,List[Dict]]) -> Tuple[List[Dict],Dict]:
             exact = len(items)
         
         if len(items)<MIN_COMPARABLE and ENABLE_FALLBACK:
-            fk = norm(m.get("fallbackPricingKey","")).upper()
-            if fk and not fk.endswith(f" {condition_class}"):
-                fk = f"{fk} {condition_class}"
+            fk = pricing_key_with_condition(m.get("fallbackPricingKey", ""), condition_class)
             if fk:
                 for ci in idx.get(f"FB:{fk}",[]):
                     iid = str(ci.get("itemID",""))
@@ -1088,7 +1102,7 @@ def find_comp(item: Dict, idx: Dict[str,List[Dict]]) -> Tuple[List[Dict],Dict]:
             if fm:
                 b = norm(m.get("brand","")).upper()
                 if b:
-                    fkey = re.sub(r"[^A-Z0-9\s+\-/]"," ",f"{b} {fm} {condition_class}").strip()
+                    fkey = normalize_pricing_key(f"{b} {fm} {condition_class}")
                     for ci in idx.get(f"FAM:{fkey}",[]):
                         iid = str(ci.get("itemID",""))
                         if iid and iid not in seen:
