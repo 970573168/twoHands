@@ -1721,7 +1721,7 @@ def execute_workflow(kw: str, ac: int, cc: int, force: bool) -> Dict:
                     recheck_items.append(detail_item)
                     detail_scraped += 1
                 if index < len(description_recheck_ids) - 1:
-                    time.sleep(_env("DETAIL_REQUEST_INTERVAL", 1.0, float))
+                    time.sleep(_env("DETAIL_REQUEST_INTERVAL", 0.3, float))
 
             if recheck_items:
                 logger.info(
