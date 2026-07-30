@@ -62,7 +62,7 @@ Parameters:
 
   GeminiMaxTokens:
     Type: Number
-    Default: 250000
+    Default: 12000
     MinValue: 100
     MaxValue: 1000000
 
@@ -91,7 +91,7 @@ Parameters:
 
   DoubaoMaxTokens:
     Type: Number
-    Default: 250000
+    Default: 12000
     MinValue: 100
     MaxValue: 1000000
 
@@ -120,7 +120,7 @@ Parameters:
 
   OpenaiMaxTokens:
     Type: Number
-    Default: 250000
+    Default: 12000
     MinValue: 100
     MaxValue: 1000000
 
@@ -230,13 +230,13 @@ Parameters:
   # ============ Yahoo Auction Analyzer 参数 ============
   ModelParseBatchSize:
     Type: Number
-    Default: 100
+    Default: 25
     MinValue: 1
     MaxValue: 1000
 
   ClosedParseBatchSize:
     Type: Number
-    Default: 100
+    Default: 25
     MinValue: 1
     MaxValue: 1000
 
@@ -353,6 +353,22 @@ Parameters:
     Default: 3000
     MinValue: 500
     MaxValue: 10000
+
+  LogAiRequestJson:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: 是否在 Analyzer 日志中打印发送给 AI 的完整 JSON（不包含 API Key）
+
+  LogAiResponseJson:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: 是否在 Analyzer 日志中打印 AI 返回的完整 JSON
 
   # ============ Yahoo Auction 详情抓取参数 ============
   EnableDetailScrape:
@@ -913,11 +929,17 @@ Resources:
           AI_MAX_RETRIES: !Ref AiMaxRetries
 
           MAX_TOKENS: !Ref MaxTotalTokens
+          SIMPLE_MAX_TOKENS: "4000"
+          DETAIL_MAX_TOKENS: "12000"
+          LOG_AI_REQUEST_JSON: !Ref LogAiRequestJson
+          LOG_AI_RESPONSE_JSON: !Ref LogAiResponseJson
           LAMBDA_TIMEOUT: "900"
           TIMEOUT_BUFFER: !Ref LambdaTimeoutBuffer
           
           MODEL_BATCH: !Ref ModelParseBatchSize
           CLOSED_BATCH: !Ref ClosedParseBatchSize
+          SIMPLE_BATCH: !Ref ModelParseBatchSize
+          DETAIL_BATCH: "10"
           REQ_INTERVAL: !Ref RequestInterval
           
           FEE_RATE: !Ref ExpectedSellingFeeRate
