@@ -48,8 +48,9 @@ class ConditionClass:
 EXCLUDED_TYPES = {ListingType.ACCESSORY, ListingType.PARTS, ListingType.BOX_ONLY, ListingType.BUNDLE}
 
 class Recommendation:
-    BUY = "BUY"; REVIEW = "REVIEW"; NO = "NO"
-    AI_RECHECK = "AI_RECHECK"; MANUAL_REVIEW = "MANUAL_REVIEW"
+    BUY_CANDIDATE = "BUY_CANDIDATE"
+    REVIEW = "REVIEW"
+    AVOID = "AVOID"
 
 NON_CRITICAL_FIELDS = {"variant", "color", "carrier", "screen_size", "battery", "graphics_card", "os", "processor", "cpu", "compatibility", "ram", "memory"}
 CRITICAL_PARAM_PENALTIES = {"brand": Decimal("0.20"), "model": Decimal("0.30"), "storage": Decimal("0.10"), "other": Decimal("0.05")}
@@ -641,13 +642,18 @@ def _parse_json(content: str) -> Optional[Dict]:
 # Prompt Templates
 # ======================================
 
-SIMPLE_PARSE_PROMPT = """以下の Yahoo! オークション商品タイトルを価格比較用に分類してください。
+ACTIVE_PARSE_PROMPT = """Yahoo!オークションの商品タイトルから製品を特定してください。
 入力: {items_json}
 全 itemId を含む次の JSON だけを返してください:
-{{"items":[{{"itemId":"123","brand":"Apple","model":"iPhone 14 Pro","storage":"256GB","listingType":"MAIN_PRODUCT","conditionClass":"NORMAL","confidence":0.95}}]}}
-listingType は MAIN_PRODUCT/ACCESSORY/PARTS/BOX_ONLY/BUNDLE/UNKNOWN。故障した本体は MAIN_PRODUCT とする。
-conditionClass は、ジャンク、不動、起動不可、画面割れ、Face ID 不良、水没、その他の故障があれば JUNK、それ以外は NORMAL。
-brand/model/storage は明記された値だけを返し、不明な値は空文字にする。他のフィールドは返さない。"""
+{{"items":[{{"itemId":"123","models":[{{"brand":"Apple","model":"iPhone 14 Pro"}}]}}]}}
+brand/model はタイトルに明記された値だけを返し、製品を特定できなければ models を空配列にしてください。他のフィールドは返さないでください。"""
+
+CLOSED_PARSE_PROMPT = """Yahoo!オークションの終了商品を参照製品と比較してください。
+入力: {items_json}
+全 itemId を含む次の JSON だけを返してください:
+{{"items":[{{"itemId":"123","models":[{{"brand":"Apple","model":"iPhone 14 Pro"}}],"listingType":"MAIN_PRODUCT"}}]}}
+sourceModel と同じモデルなら models に sourceModel の brand/model をそのまま返し、異なるモデルなら空配列にしてください。
+listingType は MAIN_PRODUCT/ACCESSORY/PARTS/BOX_ONLY のいずれかです。故障した本体は MAIN_PRODUCT としてください。他のフィールドは返さないでください。"""
 
 DETAILED_PARSE_PROMPT = """あなたは中古電子製品の識別専門家です。
 以下の商品タイトルと商品説明を解析し、価格比較に必要な詳細スペックを抽出してください。
@@ -694,8 +700,7 @@ DETAILED_PARSE_PROMPT = """あなたは中古電子製品の識別専門家で�
         "ram": "PC/Macの場合、価格に影響するRAM",
         "gpu": "PC/Macの場合、価格に影響するGPU",
         "screenSize": "価格に影響する場合のみ"
-      }},
-      "confidence": 0.95
+      }}
     }}
   ]
 }}
@@ -719,8 +724,8 @@ condition: NEW/USED/BROKEN/UNKNOWN
 13. JSONのみを出力してください"""
 
 
-def build_parse_prompt(items: List[Dict]) -> str:
-    """首次模型识别只发送 itemId 和 title。"""
+def build_active_parse_prompt(items: List[Dict]) -> str:
+    """Active 首次模型识别只发送 itemId 和 title。"""
     items_data = []
     for item in items:
         data = {
@@ -728,7 +733,23 @@ def build_parse_prompt(items: List[Dict]) -> str:
             "title": item.get("title",""),
         }
         items_data.append(data)
-    return SIMPLE_PARSE_PROMPT.replace("{items_json}", json.dumps(items_data, ensure_ascii=False, separators=(",",":")))
+    return ACTIVE_PARSE_PROMPT.replace("{items_json}", json.dumps(items_data, ensure_ascii=False, separators=(",",":")))
+
+
+def build_closed_parse_prompt(items: List[Dict]) -> str:
+    """Closed AI 只比较标题与已知 sourceModel，并判断商品类型。"""
+    items_data = []
+    for item in items:
+        source_model = item.get("sourceModel", {}) or {}
+        items_data.append({
+            "itemId": str(item.get("itemID", "")),
+            "title": item.get("title", ""),
+            "sourceModel": {
+                "brand": source_model.get("brand", ""),
+                "model": source_model.get("model", ""),
+            },
+        })
+    return CLOSED_PARSE_PROMPT.replace("{items_json}", json.dumps(items_data, ensure_ascii=False, separators=(",", ":")))
 
 
 def build_description_parse_prompt(items: List[Dict]) -> str:
@@ -811,7 +832,6 @@ def parse_ai_result(parsed: Dict) -> Tuple[List[Dict], str, str, int, List[str],
     model = norm(parsed.get("model",""))
     variant = norm(parsed.get("variant",""))
     storage = norm_storage(parsed.get("storage",""))
-    conf = sd(parsed.get("confidence",0))
     lt = norm(parsed.get("listingType","UNKNOWN")).upper()
     cond = norm(parsed.get("condition","UNKNOWN")).upper()
     missing = [m for m in (parsed.get("missing") or []) if str(m).lower() not in NON_CRITICAL_FIELDS]
@@ -843,7 +863,7 @@ def parse_ai_result(parsed: Dict) -> Tuple[List[Dict], str, str, int, List[str],
         pk = gen_detailed_key(parsed) or gen_key(b2,m2,storage,variant)
         fk = gen_fallback_key(b2,m2,storage)
         if fk:
-            fk = f"{fk} {condition_class}"
+            fk = pricing_key_with_condition(fk, condition_class)
         if not fk or fk==pk:
             fk = ""
         fm = extract_family(m2.upper()) if has_m else ""
@@ -875,7 +895,6 @@ def parse_ai_result(parsed: Dict) -> Tuple[List[Dict], str, str, int, List[str],
             "storage": storage,
             "pricingModelKey": pk,
             "fallbackPricingKey": fk,
-            "confidence": str(conf),
             "missingParameterCount": mc,
             "conditionClass": condition_class,
             "detailedParameters": detailed
@@ -899,14 +918,11 @@ def save_model(table, item_id: str, parsed: Dict) -> str:
     models, lt, cond, mc, missing_critical, excl = parse_ai_result(parsed)
     excluded = lt in EXCLUDED_TYPES
     condition_class = get_condition_class(parsed)
-    low_conf = any(sd(m.get("confidence",0))<Decimal("0.7") for m in models)
-    
+
     if not models:
         status = Status.REVIEW_REQUIRED
     elif excluded:
         status = Status.EXCLUDED
-    elif low_conf:
-        status = Status.REVIEW_REQUIRED
     else:
         status = Status.COMPLETED
     
@@ -930,6 +946,62 @@ def save_model(table, item_id: str, parsed: Dict) -> str:
     logger.info(f"Model saved: {item_id} -> {status} (type={lt}, condition={cond}, models={len(models)})")
     return status
 
+def _simple_model(parsed: Dict) -> Optional[Dict]:
+    """读取精简 AI 响应中的首个 brand/model，并生成程序所需的匹配键。"""
+    models = parsed.get("models", []) or []
+    if not isinstance(models, list) or not models or not isinstance(models[0], dict):
+        return None
+    brand = norm(models[0].get("brand", ""))
+    model = norm(models[0].get("model", ""))
+    if not brand or not model:
+        return None
+    family = extract_family(model.upper())
+    return {
+        "brand": brand,
+        "model": model,
+        "familyModel": family if family != model.upper() else "",
+        "pricingModelKey": pricing_key_with_condition(gen_key(brand, model), ConditionClass.NORMAL),
+        "fallbackPricingKey": pricing_key_with_condition(gen_fallback_key(brand, model), ConditionClass.NORMAL),
+    }
+
+def save_active_model(table, item_id: str, parsed: Dict) -> str:
+    """保存 Active 精简模型结果，不持久化 confidence/evidence。"""
+    model = _simple_model(parsed)
+    status = Status.COMPLETED if model else Status.REVIEW_REQUIRED
+    eligible = model is not None
+    update_record(table, item_id, {
+        "models": [model] if model else [],
+        "modelStatus": status,
+        "listingType": ListingType.MAIN_PRODUCT,
+        "modelParsedAt": datetime.now(timezone.utc).isoformat(),
+        "pricingStatus": Status.PENDING if eligible else Status.NOT_APPLICABLE,
+        "isAnalysisEligible": eligible,
+    })
+    return status
+
+def save_closed_model(table, item_id: str, parsed: Dict) -> str:
+    """保存 Closed 同型号及 listingType 结果，不保存条件和比较判断字段。"""
+    ai_models = parsed.get("models", []) or []
+    source_model = (get_record(table, item_id) or {}).get("sourceModel", {}) or {}
+    model = _simple_model({"models": [source_model]}) if ai_models else None
+    listing_type = norm(parsed.get("listingType", "UNKNOWN")).upper()
+    if listing_type not in {
+        ListingType.MAIN_PRODUCT, ListingType.ACCESSORY,
+        ListingType.PARTS, ListingType.BOX_ONLY,
+    }:
+        listing_type = ListingType.UNKNOWN
+    eligible = model is not None and listing_type == ListingType.MAIN_PRODUCT
+    status = Status.COMPLETED if eligible else Status.EXCLUDED
+    update_record(table, item_id, {
+        "models": [model] if model else [],
+        "modelStatus": status,
+        "listingType": listing_type,
+        "modelParsedAt": datetime.now(timezone.utc).isoformat(),
+        "pricingStatus": Status.PENDING if eligible else Status.NOT_APPLICABLE,
+        "isAnalysisEligible": eligible,
+    })
+    return status
+
 def mark_failed(table, item_id: str, error: str):
     update_record(table, item_id, {
         "modelStatus": Status.FAILED,
@@ -938,7 +1010,7 @@ def mark_failed(table, item_id: str, error: str):
     })
     logger.warning(f"Model failed: {item_id} -> {error[:100]}")
 
-def batch_parse(table, items: List[Dict], prompt_builder, batch_size: int, max_tokens: int) -> Dict:
+def batch_parse(table, items: List[Dict], prompt_builder, batch_size: int, max_tokens: int, saver=save_model) -> Dict:
     if not items:
         return {"parsed":0,"excluded":0,"review":0,"failed":0,"errors":[]}
     totals = {"parsed":0,"excluded":0,"review":0,"failed":0,"errors":[]}
@@ -968,15 +1040,16 @@ def batch_parse(table, items: List[Dict], prompt_builder, batch_size: int, max_t
             "FIRST_RETURNED_ITEM=%s",
             json.dumps(parsed[0] if parsed else None, ensure_ascii=False, default=str),
         )
+        batch_ids = {str(item["itemID"]) for item in batch}
         returned = set()
         for p in parsed:
             if not isinstance(p,dict):
                 continue
             iid = str(p.get("itemId","")).strip()
-            if not iid:
+            if not iid or iid not in batch_ids:
                 continue
             returned.add(iid)
-            s = save_model(table, iid, p)
+            s = saver(table, iid, p)
             if s==Status.COMPLETED:
                 totals["parsed"]+=1
             elif s==Status.EXCLUDED:
@@ -986,7 +1059,7 @@ def batch_parse(table, items: List[Dict], prompt_builder, batch_size: int, max_t
             else:
                 totals["failed"]+=1
         
-        missing_ids = {str(i["itemID"]) for i in batch}-returned
+        missing_ids = batch_ids-returned
         for mid in missing_ids:
             mark_failed(table, mid, "AI_NOT_RETURNED")
             totals["failed"]+=1
@@ -1266,22 +1339,13 @@ def calc_profit(est: Decimal, buy: Decimal, ship: Decimal) -> Dict:
     bep = (est*(Decimal("1")-FEE_RATE-REPAIR_RESERVE-RISK_RESERVE)-ship).quantize(Decimal("1"))
     return {"net":net,"margin":margin,"roi":roi,"fee":fee,"repair":rep,"risk":risk,"tc":tc,"bep":max(0,int(bep)),"tp10":max(0,int((est*(Decimal("1")-FEE_RATE-REPAIR_RESERVE-RISK_RESERVE-Decimal("0.1"))-ship).quantize(Decimal("1")))),"tp20":max(0,int((est*(Decimal("1")-FEE_RATE-REPAIR_RESERVE-RISK_RESERVE-Decimal("0.2"))-ship).quantize(Decimal("1"))))}
 
-def calc_decision(net: Decimal, margin: Decimal, roi: Decimal, conf: Decimal, risk: str, cc: int, mc: int, status: str) -> str:
-    if status==Status.INSUFFICIENT_DATA:
-        return Recommendation.AI_RECHECK if net>0 and roi>=MIN_ROI else Recommendation.NO
-    if net<=0:
-        return Recommendation.NO
-    if cc<MIN_COMPARABLE:
-        return Recommendation.AI_RECHECK if roi>=MIN_ROI else Recommendation.NO
-    if mc>=2 and conf<Decimal("0.6"):
-        return Recommendation.AI_RECHECK
-    if margin>=BUY_MARGIN and risk in ("LOW","MEDIUM") and conf>=Decimal("0.7"):
-        return Recommendation.BUY
-    if margin>=REVIEW_MARGIN and conf>=Decimal("0.5"):
-        return Recommendation.REVIEW
-    if roi>=MIN_ROI:
-        return Recommendation.AI_RECHECK
-    return Recommendation.NO
+def calc_decision(net: Decimal, margin: Decimal) -> str:
+    """完全由代码规则生成购买建议，不调用 AI 风险评估。"""
+    if net <= 0:
+        return Recommendation.AVOID
+    if margin >= Decimal("0.20"):
+        return Recommendation.BUY_CANDIDATE
+    return Recommendation.REVIEW
 
 def build_result(item: Dict, stats: Dict, buy: Decimal, ship: Decimal, buynow=None, mi=None) -> Dict:
     ep = sd(stats.get("f_median",stats.get("median",0)))
@@ -1315,7 +1379,7 @@ def build_result(item: Dict, stats: Dict, buy: Decimal, ship: Decimal, buynow=No
     risk = calc_risk(item,stats,conf,profit["margin"])
     cc = stats["f_count"]
     mc = si(item.get("missingParameterCount",0))
-    dec = calc_decision(profit["net"],profit["margin"],profit["roi"],conf,risk["level"],cc,mc,Status.COMPLETED)
+    dec = calc_decision(profit["net"], profit["margin"])
     
     reasons = []
     if mi:
@@ -1416,12 +1480,6 @@ def price_active_item(item_id: str, idx: Dict[str,List[Dict]]) -> Optional[Dict]
     recommendation = calc_decision(
         sd(pricing.get("netProfitAtCurrentBid", 0)),
         sd(pricing.get("profitMarginAtCurrentBid", 0)),
-        sd(pricing.get("roiAtCurrentBid", 0)),
-        sd(pricing.get("pricingConfidence", 0)),
-        pricing.get("riskLevel", "HIGH"),
-        si(pricing.get("comparableCount", 0)),
-        si(item.get("missingParameterCount", 0)),
-        pricing.get("pricingStatus", Status.INSUFFICIENT_DATA),
     )
     save_pricing(item_id, pricing, recommendation)
     return pricing
@@ -1474,7 +1532,7 @@ def scrape_profitable_active_detail(item_id: str) -> Optional[Dict]:
 # Workflow
 # ======================================
 
-def scrape_closed(kw: str, cnt: int, force: bool = False) -> List[str]:
+def scrape_closed(kw: str, cnt: int, force: bool = False, source_model: Optional[Dict] = None) -> List[str]:
     """抓取已结束商品，新商品自动设为 PENDING"""
     try:
         items = scrape_auctions(kw, "closed", False, scrape_details=False)[:cnt]
@@ -1503,6 +1561,7 @@ def scrape_closed(kw: str, cnt: int, force: bool = False) -> List[str]:
                         "isFreeShipping": item.get("isFreeShipping", False),
                         "itemCondition": item.get("itemCondition"),
                         "thumbnailUrl": item.get("thumbnailUrl", ""),
+                        "sourceModel": source_model or {},
                     },
                     force=force
                 )
@@ -1595,7 +1654,7 @@ def calc_min_price(closed_ids: List[str]) -> Dict:
     logger.info(f"Calculated min price: {min_price} (from {len(prices)} prices)")
     return {"min": min_price}
 
-def execute_workflow(kw: str, ac: int, cc: int, force: bool) -> Dict:
+def execute_workflow(kw: str, ac: int, cc: int, force: bool, source_model: Optional[Dict] = None) -> Dict:
     global _start_time
     _start_time = time.time()
     result = {"keyword":kw}
@@ -1604,7 +1663,7 @@ def execute_workflow(kw: str, ac: int, cc: int, force: bool) -> Dict:
         # Step 1: 抓取已结束商品
         check_limits()
         logger.info(f"Step 1: Scraping closed auctions for '{kw}'")
-        closed_ids = scrape_closed(kw, cc, force)
+        closed_ids = scrape_closed(kw, cc, force, source_model)
         result["closed"] = len(closed_ids)
         if not closed_ids:
             logger.warning("No closed items found")
@@ -1630,7 +1689,8 @@ def execute_workflow(kw: str, ac: int, cc: int, force: bool) -> Dict:
         if closed_items:
             logger.info(f"Start closed AI parse: {len(closed_items)} items")
             closed_result = batch_parse(
-                closed_db, closed_items, build_parse_prompt, SIMPLE_BATCH, SIMPLE_MAX_TOKENS
+                closed_db, closed_items, build_closed_parse_prompt, SIMPLE_BATCH,
+                SIMPLE_MAX_TOKENS, saver=save_closed_model,
             )
             result["closed_parsed"] = closed_result
             logger.info(f"Closed parse result: {closed_result}")
@@ -1671,7 +1731,8 @@ def execute_workflow(kw: str, ac: int, cc: int, force: bool) -> Dict:
         if active_items:
             logger.info(f"Start active AI parse: {len(active_items)} items")
             active_result = batch_parse(
-                active_db, active_items, build_parse_prompt, SIMPLE_BATCH, SIMPLE_MAX_TOKENS
+                active_db, active_items, build_active_parse_prompt, SIMPLE_BATCH,
+                SIMPLE_MAX_TOKENS, saver=save_active_model,
             )
             result["active_parsed"] = active_result
             logger.info(f"Active parse result: {active_result}")
@@ -1806,7 +1867,15 @@ def lambda_handler(event, context):
         force = str(event.get("force_reprocess", "")).lower() in ("true", "1", "yes")
         
         logger.info(f"Starting workflow: kw={kw}, active={ac}, closed={cc_val}, force={force}")
-        result = execute_workflow(kw, ac, cc_val, force)
+        source_model = {
+            "brand": norm(event.get("brand", "")),
+            "model": norm(event.get("model", "")),
+        }
+        if not source_model["brand"] or not source_model["model"]:
+            # 兼容直接调用：keyword 通常就是 "brand model"，但无法可靠拆分时
+            # 仍保留空 sourceModel，由 Closed AI 返回空 models。
+            source_model = {}
+        result = execute_workflow(kw, ac, cc_val, force, source_model)
         
         return {
             "statusCode": 200,
