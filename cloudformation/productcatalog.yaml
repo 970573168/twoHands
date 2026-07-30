@@ -85,7 +85,7 @@ Parameters:
 
   DoubaoTimeout:
     Type: Number
-    Default: 250
+    Default: 300
     MinValue: 10
     MaxValue: 300
 

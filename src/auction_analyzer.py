@@ -62,14 +62,22 @@ TABLE_ACTIVE = _env("TABLE_NAME_ACTIVE", "YahooAuctionActiveItems")
 TABLE_CLOSED = _env("TABLE_NAME_CLOSED", "YahooAuctionItems")
 AI_MODE = _env("AI_MODE", "doubao")
 
-# ★★★ FIX 2: API URL默认值 ★★★
-# AI_CONFIGS 里去掉 key 字段
+_gemini_model = _env("GEMINI_MODEL", "gemini-2.0-flash")
+_gemini_url = _env(
+    "GEMINI_URL",
+    "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
+)
+if _gemini_model == "gemini-2.0-flash-latest":
+    logger.warning("Unsupported Gemini alias configured; using gemini-2.0-flash instead")
+    _gemini_model = "gemini-2.0-flash"
+    _gemini_url = _gemini_url.replace("gemini-2.0-flash-latest", "gemini-2.0-flash")
+
 AI_CONFIGS = {
     "gemini": {
         "name": "gemini",
         "type": "gemini",
-        "url": _env("GEMINI_URL", "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"),
-        "model": _env("GEMINI_MODEL", "gemini-2.0-flash"),
+        "url": _gemini_url,
+        "model": _gemini_model,
         "timeout": _env("GEMINI_TIMEOUT", 60, int),
         "max_tokens": _env("GEMINI_MAX_TOKENS", 250000, int),
         # ★ 不再从环境变量读 key
@@ -79,7 +87,7 @@ AI_CONFIGS = {
         "type": "openai",
         "url": _env("DOUBAO_URL", "https://ws-8lxmxlbemcgcus5u.ap-northeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions"),
         "model": _env("DOUBAO_MODEL", "qwen-plus-character"),
-        "timeout": _env("DOUBAO_TIMEOUT", 300, int),
+        "timeout": max(300, _env("DOUBAO_TIMEOUT", 300, int)),
         "max_tokens": _env("DOUBAO_MAX_TOKENS", 250000, int),
     },
     "openai": {
@@ -91,6 +99,14 @@ AI_CONFIGS = {
         "max_tokens": _env("OPENAI_MAX_TOKENS", 250000, int),
     },
 }
+
+logger.info(
+    "AI runtime config: doubao_timeout=%s gemini_model=%s gemini_timeout=%s openai_timeout=%s",
+    AI_CONFIGS["doubao"]["timeout"],
+    AI_CONFIGS["gemini"]["model"],
+    AI_CONFIGS["gemini"]["timeout"],
+    AI_CONFIGS["openai"]["timeout"],
+)
 
 BUY_MARGIN = _env("BUY_MARGIN_THRESHOLD", Decimal("0.20"), Decimal)
 REVIEW_MARGIN = _env("REVIEW_MARGIN_THRESHOLD", Decimal("0.10"), Decimal)
@@ -349,6 +365,19 @@ def _extract_secret_value(secret_string: str, mode: str) -> str:
     return ""
 
 
+def _is_valid_header_key(key: str, mode: str) -> bool:
+    """验证 API Key 能否安全写入 HTTP Header。"""
+    if not key or any(char.isspace() for char in key):
+        logger.error("Secret value for %s is empty or contains whitespace", mode)
+        return False
+    try:
+        key.encode("ascii")
+    except UnicodeEncodeError:
+        logger.error("Secret value for %s contains non-ASCII characters", mode)
+        return False
+    return True
+
+
 def _get_key(mode: str) -> str:
     """仅从 Secrets Manager 获取 AI API Key。
 
@@ -369,7 +398,7 @@ def _get_key(mode: str) -> str:
             secret_string = response.get("SecretString", "")
             logger.info("Secret retrieved, length=%s", len(secret_string))
             key = _extract_secret_value(secret_string, mode)
-            if key:
+            if key and _is_valid_header_key(key, mode):
                 return key
         except Exception as e:
             logger.error("Secret read failed for %s: %s: %s", secret_name, type(e).__name__, e)
@@ -498,6 +527,13 @@ def call_ai(prompt: str) -> Tuple[Optional[Dict],Optional[str]]:
                     e.code,
                     error_body[:3000]
                 )
+                if e.code in (400, 401, 403, 404):
+                    logger.warning(
+                        "[%s] non-retryable HTTP status=%s; switching AI mode",
+                        mode,
+                        e.code,
+                    )
+                    break
             
             except urllib.error.URLError as e:
                 logger.error(
