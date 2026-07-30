@@ -126,7 +126,6 @@ closed_db = dynamodb.Table(TABLE_CLOSED)
 secrets = boto3.client("secretsmanager")
 _total_tokens = 0
 _start_time = None
-_ai_state = {"failed_modes": {}}
 
 # ======================================
 # Repository
@@ -314,54 +313,80 @@ def check_limits():
 # AI Service
 # ======================================
 
-def _get_key(mode: str) -> str:
-    env = os.getenv("ENVIRONMENT", "dev")
-    secret_name = f"{mode}-api-key-{env}"
-    
-    logger.info(f"Reading secret: {secret_name}")
-    
+def _extract_secret_value(secret_string: str, mode: str) -> str:
+    """从 Secrets Manager 的 SecretString 中提取 API Key。"""
+    if not secret_string:
+        return ""
+
     try:
-        r = secrets.get_secret_value(SecretId=secret_name)
-        s = r.get("SecretString", "")
-        logger.info(f"Secret retrieved, length={len(s)}")
-        
-        # 尝试 JSON 解析
-        d = json.loads(s)
-        logger.info(f"Secret JSON keys: {list(d.keys())}")
-        
-        # 取第一个值（兼容各种 key 名）
-        for key_name in ["apiKey", "api_key", "key", f"{mode.upper()}_API_KEY"]:
-            val = d.get(key_name, "")
-            if val:
-                logger.info(f"Found key via '{key_name}'")
-                return val
-        
-        # 都没匹配到，取 JSON 里第一个值
-        first_val = list(d.values())[0] if d else ""
-        if first_val:
-            logger.info(f"Using first value from JSON")
-            return first_val
-        
+        secret_dict = json.loads(secret_string)
     except json.JSONDecodeError:
-        # 纯文本
-        logger.info("Secret is plaintext")
-        return s.strip()
-    except Exception as e:
-        logger.error(f"Secret read failed: {type(e).__name__}: {e}")
-    
+        return secret_string.strip()
+
+    if not isinstance(secret_dict, dict):
+        return ""
+
+    logger.info("Secret JSON keys: %s", list(secret_dict.keys()))
+    for key_name in (
+        "apiKey",
+        "api_key",
+        "key",
+        "GEMINI_API_KEY",
+        "DOUBAO_API_KEY",
+        "OPENAI_API_KEY",
+        f"{mode.upper()}_API_KEY",
+    ):
+        val = secret_dict.get(key_name)
+        if val:
+            logger.info("Found key via '%s'", key_name)
+            return str(val).strip()
+
+    first_val = next((v for v in secret_dict.values() if v), "")
+    if first_val:
+        logger.info("Using first non-empty value from JSON secret")
+        return str(first_val).strip()
+
     return ""
 
-def get_ai_cfg():
-    """获取AI配置，key 只从 Secrets Manager 读"""
+
+def _get_key(mode: str) -> str:
+    """仅从 Secrets Manager 获取 AI API Key。
+
+    API Key 不从 Lambda 环境变量读取，统一通过
+    <mode>-api-key-<ENVIRONMENT> 管理；SECRET_NAME 仅作为旧版 Secret 名称兜底。
+    """
+    env = os.getenv("ENVIRONMENT", "dev")
+    secret_names = [f"{mode}-api-key-{env}"]
+
+    legacy_secret = os.getenv("SECRET_NAME", "").strip()
+    if legacy_secret:
+        secret_names.append(legacy_secret)
+
+    for secret_name in dict.fromkeys(secret_names):
+        logger.info("Reading secret: %s", secret_name)
+        try:
+            response = secrets.get_secret_value(SecretId=secret_name)
+            secret_string = response.get("SecretString", "")
+            logger.info("Secret retrieved, length=%s", len(secret_string))
+            key = _extract_secret_value(secret_string, mode)
+            if key:
+                return key
+        except Exception as e:
+            logger.error("Secret read failed for %s: %s: %s", secret_name, type(e).__name__, e)
+
+    return ""
+
+def get_ai_cfg(excluded_modes=None):
+    """获取 AI 配置，key 只从 Secrets Manager 读取。
+
+    excluded_modes 只用于一次 call_ai 调用内的故障转移，避免失败状态跨批次保留。
+    """
+    excluded_modes = set(excluded_modes or ())
     order = [AI_MODE] + [m for m in ["gemini","doubao","openai"] if m != AI_MODE]
-    now = time.time()
-    
+
     for mode in order:
-        if mode in _ai_state["failed_modes"]:
-            cooldown = _env("AI_COOLDOWN", 300, int)
-            if now - _ai_state["failed_modes"][mode] < cooldown:
-                continue
-            del _ai_state["failed_modes"][mode]
+        if mode in excluded_modes:
+            continue
         
         original = AI_CONFIGS.get(mode, {})
         if not original:
@@ -391,14 +416,16 @@ def get_ai_cfg():
         logger.info("Selected AI mode=%s model=%s url=%s", mode, model, url)
         return cfg
     
+    logger.error("No AI config available after checking modes: %s", order)
     return None
 
 def call_ai(prompt: str) -> Tuple[Optional[Dict],Optional[str]]:
     global _total_tokens
     logger.info(f"AI call: prompt length={len(prompt)}, current tokens={_total_tokens}")
-    
+
+    failed_modes = set()
     for attempt in range(3):
-        cfg = get_ai_cfg()
+        cfg = get_ai_cfg(failed_modes)
         if not cfg:
             logger.error("All AI modes unavailable")
             return None,"ALL_MODES_UNAVAILABLE"
@@ -498,7 +525,7 @@ def call_ai(prompt: str) -> Tuple[Optional[Dict],Optional[str]]:
             if retry < AI_RETRIES-1:
                 time.sleep(2**retry+random.uniform(0,1))
         
-        _ai_state["failed_modes"][mode]=time.time()
+        failed_modes.add(mode)
         logger.warning(f"Mode {mode} failed, switching to next")
     
     return None,"ALL_MODES_EXHAUSTED"
@@ -529,7 +556,7 @@ def _parse_json(content: str) -> Optional[Dict]:
     return None
 
 # ======================================
-# Prompt Templates (title + description)
+# Prompt Templates
 # ======================================
 
 DETAILED_PARSE_PROMPT = """あなたは中古電子製品の識別専門家です。
@@ -599,19 +626,43 @@ condition: NEW/USED/BROKEN/UNKNOWN
 11. アクセサリ、部品、空箱、セット品、ジャンク品は適切な listingType に分類
 12. JSONのみを出力してください"""
 
+TITLE_PARSE_PROMPT = DETAILED_PARSE_PROMPT.replace(
+    "以下の商品タイトルと商品説明を解析し、価格比較に必要な詳細スペックを抽出してください。",
+    "以下の商品タイトルだけを解析し、価格比較に必要な詳細スペックを抽出してください。",
+).replace(
+    "1. title と description の両方を使って判断してください\n2. 矛盾する場合、description の具体的な記載を優先してください",
+    "1. title だけを使って判断してください\n2. title に明記されていない情報は推測せず missing に入れてください",
+).replace(
+    "10. 商品説明から読み取れない重要情報は missing に入れる",
+    "10. 商品タイトルから読み取れない重要情報は missing に入れる",
+)
+
+
 def build_parse_prompt(items: List[Dict]) -> str:
+    """首次模型识别只发送 itemId 和 title。"""
     items_data = []
     for item in items:
         data = {
             "itemId": str(item.get("itemID","")),
             "title": item.get("title",""),
-            "description": str(item.get("detailDescription",""))[:DETAIL_DESC_MAX],
-            "price": si(item.get("price",0)),
-            "itemCondition": str(item.get("itemCondition","")),
-            "shippingText": str(item.get("shippingText",""))
         }
         items_data.append(data)
-    return DETAILED_PARSE_PROMPT.replace("{items_json}", json.dumps(items_data, ensure_ascii=False, separators=(",",":")))
+    return TITLE_PARSE_PROMPT.replace("{items_json}", json.dumps(items_data, ensure_ascii=False, separators=(",",":")))
+
+
+def build_description_parse_prompt(items: List[Dict]) -> str:
+    """仅对有利润且缺少关键参数的 active 商品发送 title 和 description。"""
+    items_data = []
+    for item in items:
+        items_data.append({
+            "itemId": str(item.get("itemID", "")),
+            "title": item.get("title", ""),
+            "description": str(item.get("detailDescription", ""))[:DETAIL_DESC_MAX],
+        })
+    return DETAILED_PARSE_PROMPT.replace(
+        "{items_json}",
+        json.dumps(items_data, ensure_ascii=False, separators=(",", ":")),
+    )
 
 # ======================================
 # Model Parser (详细参数版)
@@ -655,7 +706,7 @@ def gen_detailed_key(parsed: Dict) -> str:
     combined = re.sub(r"[^A-Z0-9ぁ-んァ-ン一-龥\s+\-/\.]"," ",combined)
     return re.sub(r"\s+"," ",combined).strip()
 
-def parse_ai_result(parsed: Dict) -> Tuple[List[Dict], str, str, int, str]:
+def parse_ai_result(parsed: Dict) -> Tuple[List[Dict], str, str, int, List[str], str]:
     brand = norm(parsed.get("brand",""))
     model = norm(parsed.get("model",""))
     variant = norm(parsed.get("variant",""))
@@ -670,15 +721,17 @@ def parse_ai_result(parsed: Dict) -> Tuple[List[Dict], str, str, int, str]:
     
     has_b, has_m = bool(brand), bool(model)
     is_unk = model.upper() in ("UNKNOWN","不明","N/A","")
-    mc = 0
+    missing_critical = []
     if not has_b:
         missing.append("brand")
-        mc += 1
+        missing_critical.append("brand")
     if not has_m or is_unk:
         missing.append("model")
-        mc += 1
+        missing_critical.append("model")
     if not storage:
-        mc += 1
+        missing_critical.append("storage")
+    missing_critical = list(dict.fromkeys(missing_critical))
+    mc = len(missing_critical)
     
     identifiable = (has_b or has_m) and not is_unk
     
@@ -736,10 +789,10 @@ def parse_ai_result(parsed: Dict) -> Tuple[List[Dict], str, str, int, str]:
     if defects:
         reasons.append(f"Defects: {','.join(str(d) for d in defects[:5])}")
     
-    return models, lt, cond, mc, "; ".join(reasons)
+    return models, lt, cond, mc, missing_critical, "; ".join(reasons)
 
 def save_model(table, item_id: str, parsed: Dict) -> str:
-    models, lt, cond, mc, excl = parse_ai_result(parsed)
+    models, lt, cond, mc, missing_critical, excl = parse_ai_result(parsed)
     excluded = lt in EXCLUDED_TYPES
     broken = cond=="BROKEN"
     low_conf = any(sd(m.get("confidence",0))<Decimal("0.7") for m in models)
@@ -759,13 +812,14 @@ def save_model(table, item_id: str, parsed: Dict) -> str:
         "modelStatus": status,
         "listingType": lt,
         "missingParameterCount": mc,
+        "missingCriticalParameters": missing_critical,
         "isComparable": eligible,
         "parsedCondition": cond,
         "exclusionReason": excl,
         "modelParsedAt": datetime.now(timezone.utc).isoformat(),
         "pricingStatus": Status.PENDING if eligible else Status.NOT_APPLICABLE,
         "isAnalysisEligible": eligible,
-        "hasAllCriticalParameters": len(models)>0
+        "hasAllCriticalParameters": len(models)>0 and mc==0
     })
     
     logger.info(f"Model saved: {item_id} -> {status} (type={lt}, condition={cond}, models={len(models)})")
@@ -842,7 +896,7 @@ def build_index(closed_ids: Set[str]) -> Dict[str,List[Dict]]:
     
     for cid in closed_ids:
         item = get_record(closed_db, cid)
-        if not item or item.get("modelStatus")!=Status.COMPLETED:
+        if not item or item.get("modelStatus") not in (Status.COMPLETED, Status.REVIEW_REQUIRED):
             continue
         if item.get("listingType")!=ListingType.MAIN_PRODUCT or item.get("parsedCondition")=="BROKEN":
             continue
@@ -1214,6 +1268,58 @@ def save_pricing(iid: str, result: Dict, rec: str):
     })
     logger.info(f"Pricing saved: {iid} -> {rec}")
 
+
+def has_usable_model(item: Dict) -> bool:
+    """缺少参数或低置信度时仍允许使用已识别出的模型参与初步定价。"""
+    models = item.get("models", [])
+    if isinstance(models, str):
+        try:
+            models = json.loads(models)
+        except json.JSONDecodeError:
+            models = []
+    return (
+        item.get("modelStatus") in (Status.COMPLETED, Status.REVIEW_REQUIRED)
+        and isinstance(models, list)
+        and any(isinstance(model, dict) for model in models)
+        and str(item.get("listingType", "")).upper() not in EXCLUDED_TYPES
+    )
+
+
+def price_active_item(item_id: str, idx: Dict[str,List[Dict]]) -> Optional[Dict]:
+    """计算并保存单个 active 商品利润；返回定价结果。"""
+    item = get_record(active_db, item_id)
+    if not item or not has_usable_model(item):
+        return None
+
+    ci, mi = find_comp(item, idx)
+    stats = calc_stats(ci)
+    current_price = sd(item.get("price", 0))
+    shipping = get_shipping(item)
+    buynow = sd(item.get("buynowPrice")) if item.get("buynowPrice") else None
+
+    pricing = build_result(item, stats, current_price, shipping, buynow, mi)
+    recommendation = calc_decision(
+        sd(pricing.get("netProfitAtCurrentBid", 0)),
+        sd(pricing.get("profitMarginAtCurrentBid", 0)),
+        sd(pricing.get("roiAtCurrentBid", 0)),
+        sd(pricing.get("pricingConfidence", 0)),
+        pricing.get("riskLevel", "HIGH"),
+        si(pricing.get("comparableCount", 0)),
+        si(item.get("missingParameterCount", 0)),
+        pricing.get("pricingStatus", Status.INSUFFICIENT_DATA),
+    )
+    save_pricing(item_id, pricing, recommendation)
+    return pricing
+
+
+def should_reanalyze_description(item: Dict, pricing: Dict) -> bool:
+    """有正利润且缺关键参数时，才使用详情进行第二次 AI 分析。"""
+    return (
+        bool(str(item.get("detailDescription", "")).strip())
+        and si(item.get("missingParameterCount", 0)) > 0
+        and sd(pricing.get("netProfitAtCurrentBid", 0)) > 0
+    )
+
 # ======================================
 # Workflow
 # ======================================
@@ -1434,46 +1540,77 @@ def execute_workflow(kw: str, ac: int, cc: int, force: bool) -> Dict:
         # Step 7: 对每个活跃商品进行定价
         logger.info(f"Step 7: Pricing {len(active_ids)} active items")
         priced = 0
+        description_recheck_ids = []
         for aid in active_ids:
             try:
                 check_limits()
                 item = get_record(active_db, aid)
-                
-                if not item or item.get("modelStatus") != Status.COMPLETED:
-                    continue
-                if str(item.get("listingType", "")).upper() in EXCLUDED_TYPES:
+
+                if not item or not has_usable_model(item):
                     continue
                 
                 # 只处理待定价的商品
                 if not force and item.get("pricingStatus") != Status.PENDING:
                     continue
-                
-                ci, mi = find_comp(item, idx)
-                stats = calc_stats(ci)
-                pp = sd(item.get("price", 0))
-                sh = get_shipping(item)
-                bp = sd(item.get("buynowPrice")) if item.get("buynowPrice") else None
-                
-                pr = build_result(item, stats, pp, sh, bp, mi)
-                rec = calc_decision(
-                    sd(pr.get("netProfitAtCurrentBid", 0)),
-                    sd(pr.get("profitMarginAtCurrentBid", 0)),
-                    sd(pr.get("roiAtCurrentBid", 0)),
-                    sd(pr.get("pricingConfidence", 0)),
-                    pr.get("riskLevel", "HIGH"),
-                    si(pr.get("comparableCount", 0)),
-                    si(item.get("missingParameterCount", 0)),
-                    pr.get("pricingStatus", Status.INSUFFICIENT_DATA)
-                )
-                save_pricing(aid, pr, rec)
+
+                pricing = price_active_item(aid, idx)
+                if not pricing:
+                    continue
                 priced += 1
+
+                if should_reanalyze_description(item, pricing):
+                    description_recheck_ids.append(aid)
+                    logger.info(
+                        "Active item queued for description reanalysis: %s missing=%s net_profit=%s",
+                        aid,
+                        item.get("missingCriticalParameters", []),
+                        pricing.get("netProfitAtCurrentBid", 0),
+                    )
                 
             except RuntimeError:
                 raise
             except Exception as e:
                 logger.error(f"Pricing {aid}: {e}")
+
+        # Step 8: 仅对有利润且缺少关键参数的 active 商品使用详情二次分析
+        reanalyzed = 0
+        repriced = 0
+        if description_recheck_ids:
+            logger.info(
+                "Step 8: Description reanalysis for %s profitable active items",
+                len(description_recheck_ids),
+            )
+            recheck_items = [
+                item for item in (get_record(active_db, aid) for aid in description_recheck_ids)
+                if item
+            ]
+            reanalysis_result = batch_parse(
+                active_db,
+                recheck_items,
+                build_description_parse_prompt,
+                MODEL_BATCH,
+            )
+            result["active_description_reanalysis"] = reanalysis_result
+            reanalyzed = (
+                reanalysis_result.get("parsed", 0)
+                + reanalysis_result.get("review", 0)
+                + reanalysis_result.get("excluded", 0)
+            )
+
+            # 使用详情补齐后的模型重新计算利润与推荐
+            for aid in description_recheck_ids:
+                try:
+                    check_limits()
+                    if price_active_item(aid, idx):
+                        repriced += 1
+                except RuntimeError:
+                    raise
+                except Exception as e:
+                    logger.error(f"Repricing after description analysis {aid}: {e}")
         
         result["priced"] = priced
+        result["description_reanalyzed"] = reanalyzed
+        result["description_repriced"] = repriced
         result["status"] = "COMPLETED"
         result["elapsed"] = round(time.time() - _start_time, 1)
         
