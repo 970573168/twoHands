@@ -3,6 +3,7 @@ import re
 import json
 import time
 import logging
+import ipaddress
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode, quote
@@ -23,6 +24,8 @@ MAX_PAGES = int(os.getenv("MAX_PAGES", "1"))
 TABLE_NAME_CLOSED = os.getenv("TABLE_NAME_CLOSED", "YahooAuctionItems")
 TABLE_NAME_ACTIVE = os.getenv("TABLE_NAME_ACTIVE", "YahooAuctionActiveItems")
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
+PUBLIC_IP_CHECK_URL = os.getenv("PUBLIC_IP_CHECK_URL", "https://checkip.amazonaws.com").strip()
+PUBLIC_IP_CHECK_TIMEOUT = float(os.getenv("PUBLIC_IP_CHECK_TIMEOUT", "5"))
 USER_AGENT = os.getenv("USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
 DEBUG_LOG_HTML = os.getenv("DEBUG_LOG_HTML", "false").lower() == "true"
 ITEMS_PER_PAGE = int(os.getenv("ITEMS_PER_PAGE", "50"))
@@ -83,6 +86,38 @@ PREFECTURES_LIST = [
 ]
 
 dynamodb = boto3.resource("dynamodb")
+
+
+def log_public_egress_ip(action="", request_id=""):
+    """每次 Lambda 调用开始时查询并记录爬虫的公网出口 IP。"""
+    if not PUBLIC_IP_CHECK_URL:
+        logger.warning("Public egress IP check skipped: PUBLIC_IP_CHECK_URL is empty")
+        return None
+
+    try:
+        response = requests.get(
+            PUBLIC_IP_CHECK_URL,
+            timeout=PUBLIC_IP_CHECK_TIMEOUT,
+            headers={"User-Agent": USER_AGENT},
+        )
+        response.raise_for_status()
+        public_ip = response.text.strip()
+        ipaddress.ip_address(public_ip)
+        logger.info(
+            "Crawler public egress IP: ip=%s action=%s request_id=%s",
+            public_ip,
+            action or "unknown",
+            request_id or "unknown",
+        )
+        return public_ip
+    except (requests.exceptions.RequestException, ValueError) as exc:
+        logger.warning(
+            "Public egress IP check failed: action=%s request_id=%s error=%s",
+            action or "unknown",
+            request_id or "unknown",
+            exc,
+        )
+        return None
 
 
 def get_target_table(search_type: str):
@@ -496,6 +531,8 @@ def lambda_handler(event, context):
     4. scrape_and_parse: 搜索 + 详情爬取一体化
     """
     action = event.get("action", "search")
+    request_id = getattr(context, "aws_request_id", "") if context else ""
+    log_public_egress_ip(action=action, request_id=request_id)
     
     # ========== 模式1：搜索商品（含详情） ==========
     if action == "search":
