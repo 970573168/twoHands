@@ -1,4 +1,4 @@
-name: Deploy Lambda Code
+name: 部署应用
 
 on:
   push:
@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - 'src/**'
+      - 'cloudformation/**'
       - 'requirements.txt'
       - 'build.sh'
   workflow_dispatch:
@@ -19,6 +20,16 @@ on:
           - dev
           - test
           - prod
+
+      deployment_mode:
+        description: '部署方式（自动会在模板变更时完整部署）'
+        required: true
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - code
+          - all
       
       s3_bucket:
         description: 'Lambda代码的S3存储桶'
@@ -63,6 +74,8 @@ jobs:
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
 
       - name: 设置 Python
         uses: actions/setup-python@v5
@@ -77,8 +90,22 @@ jobs:
       - name: 检查是否需要构建
         id: check
         run: |
-          # 自动触发时更新所有函数，手动触发时按选择
+          # CloudFormation 有变化时必须更新堆栈和全部 Lambda；仅代码变化时
+          # 直接更新 Lambda 代码，避免一次不必要且较慢的堆栈部署。
+          DEPLOY_ALL="false"
           if [[ "${{ github.event_name }}" == "push" ]]; then
+            if git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" | grep -q '^cloudformation/'; then
+              DEPLOY_ALL="true"
+            fi
+          elif [[ "${{ github.event.inputs.deployment_mode }}" == "all" ]]; then
+            DEPLOY_ALL="true"
+          elif [[ "${{ github.event.inputs.deployment_mode }}" == "auto" ]] && \
+               git diff --name-only HEAD^ HEAD | grep -q '^cloudformation/'; then
+            DEPLOY_ALL="true"
+          fi
+
+          # 自动触发时更新所有函数，手动触发时按选择
+          if [[ "${{ github.event_name }}" == "push" || "$DEPLOY_ALL" == "true" ]]; then
             UPDATE_AUCTION="true"
             UPDATE_ANALYZER="true"
             UPDATE_CATALOG="true"
@@ -93,6 +120,8 @@ jobs:
           fi
           
           echo "environment=$ENVIRONMENT" >> $GITHUB_ENV
+          echo "deploy_all=$DEPLOY_ALL" >> "$GITHUB_OUTPUT"
+          echo "完整部署: $DEPLOY_ALL"
           
           NEED_BUILD="false"
           BUILD_REASONS=""
@@ -161,8 +190,51 @@ jobs:
           echo "s3_key=$S3_KEY" >> $GITHUB_ENV
           echo "s3_bucket=$S3_BUCKET" >> $GITHUB_ENV
 
+      - name: 验证 CloudFormation 模板
+        if: steps.check.outputs.deploy_all == 'true'
+        run: |
+          echo "🔎 正在验证 CloudFormation 模板..."
+          aws cloudformation validate-template \
+            --template-body file://cloudformation/productcatalog.yaml >/dev/null
+
+      - name: 完整部署 CloudFormation 和 Lambda
+        if: steps.check.outputs.deploy_all == 'true'
+        run: |
+          STACK_NAME="productcatalog-app-${{ env.environment }}"
+          echo "🚀 模板已变更，正在完整部署 $STACK_NAME..."
+
+          set +e
+          aws cloudformation deploy \
+            --template-file cloudformation/productcatalog.yaml \
+            --stack-name "$STACK_NAME" \
+            --parameter-overrides \
+              "Environment=${{ env.environment }}" \
+              "LambdaCodeS3Bucket=${{ env.s3_bucket }}" \
+              "LambdaCodeS3Key=${{ env.s3_key }}" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --no-fail-on-empty-changeset
+          DEPLOY_STATUS=$?
+          set -e
+
+          if [[ "$DEPLOY_STATUS" -ne 0 ]]; then
+            echo "::error::CloudFormation 部署失败，下面显示失败资源及具体原因。"
+            aws cloudformation describe-stack-events \
+              --stack-name "$STACK_NAME" \
+              --query "StackEvents[?contains(ResourceStatus, 'FAILED')].[Timestamp,LogicalResourceId,ResourceType,ResourceStatusReason]" \
+              --output table || true
+            exit "$DEPLOY_STATUS"
+          fi
+
+      - name: 显示堆栈输出
+        if: steps.check.outputs.deploy_all == 'true'
+        run: |
+          aws cloudformation describe-stacks \
+            --stack-name "productcatalog-app-${{ env.environment }}" \
+            --query 'Stacks[0].Outputs[*].[OutputKey,OutputValue]' \
+            --output table
+
       - name: 更新 Yahoo Auction Scraper 函数
-        if: steps.check.outputs.need_build == 'true' && steps.check.outputs.update_auction == 'true'
+        if: steps.check.outputs.deploy_all != 'true' && steps.check.outputs.need_build == 'true' && steps.check.outputs.update_auction == 'true'
         run: |
           FUNCTION_NAME="YahooAuctionScraper-${{ env.environment }}"
           echo "🔄 正在更新 $FUNCTION_NAME..."
@@ -179,7 +251,7 @@ jobs:
           fi
 
       - name: 更新 Yahoo Auction Analyzer 函数
-        if: steps.check.outputs.need_build == 'true' && steps.check.outputs.update_analyzer == 'true'
+        if: steps.check.outputs.deploy_all != 'true' && steps.check.outputs.need_build == 'true' && steps.check.outputs.update_analyzer == 'true'
         run: |
           FUNCTION_NAME="YahooAuctionAnalyzer-${{ env.environment }}"
           echo "🔄 正在更新 $FUNCTION_NAME..."
@@ -196,7 +268,7 @@ jobs:
           fi
 
       - name: 更新 ProductCatalog Discovery 函数
-        if: steps.check.outputs.need_build == 'true' && steps.check.outputs.update_catalog == 'true'
+        if: steps.check.outputs.deploy_all != 'true' && steps.check.outputs.need_build == 'true' && steps.check.outputs.update_catalog == 'true'
         run: |
           FUNCTION_NAME="ProductCatalog-Discovery-${{ env.environment }}"
           echo "🔄 正在更新 $FUNCTION_NAME..."
@@ -213,7 +285,7 @@ jobs:
           fi
 
       - name: 更新 Catalog Scanner 函数
-        if: steps.check.outputs.need_build == 'true' && steps.check.outputs.update_catalog_scanner == 'true'
+        if: steps.check.outputs.deploy_all != 'true' && steps.check.outputs.need_build == 'true' && steps.check.outputs.update_catalog_scanner == 'true'
         run: |
           FUNCTION_NAME="CatalogScanner-${{ env.environment }}"
           echo "🔄 正在更新 $FUNCTION_NAME..."

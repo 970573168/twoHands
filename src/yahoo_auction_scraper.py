@@ -172,7 +172,9 @@ def build_url(keyword, page, search_type, exclude_keywords="", include_keywords=
             params[k] = v
     
     params.update(get_auction_params())
-    params["va"] = keyword
+    # Yahoo 的普通搜索框使用 p。此前改成高级搜索参数 va 后，部分关键词
+    # （尤其是型号、英文编号）会得到不同或空的结果集。
+    params["p"] = keyword
     params["abatch"] = AUCTION_ABATCH
     
     if include_keywords:
@@ -444,6 +446,9 @@ def enrich_item_with_detail(item):
     item["detailDescriptionRawLength"] = detail.get("detailDescriptionRawLength", 0)
     item["detailDescriptionCleanedLength"] = detail.get("detailDescriptionCleanedLength", len(description))
     item["detailTitle"] = detail.get("title", "")
+    # 列表页标题缺失时用详情页标题修复顶层 title，Analyzer 读取的是顶层字段。
+    if not str(item.get("title", "")).strip() and item["detailTitle"] not in ("", "Unknown Title"):
+        item["title"] = item["detailTitle"]
     item["detailUrl"] = detail.get("url", "")
     item["detailScrapedAt"] = detail.get("scrapedAt", datetime.now(timezone.utc).isoformat())
     item["detailDescriptionLength"] = detail.get("detailDescriptionLength", len(description))
@@ -856,7 +861,8 @@ def find_product_items_in_container(container, search_type, include_paypay):
     else:
         link_pattern = re.compile(r"/auction/")
 
-    for ul in container.find_all("ul"):
+    uls = ([container] if getattr(container, "name", None) == "ul" else []) + container.find_all("ul")
+    for ul in uls:
         ul_class = " ".join(ul.get("class", [])).lower()
 
         if any(skip in ul_class for skip in ["category", "nav", "menu", "footer", "header", "breadcrumb"]):
@@ -954,14 +960,25 @@ def parse_item(li, include_paypay=True):
     else:
         link_pattern = re.compile(r"/auction/")
 
-    # 查找商品链接
-    auction_link = li.select_one('.Product__titleLink')
+    # 优先选择真正承载标题/元数据的链接。直接取第一个 /auction/ 链接时，
+    # Yahoo 新版 closed 页面经常会选中只有图片、没有文本的链接。
+    link_candidates = li.find_all("a", href=link_pattern)
+    auction_link = li.select_one('a.Product__titleLink, a[data-auction-title]')
     if not auction_link:
-        h3 = li.find('h3', class_='Product__title')
-        if h3:
-            auction_link = h3.find('a', href=link_pattern)
-        if not auction_link:
-            auction_link = li.find("a", href=link_pattern)
+        title_container = li.select_one(
+            '.Product__title, [class*="ProductTitle"], [class*="ItemTitle"]'
+        )
+        if title_container:
+            auction_link = title_container.find('a', href=link_pattern)
+    if not auction_link and link_candidates:
+        auction_link = max(
+            link_candidates,
+            key=lambda link: (
+                bool(link.get('data-auction-title')),
+                bool(link.get('title') or link.get('aria-label')),
+                len(link.get_text(" ", strip=True)),
+            ),
+        )
 
     if not auction_link:
         return None
@@ -993,15 +1010,37 @@ def parse_item(li, include_paypay=True):
         return None
 
     # 提取标题
-    title = auction_link.get('data-auction-title', '').strip()
+    title_sources = [
+        auction_link.get('data-auction-title', ''),
+        auction_link.get_text(" ", strip=True),
+        auction_link.get("title", ""),
+        auction_link.get("aria-label", ""),
+    ]
+    metadata_link = li.select_one('[data-auction-title]')
+    title_sources.insert(0, li.get('data-auction-title', ''))
+    if metadata_link:
+        title_sources.insert(0, metadata_link.get('data-auction-title', ''))
+    title_elem = li.select_one(
+        '.Product__title, .Product__titleLink, [class*="ProductTitle"], '
+        '[class*="ItemTitle"], h3'
+    )
+    if title_elem:
+        title_sources.append(title_elem.get_text(" ", strip=True))
+    image = li.find('img')
+    if image:
+        title_sources.extend([image.get('alt', ''), image.get('title', '')])
+    title = next((str(value).strip() for value in title_sources if str(value).strip()), "")
     if not title:
-        title = auction_link.get_text(strip=True)
-    if not title:
-        title = auction_link.get("title", "").strip()
+        logger.warning("商品标题缺失: itemId=%s url=%s", item_id, href)
 
     # 提取价格
     price = 0
-    data_price = auction_link.get('data-auction-price', '')
+    price_metadata = li.select_one('[data-auction-price]')
+    data_price = (
+        auction_link.get('data-auction-price', '')
+        or li.get('data-auction-price', '')
+        or (price_metadata.get('data-auction-price', '') if price_metadata else '')
+    )
     if data_price:
         try:
             price = int(data_price)
@@ -1054,13 +1093,28 @@ def parse_item(li, include_paypay=True):
     # 入札数
     bid_count = 0
     if item_type == "auction":
-        bid_link = li.find("a", href=re.compile(r"bid_hist"))
-        if bid_link:
-            bid_text = bid_link.get_text(strip=True)
-            try:
-                bid_count = int(re.sub(r"\D", "", bid_text))
-            except ValueError:
-                pass
+        bid_elem = li.select_one('[data-auction-bidcount], [data-bid-count]')
+        if bid_elem:
+            raw_bid_count = (
+                bid_elem.get('data-auction-bidcount')
+                or bid_elem.get('data-bid-count')
+                or ''
+            )
+            match = re.search(r'\d+', str(raw_bid_count).replace(',', ''))
+            if match:
+                bid_count = int(match.group())
+        if bid_count == 0:
+            bid_elem = li.find("a", href=re.compile(r"bid_hist|bidHistory", re.I))
+        if bid_count == 0 and not bid_elem:
+            bid_elem = li.select_one('.Product__bid, [class*="BidCount"], [class*="bidCount"]')
+        if bid_count == 0 and bid_elem:
+            match = re.search(r'\d[\d,]*', bid_elem.get_text(" ", strip=True))
+            if match:
+                bid_count = int(match.group().replace(',', ''))
+        if bid_count == 0:
+            match = re.search(r'入札(?:件数)?\s*[：:]?\s*(\d[\d,]*)', li.get_text(" ", strip=True))
+            if match:
+                bid_count = int(match.group(1).replace(',', ''))
 
     # 结束时间
     end_time = None
@@ -1265,12 +1319,24 @@ def save_items(items, table):
         except dynamodb.meta.client.exceptions.ConditionalCheckFailedException:
             skipped_duplicates += 1
             
-            # 已存在时也更新详情
+            # 已存在时也刷新列表字段。旧逻辑只更新详情，导致第一次保存为空的
+            # closed title、bidCount、价格等字段以后永远无法被修复。
             try:
+                title = str(item.get("title", "")).strip()
+                list_updates = [
+                    "price = :price", "buynowPrice = :buynow", "shippingFee = :shipping_fee",
+                    "shippingText = :shipping_text", "isFreeShipping = :free_shipping",
+                    "bidCount = :bid_count", "endTime = :end_time", "sellerId = :seller_id",
+                    "sellerRating = :seller_rating", "sellerType = :seller_type",
+                    "prefecture = :prefecture", "itemCondition = :item_condition",
+                    "#item_url = :item_url", "thumbnailUrl = :thumbnail", "scrapedAt = :scraped_at",
+                ]
+                if title:
+                    list_updates.insert(0, "#item_title = :item_title")
                 table.update_item(
                     Key={"itemID": item["itemId"]},
-                    UpdateExpression="""
-                        SET detailDescription = :desc,
+                    UpdateExpression="SET " + ", ".join(list_updates) + ", " + """
+                            detailDescription = :desc,
                             detailDescriptionRaw = :raw,
                             detailDescriptionCleaned = :cleaned,
                             detailDescriptionRawLength = :raw_len,
@@ -1285,7 +1351,27 @@ def save_items(items, table):
                             detailScrapeError = :detail_error,
                             lastDetailUpdatedAt = :now
                     """,
+                    ExpressionAttributeNames={
+                        "#item_url": "url",
+                        **({"#item_title": "title"} if title else {}),
+                    },
                     ExpressionAttributeValues={
+                        **({":item_title": title} if title else {}),
+                        ":price": item.get("price", 0),
+                        ":buynow": item.get("buynowPrice"),
+                        ":shipping_fee": item.get("shippingFee"),
+                        ":shipping_text": item.get("shippingText", ""),
+                        ":free_shipping": item.get("isFreeShipping", False),
+                        ":bid_count": item.get("bidCount", 0),
+                        ":end_time": item.get("endTime") or "unknown",
+                        ":seller_id": item.get("sellerId") or "unknown",
+                        ":seller_rating": item.get("sellerRating") or "unknown",
+                        ":seller_type": item.get("sellerType", "personal"),
+                        ":prefecture": item.get("prefecture") or "unknown",
+                        ":item_condition": item.get("itemCondition"),
+                        ":item_url": item.get("url") or "",
+                        ":thumbnail": item.get("thumbnailUrl") or "",
+                        ":scraped_at": item.get("scrapedAt") or datetime.now(timezone.utc).isoformat(),
                         ":desc": item.get("detailDescription", ""),
                         ":raw": item.get("detailDescriptionRaw", ""),
                         ":cleaned": item.get("detailDescriptionCleaned", ""),
