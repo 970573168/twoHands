@@ -7,7 +7,7 @@ title + detailDescription 详细AI解析
 核心修复：
 1. HTTP错误响应内容记录
 2. API URL默认值设置
-3. AI输出长度调整为25万token
+3. 按简单/详细解析分别限制 AI 输出长度
 4. scrape_closed/scrape_active 新商品自动初始化 modelStatus=PENDING
 5. upsert_scraped_item 使用 if_not_exists 不覆盖已有状态
 6. update_record 修复 ExpressionAttributeNames 问题
@@ -40,7 +40,12 @@ class ListingType:
     MAIN_PRODUCT = "MAIN_PRODUCT"; ACCESSORY = "ACCESSORY"; PARTS = "PARTS"
     BROKEN = "BROKEN"; BOX_ONLY = "BOX_ONLY"; BUNDLE = "BUNDLE"; UNKNOWN = "UNKNOWN"
 
-EXCLUDED_TYPES = {ListingType.ACCESSORY, ListingType.PARTS, ListingType.BROKEN, ListingType.BOX_ONLY, ListingType.BUNDLE, ListingType.UNKNOWN}
+class ConditionClass:
+    NORMAL = "NORMAL"
+    JUNK = "JUNK"
+
+# 故障主机是可比商品；只有下列非单一主商品类型会被程序排除。
+EXCLUDED_TYPES = {ListingType.ACCESSORY, ListingType.PARTS, ListingType.BOX_ONLY, ListingType.BUNDLE}
 
 class Recommendation:
     BUY = "BUY"; REVIEW = "REVIEW"; NO = "NO"
@@ -79,7 +84,7 @@ AI_CONFIGS = {
         "url": _gemini_url,
         "model": _gemini_model,
         "timeout": _env("GEMINI_TIMEOUT", 60, int),
-        "max_tokens": _env("GEMINI_MAX_TOKENS", 250000, int),
+        "max_tokens": _env("GEMINI_MAX_TOKENS", 12000, int),
         # ★ 不再从环境变量读 key
     },
     "doubao": {
@@ -88,7 +93,7 @@ AI_CONFIGS = {
         "url": _env("DOUBAO_URL", "https://ws-8lxmxlbemcgcus5u.ap-northeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions"),
         "model": _env("DOUBAO_MODEL", "qwen-plus-character"),
         "timeout": max(300, _env("DOUBAO_TIMEOUT", 300, int)),
-        "max_tokens": _env("DOUBAO_MAX_TOKENS", 250000, int),
+        "max_tokens": _env("DOUBAO_MAX_TOKENS", 12000, int),
     },
     "openai": {
         "name": "openai",
@@ -96,7 +101,7 @@ AI_CONFIGS = {
         "url": _env("OPENAI_URL", "https://api.openai.com/v1/chat/completions"),
         "model": _env("OPENAI_MODEL", "gpt-4o-mini"),
         "timeout": _env("OPENAI_TIMEOUT", 60, int),
-        "max_tokens": _env("OPENAI_MAX_TOKENS", 250000, int),
+        "max_tokens": _env("OPENAI_MAX_TOKENS", 12000, int),
     },
 }
 
@@ -120,17 +125,20 @@ SHIPPING_COST = _env("SHIPPING_COST", Decimal("1500"), Decimal)
 REPAIR_RESERVE = _env("REPAIR_RESERVE", Decimal("0.05"), Decimal)
 RISK_RESERVE = _env("RISK_RESERVE", Decimal("0.03"), Decimal)
 MAX_PRICE_DEV = _env("MAX_PRICE_DEV", Decimal("1.5"), Decimal)
-MODEL_BATCH = _env("MODEL_BATCH", 100, int)
-CLOSED_BATCH = _env("CLOSED_BATCH", 100, int)
+SIMPLE_BATCH = _env("SIMPLE_BATCH", _env("MODEL_BATCH", 25, int), int)
+DETAIL_BATCH = _env("DETAIL_BATCH", 10, int)
 AI_TIMEOUT = _env("AI_TIMEOUT", 90, int)
 AI_RETRIES = _env("AI_RETRIES", 3, int)
-# ★ FIX 3: 总token限制改为25万
 MAX_TOKENS = _env("MAX_TOKENS", 250000, int)
+SIMPLE_MAX_TOKENS = _env("SIMPLE_MAX_TOKENS", 4000, int)
+DETAIL_MAX_TOKENS = _env("DETAIL_MAX_TOKENS", 12000, int)
 LAMBDA_TIMEOUT = _env("LAMBDA_TIMEOUT", 840, int)
 TIMEOUT_BUFFER = _env("TIMEOUT_BUFFER", 30, int)
 DETAIL_DESC_MAX = _env("DETAIL_DESC_MAX", 3000, int)
 ENABLE_FALLBACK = _env("FALLBACK_MATCH", True, lambda x: x.lower() in ("true","1"))
 ENABLE_FAMILY = _env("FAMILY_MATCH", True, lambda x: x.lower() in ("true","1"))
+LOG_AI_REQUEST_JSON = _env("LOG_AI_REQUEST_JSON", False, lambda x: x.lower() in ("true", "1"))
+LOG_AI_RESPONSE_JSON = _env("LOG_AI_RESPONSE_JSON", False, lambda x: x.lower() in ("true", "1"))
 
 # ======================================
 # DynamoDB & State
@@ -448,9 +456,9 @@ def get_ai_cfg(excluded_modes=None):
     logger.error("No AI config available after checking modes: %s", order)
     return None
 
-def call_ai(prompt: str) -> Tuple[Optional[Dict],Optional[str]]:
+def call_ai(prompt: str, max_tokens: int) -> Tuple[Optional[Dict],Optional[str]]:
     global _total_tokens
-    logger.info(f"AI call: prompt length={len(prompt)}, current tokens={_total_tokens}")
+    logger.info("PROMPT_LENGTH=%s current_tokens=%s", len(prompt), _total_tokens)
 
     failed_modes = set()
     for attempt in range(3):
@@ -462,10 +470,19 @@ def call_ai(prompt: str) -> Tuple[Optional[Dict],Optional[str]]:
         mode, is_gem = cfg["name"], cfg["type"]=="gemini"
         logger.info(f"AI attempt {attempt+1}: mode={mode}, model={cfg['model']}")
         
-        body = {"contents":[{"parts":[{"text":prompt}]}],"generationConfig":{"temperature":0.0,"maxOutputTokens":cfg["max_tokens"]}} if is_gem else {"model":cfg["model"],"messages":[{"role":"system","content":"JSONのみ返してください"},{"role":"user","content":prompt}],"temperature":0.0,"max_tokens":cfg["max_tokens"]}
+        output_limit = min(max_tokens, cfg["max_tokens"])
+        body = {"contents":[{"parts":[{"text":prompt}]}],"generationConfig":{"temperature":0.0,"maxOutputTokens":output_limit}} if is_gem else {"model":cfg["model"],"messages":[{"role":"system","content":"JSONのみ返してください"},{"role":"user","content":prompt}],"temperature":0.0,"max_tokens":output_limit}
         if mode=="doubao":
             body["response_format"]={"type":"json_object"}
         headers = {"x-goog-api-key":cfg["key"],"Content-Type":"application/json"} if is_gem else {"Authorization":f"Bearer {cfg['key']}","Content-Type":"application/json"}
+
+        # 调试开关默认关闭，避免常规运行时输出大量商品文本。
+        # 请求日志只记录 JSON body，不记录含 API Key 的 headers。
+        if LOG_AI_REQUEST_JSON:
+            logger.info(
+                "AI_REQUEST_JSON=%s",
+                json.dumps(body, ensure_ascii=False, separators=(",", ":"), default=str),
+            )
         
         for retry in range(AI_RETRIES):
             try:
@@ -478,6 +495,12 @@ def call_ai(prompt: str) -> Tuple[Optional[Dict],Optional[str]]:
                 )
                 with urllib.request.urlopen(req,timeout=cfg["timeout"]) as r:
                     result = json.loads(r.read().decode())
+
+                if LOG_AI_RESPONSE_JSON:
+                    logger.info(
+                        "AI_RESPONSE_JSON=%s",
+                        json.dumps(result, ensure_ascii=False, separators=(",", ":"), default=str),
+                    )
                 
                 u = result.get("usageMetadata",{}) or result.get("usage",{})
                 tokens_used = u.get("total_tokens",u.get("totalTokenCount",0))
@@ -498,7 +521,7 @@ def call_ai(prompt: str) -> Tuple[Optional[Dict],Optional[str]]:
                     else:
                         content,fr = "","unknown"
                 
-                logger.info(f"AI finish: reason={fr}, content_length={len(content)}")
+                logger.info("AI finish: reason=%s OUTPUT_LENGTH=%s", fr, len(content))
                 
                 if fr=="SAFETY":
                     return None,"safety_blocked"
@@ -595,6 +618,14 @@ def _parse_json(content: str) -> Optional[Dict]:
 # Prompt Templates
 # ======================================
 
+SIMPLE_PARSE_PROMPT = """以下の Yahoo! オークション商品タイトルを価格比較用に分類してください。
+入力: {items_json}
+全 itemId を含む次の JSON だけを返してください:
+{{"items":[{{"itemId":"123","brand":"Apple","model":"iPhone 14 Pro","storage":"256GB","listingType":"MAIN_PRODUCT","conditionClass":"NORMAL","confidence":0.95}}]}}
+listingType は MAIN_PRODUCT/ACCESSORY/PARTS/BOX_ONLY/BUNDLE/UNKNOWN。故障した本体は MAIN_PRODUCT とする。
+conditionClass は、ジャンク、不動、起動不可、画面割れ、Face ID 不良、水没、その他の故障があれば JUNK、それ以外は NORMAL。
+brand/model/storage は明記された値だけを返し、不明な値は空文字にする。他のフィールドは返さない。"""
+
 DETAILED_PARSE_PROMPT = """あなたは中古電子製品の識別専門家です。
 以下の商品タイトルと商品説明を解析し、価格比較に必要な詳細スペックを抽出してください。
 
@@ -626,6 +657,7 @@ DETAILED_PARSE_PROMPT = """あなたは中古電子製品の識別専門家で�
       "conditionDetail": "商品の状態詳細。例: 美品, 傷あり, ジャンク, 動作確認済み",
       "listingType": "MAIN_PRODUCT",
       "condition": "USED",
+      "conditionClass": "NORMAL/JUNK",
       "isJunk": false,
       "isLocked": false,
       "isWorking": true,
@@ -659,19 +691,9 @@ condition: NEW/USED/BROKEN/UNKNOWN
 8. 色やキャリアは抽出するが、pricingCompareKeyParts には価格差が大きい場合のみ入れる
 9. 明記されていない情報は推測しない
 10. 商品説明から読み取れない重要情報は missing に入れる
-11. アクセサリ、部品、空箱、セット品、ジャンク品は適切な listingType に分類
-12. JSONのみを出力してください"""
-
-TITLE_PARSE_PROMPT = DETAILED_PARSE_PROMPT.replace(
-    "以下の商品タイトルと商品説明を解析し、価格比較に必要な詳細スペックを抽出してください。",
-    "以下の商品タイトルだけを解析し、価格比較に必要な詳細スペックを抽出してください。",
-).replace(
-    "1. title と description の両方を使って判断してください\n2. 矛盾する場合、description の具体的な記載を優先してください",
-    "1. title だけを使って判断してください\n2. title に明記されていない情報は推測せず missing に入れてください",
-).replace(
-    "10. 商品説明から読み取れない重要情報は missing に入れる",
-    "10. 商品タイトルから読み取れない重要情報は missing に入れる",
-)
+11. アクセサリ、部品、空箱、セット品は適切な listingType に分類する。故障した本体は MAIN_PRODUCT とする
+12. conditionClass は isJunk=true、defects あり、condition=BROKEN、または listingType=BROKEN の場合 JUNK、それ以外は NORMAL
+13. JSONのみを出力してください"""
 
 
 def build_parse_prompt(items: List[Dict]) -> str:
@@ -683,7 +705,7 @@ def build_parse_prompt(items: List[Dict]) -> str:
             "title": item.get("title",""),
         }
         items_data.append(data)
-    return TITLE_PARSE_PROMPT.replace("{items_json}", json.dumps(items_data, ensure_ascii=False, separators=(",",":")))
+    return SIMPLE_PARSE_PROMPT.replace("{items_json}", json.dumps(items_data, ensure_ascii=False, separators=(",",":")))
 
 
 def build_description_parse_prompt(items: List[Dict]) -> str:
@@ -713,6 +735,25 @@ def norm_detail(v: Any) -> str:
         return json.dumps(v, ensure_ascii=False, sort_keys=True)
     return norm(str(v))
 
+def get_condition_class(data: Dict, default: str = ConditionClass.NORMAL) -> str:
+    """统一商品状态分类。
+
+    旧数据没有 conditionClass 时默认 NORMAL；对 AI 新返回的数据，也会根据
+    isJunk/defects/condition/listingType 进行程序端校正。
+    """
+    explicit = norm(data.get("conditionClass", "")).upper()
+    is_junk = str(data.get("isJunk", "")).lower() in ("true", "1", "yes")
+    defects = data.get("defects", []) or []
+    condition = norm(data.get("condition", data.get("parsedCondition", ""))).upper()
+    listing_type = norm(data.get("listingType", "")).upper()
+    if is_junk or bool(defects) or condition == "BROKEN" or listing_type == ListingType.BROKEN:
+        return ConditionClass.JUNK
+    if explicit == ConditionClass.JUNK:
+        return ConditionClass.JUNK
+    if explicit == ConditionClass.NORMAL:
+        return ConditionClass.NORMAL
+    return default if default in (ConditionClass.NORMAL, ConditionClass.JUNK) else ConditionClass.NORMAL
+
 def gen_detailed_key(parsed: Dict) -> str:
     cp = parsed.get("pricingCompareKeyParts",{}) or {}
     b = norm(cp.get("brand") or parsed.get("brand","")).upper()
@@ -737,6 +778,7 @@ def gen_detailed_key(parsed: Dict) -> str:
         parts.append(gpu)
     if scr:
         parts.append(scr)
+    parts.append(get_condition_class(parsed))
     
     combined = " ".join(p for p in parts if p)
     combined = re.sub(r"[^A-Z0-9ぁ-んァ-ン一-龥\s+\-/\.]"," ",combined)
@@ -754,6 +796,7 @@ def parse_ai_result(parsed: Dict) -> Tuple[List[Dict], str, str, int, List[str],
     defects = parsed.get("defects",[]) or []
     is_junk = str(parsed.get("isJunk","")).lower() in ("true","1","yes")
     is_locked = str(parsed.get("isLocked","")).lower() in ("true","1","yes")
+    condition_class = get_condition_class(parsed)
     
     has_b, has_m = bool(brand), bool(model)
     is_unk = model.upper() in ("UNKNOWN","不明","N/A","")
@@ -777,6 +820,8 @@ def parse_ai_result(parsed: Dict) -> Tuple[List[Dict], str, str, int, List[str],
         m2 = model if has_m else "UNKNOWN"
         pk = gen_detailed_key(parsed) or gen_key(b2,m2,storage,variant)
         fk = gen_fallback_key(b2,m2,storage)
+        if fk:
+            fk = f"{fk} {condition_class}"
         if not fk or fk==pk:
             fk = ""
         fm = extract_family(m2.upper()) if has_m else ""
@@ -810,6 +855,7 @@ def parse_ai_result(parsed: Dict) -> Tuple[List[Dict], str, str, int, List[str],
             "fallbackPricingKey": fk,
             "confidence": str(conf),
             "missingParameterCount": mc,
+            "conditionClass": condition_class,
             "detailedParameters": detailed
         })
     
@@ -830,23 +876,24 @@ def parse_ai_result(parsed: Dict) -> Tuple[List[Dict], str, str, int, List[str],
 def save_model(table, item_id: str, parsed: Dict) -> str:
     models, lt, cond, mc, missing_critical, excl = parse_ai_result(parsed)
     excluded = lt in EXCLUDED_TYPES
-    broken = cond=="BROKEN"
+    condition_class = get_condition_class(parsed)
     low_conf = any(sd(m.get("confidence",0))<Decimal("0.7") for m in models)
     
     if not models:
         status = Status.REVIEW_REQUIRED
-    elif excluded or broken:
+    elif excluded:
         status = Status.EXCLUDED
     elif low_conf:
         status = Status.REVIEW_REQUIRED
     else:
         status = Status.COMPLETED
     
-    eligible = not excluded and not broken and len(models)>0
+    eligible = not excluded and len(models)>0
     update_record(table, item_id, {
         "models": models,
         "modelStatus": status,
         "listingType": lt,
+        "conditionClass": condition_class,
         "missingParameterCount": mc,
         "missingCriticalParameters": missing_critical,
         "isComparable": eligible,
@@ -869,7 +916,7 @@ def mark_failed(table, item_id: str, error: str):
     })
     logger.warning(f"Model failed: {item_id} -> {error[:100]}")
 
-def batch_parse(table, items: List[Dict], prompt_builder, batch_size: int) -> Dict:
+def batch_parse(table, items: List[Dict], prompt_builder, batch_size: int, max_tokens: int) -> Dict:
     if not items:
         return {"parsed":0,"excluded":0,"review":0,"failed":0,"errors":[]}
     totals = {"parsed":0,"excluded":0,"review":0,"failed":0,"errors":[]}
@@ -881,7 +928,11 @@ def batch_parse(table, items: List[Dict], prompt_builder, batch_size: int) -> Di
         batch = items[start:start+batch_size]
         logger.info(f"AI parsing batch {start//batch_size+1}/{(len(items)-1)//batch_size+1}, size={len(batch)}")
         
-        result, err = call_ai(prompt_builder(batch))
+        prompt = prompt_builder(batch)
+        tokens_before = _total_tokens
+        result, err = call_ai(prompt, max_tokens)
+        tokens_used = _total_tokens - tokens_before
+        logger.info("TOKENS_PER_ITEM=%s", tokens_used / max(1, len(batch)))
         
         if not result:
             logger.error(f"AI returned empty for batch: {err}")
@@ -891,6 +942,10 @@ def batch_parse(table, items: List[Dict], prompt_builder, batch_size: int) -> Di
             continue
         
         parsed = result.get("items",[]) or []
+        logger.info(
+            "FIRST_RETURNED_ITEM=%s",
+            json.dumps(parsed[0] if parsed else None, ensure_ascii=False, default=str),
+        )
         returned = set()
         for p in parsed:
             if not isinstance(p,dict):
@@ -934,7 +989,7 @@ def build_index(closed_ids: Set[str]) -> Dict[str,List[Dict]]:
         item = get_record(closed_db, cid)
         if not item or item.get("modelStatus") not in (Status.COMPLETED, Status.REVIEW_REQUIRED):
             continue
-        if item.get("listingType")!=ListingType.MAIN_PRODUCT or item.get("parsedCondition")=="BROKEN":
+        if norm(item.get("listingType", "")).upper() in EXCLUDED_TYPES:
             continue
         if sd(item.get("price",0))<=0:
             continue
@@ -955,13 +1010,18 @@ def build_index(closed_ids: Set[str]) -> Dict[str,List[Dict]]:
                 excluded+=1
                 continue
             
+            condition_class = get_condition_class(m, get_condition_class(item))
             pk = norm(m.get("pricingModelKey","")).upper()
+            if pk and not pk.endswith(f" {condition_class}"):
+                pk = f"{pk} {condition_class}"
             if pk and pk not in keys:
                 keys.add(pk)
                 idx.setdefault(pk,[]).append(item)
             
             if ENABLE_FALLBACK:
                 fk = norm(m.get("fallbackPricingKey","")).upper()
+                if fk and not fk.endswith(f" {condition_class}"):
+                    fk = f"{fk} {condition_class}"
                 if fk and fk!=pk:
                     fq = f"FB:{fk}"
                     if fq not in keys:
@@ -973,7 +1033,7 @@ def build_index(closed_ids: Set[str]) -> Dict[str,List[Dict]]:
                 if fm and fm!=mn:
                     b = norm(m.get("brand","")).upper()
                     if b:
-                        fam = re.sub(r"[^A-Z0-9\s+\-/]"," ",f"{b} {fm}").strip()
+                        fam = re.sub(r"[^A-Z0-9\s+\-/]"," ",f"{b} {fm} {condition_class}").strip()
                         fq = f"FAM:{fam}"
                         if fq not in keys:
                             keys.add(fq)
@@ -999,7 +1059,10 @@ def find_comp(item: Dict, idx: Dict[str,List[Dict]]) -> Tuple[List[Dict],Dict]:
         if not isinstance(m,dict):
             continue
         
+        condition_class = get_condition_class(m, get_condition_class(item))
         pk = norm(m.get("pricingModelKey","")).upper()
+        if pk and not pk.endswith(f" {condition_class}"):
+            pk = f"{pk} {condition_class}"
         if pk:
             for ci in idx.get(pk,[]):
                 iid = str(ci.get("itemID",""))
@@ -1010,6 +1073,8 @@ def find_comp(item: Dict, idx: Dict[str,List[Dict]]) -> Tuple[List[Dict],Dict]:
         
         if len(items)<MIN_COMPARABLE and ENABLE_FALLBACK:
             fk = norm(m.get("fallbackPricingKey","")).upper()
+            if fk and not fk.endswith(f" {condition_class}"):
+                fk = f"{fk} {condition_class}"
             if fk:
                 for ci in idx.get(f"FB:{fk}",[]):
                     iid = str(ci.get("itemID",""))
@@ -1023,7 +1088,7 @@ def find_comp(item: Dict, idx: Dict[str,List[Dict]]) -> Tuple[List[Dict],Dict]:
             if fm:
                 b = norm(m.get("brand","")).upper()
                 if b:
-                    fkey = re.sub(r"[^A-Z0-9\s+\-/]"," ",f"{b} {fm}").strip()
+                    fkey = re.sub(r"[^A-Z0-9\s+\-/]"," ",f"{b} {fm} {condition_class}").strip()
                     for ci in idx.get(f"FAM:{fkey}",[]):
                         iid = str(ci.get("itemID",""))
                         if iid and iid not in seen:
@@ -1493,7 +1558,7 @@ def calc_min_price(closed_ids: List[str]) -> Dict:
         item = get_record(closed_db, cid)
         if not item or item.get("modelStatus")!=Status.COMPLETED:
             continue
-        if item.get("listingType")!=ListingType.MAIN_PRODUCT or item.get("parsedCondition")=="BROKEN":
+        if norm(item.get("listingType", "")).upper() in EXCLUDED_TYPES:
             continue
         p = si(item.get("price",0))
         if p>0:
@@ -1550,7 +1615,9 @@ def execute_workflow(kw: str, ac: int, cc: int, force: bool) -> Dict:
         
         if closed_items:
             logger.info(f"Start closed AI parse: {len(closed_items)} items")
-            closed_result = batch_parse(closed_db, closed_items, build_parse_prompt, CLOSED_BATCH)
+            closed_result = batch_parse(
+                closed_db, closed_items, build_parse_prompt, SIMPLE_BATCH, SIMPLE_MAX_TOKENS
+            )
             result["closed_parsed"] = closed_result
             logger.info(f"Closed parse result: {closed_result}")
         else:
@@ -1589,7 +1656,9 @@ def execute_workflow(kw: str, ac: int, cc: int, force: bool) -> Dict:
         
         if active_items:
             logger.info(f"Start active AI parse: {len(active_items)} items")
-            active_result = batch_parse(active_db, active_items, build_parse_prompt, MODEL_BATCH)
+            active_result = batch_parse(
+                active_db, active_items, build_parse_prompt, SIMPLE_BATCH, SIMPLE_MAX_TOKENS
+            )
             result["active_parsed"] = active_result
             logger.info(f"Active parse result: {active_result}")
         else:
@@ -1663,7 +1732,8 @@ def execute_workflow(kw: str, ac: int, cc: int, force: bool) -> Dict:
                     active_db,
                     recheck_items,
                     build_description_parse_prompt,
-                    MODEL_BATCH,
+                    DETAIL_BATCH,
+                    DETAIL_MAX_TOKENS,
                 )
                 result["active_description_reanalysis"] = reanalysis_result
                 reanalyzed = (
