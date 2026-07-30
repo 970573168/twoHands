@@ -18,6 +18,7 @@ from auction_analyzer import (
     calc_decision,
     normalize_pricing_key,
     pricing_key_with_condition,
+    resolve_closed_without_ai,
     save_active_model,
     save_closed_model,
 )
@@ -53,9 +54,10 @@ class NormalizePricingKeyTest(unittest.TestCase):
 
 class LeanAiWorkflowTest(unittest.TestCase):
     def test_active_prompt_keeps_item_id_and_only_requests_brand_model(self):
-        prompt = build_active_parse_prompt([{"itemID": "a1", "title": "Apple iPhone 15"}])
+        prompt = build_active_parse_prompt([{"itemID": "a1", "title": "Apple iPhone 15" + "x" * 200}])
         self.assertIn('"itemId":"a1"', prompt)
         self.assertIn('"models"', prompt)
+        self.assertNotIn("x" * 121, prompt)
         self.assertNotIn("confidence", prompt)
         self.assertNotIn("evidence", prompt)
 
@@ -67,6 +69,9 @@ class LeanAiWorkflowTest(unittest.TestCase):
         }])
         self.assertIn('"itemId":"c1"', prompt)
         self.assertIn('"sourceModel":{"brand":"Apple","model":"iPhone 15"}', prompt)
+        self.assertIn('"matched":true', prompt)
+        self.assertNotIn('"models"', prompt)
+        self.assertEqual(prompt.count('"sourceModel"'), 1)
         for removed in ("confidence", "condition", "isComparable", "exclusionReason"):
             self.assertNotIn(removed, prompt)
 
@@ -82,21 +87,37 @@ class LeanAiWorkflowTest(unittest.TestCase):
     @patch("auction_analyzer.update_record")
     def test_closed_storage_uses_source_model_and_omits_removed_fields(self, update_record):
         table = Mock()
-        table.get_item.return_value = {
-            "Item": {"sourceModel": {"brand": "Nikon", "model": "Z 85mm F1.2 S"}},
-        }
         save_closed_model(table, "c1", {
-            "models": [{"brand": "wrong", "model": "wrong"}],
+            "matched": True,
             "listingType": "MAIN_PRODUCT",
             "condition": "USED",
             "isComparable": True,
             "exclusionReason": "",
-        })
+        }, {"sourceModel": {"brand": "Nikon", "model": "Z 85mm F1.2 S"}})
         fields = update_record.call_args.args[2]
         self.assertEqual(fields["models"][0]["brand"], "Nikon")
         self.assertEqual(fields["models"][0]["model"], "Z 85mm F1.2 S")
         for removed in ("condition", "isComparable", "exclusionReason"):
             self.assertNotIn(removed, fields)
+        table.get_item.assert_not_called()
+
+    def test_closed_title_and_model_can_be_resolved_without_ai(self):
+        item = {
+            "itemID": "c1",
+            "title": "Bosch GBH2-26DFR ハンマードリル",
+            "sourceModel": {"brand": "Bosch", "model": "GBH 2-26 DFR"},
+        }
+        self.assertEqual(resolve_closed_without_ai(item), {
+            "itemId": "c1", "matched": True, "listingType": "MAIN_PRODUCT",
+        })
+
+    def test_uncertain_closed_model_is_left_for_ai(self):
+        item = {
+            "itemID": "c2",
+            "title": "Bosch コードレスハンマードリル",
+            "sourceModel": {"brand": "Bosch", "model": "GBH 2-26 DFR"},
+        }
+        self.assertIsNone(resolve_closed_without_ai(item))
 
     def test_purchase_decision_uses_only_profit_rules(self):
         self.assertEqual(calc_decision(Decimal("-1"), Decimal("0.50")), Recommendation.AVOID)

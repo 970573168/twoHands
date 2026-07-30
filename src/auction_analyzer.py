@@ -136,6 +136,8 @@ DETAIL_MAX_TOKENS = _env("DETAIL_MAX_TOKENS", 12000, int)
 LAMBDA_TIMEOUT = _env("LAMBDA_TIMEOUT", 840, int)
 TIMEOUT_BUFFER = _env("TIMEOUT_BUFFER", 30, int)
 DETAIL_DESC_MAX = _env("DETAIL_DESC_MAX", 3000, int)
+ACTIVE_TITLE_MAX = _env("ACTIVE_TITLE_MAX", 120, int)
+CLOSED_TITLE_MAX = _env("CLOSED_TITLE_MAX", 100, int)
 ENABLE_FALLBACK = _env("FALLBACK_MATCH", True, lambda x: x.lower() in ("true","1"))
 ENABLE_FAMILY = _env("FAMILY_MATCH", True, lambda x: x.lower() in ("true","1"))
 LOG_AI_REQUEST_JSON = _env("LOG_AI_REQUEST_JSON", False, lambda x: x.lower() in ("true", "1"))
@@ -651,8 +653,8 @@ brand/model はタイトルに明記された値だけを返し、製品を特�
 CLOSED_PARSE_PROMPT = """Yahoo!オークションの終了商品を参照製品と比較してください。
 入力: {items_json}
 全 itemId を含む次の JSON だけを返してください:
-{{"items":[{{"itemId":"123","models":[{{"brand":"Apple","model":"iPhone 14 Pro"}}],"listingType":"MAIN_PRODUCT"}}]}}
-sourceModel と同じモデルなら models に sourceModel の brand/model をそのまま返し、異なるモデルなら空配列にしてください。
+{{"items":[{{"itemId":"123","matched":true,"listingType":"MAIN_PRODUCT"}}]}}
+sourceModel と同じモデルなら matched=true、異なるモデルなら false にしてください。
 listingType は MAIN_PRODUCT/ACCESSORY/PARTS/BOX_ONLY のいずれかです。故障した本体は MAIN_PRODUCT としてください。他のフィールドは返さないでください。"""
 
 DETAILED_PARSE_PROMPT = """あなたは中古電子製品の識別専門家です。
@@ -730,26 +732,29 @@ def build_active_parse_prompt(items: List[Dict]) -> str:
     for item in items:
         data = {
             "itemId": str(item.get("itemID","")),
-            "title": item.get("title",""),
+            "title": str(item.get("title", ""))[:ACTIVE_TITLE_MAX],
         }
         items_data.append(data)
     return ACTIVE_PARSE_PROMPT.replace("{items_json}", json.dumps(items_data, ensure_ascii=False, separators=(",",":")))
 
 
 def build_closed_parse_prompt(items: List[Dict]) -> str:
-    """Closed AI 只比较标题与已知 sourceModel，并判断商品类型。"""
+    """Closed AI 只接收一次 sourceModel，并比较截断后的商品标题。"""
+    source_model = (items[0].get("sourceModel", {}) or {}) if items else {}
     items_data = []
     for item in items:
-        source_model = item.get("sourceModel", {}) or {}
         items_data.append({
             "itemId": str(item.get("itemID", "")),
-            "title": item.get("title", ""),
-            "sourceModel": {
-                "brand": source_model.get("brand", ""),
-                "model": source_model.get("model", ""),
-            },
+            "title": str(item.get("title", ""))[:CLOSED_TITLE_MAX],
         })
-    return CLOSED_PARSE_PROMPT.replace("{items_json}", json.dumps(items_data, ensure_ascii=False, separators=(",", ":")))
+    payload = {
+        "sourceModel": {
+            "brand": source_model.get("brand", ""),
+            "model": source_model.get("model", ""),
+        },
+        "items": items_data,
+    }
+    return CLOSED_PARSE_PROMPT.replace("{items_json}", json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
 
 
 def build_description_parse_prompt(items: List[Dict]) -> str:
@@ -914,7 +919,7 @@ def parse_ai_result(parsed: Dict) -> Tuple[List[Dict], str, str, int, List[str],
     
     return models, lt, cond, mc, missing_critical, "; ".join(reasons)
 
-def save_model(table, item_id: str, parsed: Dict) -> str:
+def save_model(table, item_id: str, parsed: Dict, item: Optional[Dict] = None) -> str:
     models, lt, cond, mc, missing_critical, excl = parse_ai_result(parsed)
     excluded = lt in EXCLUDED_TYPES
     condition_class = get_condition_class(parsed)
@@ -964,7 +969,7 @@ def _simple_model(parsed: Dict) -> Optional[Dict]:
         "fallbackPricingKey": pricing_key_with_condition(gen_fallback_key(brand, model), ConditionClass.NORMAL),
     }
 
-def save_active_model(table, item_id: str, parsed: Dict) -> str:
+def save_active_model(table, item_id: str, parsed: Dict, item: Optional[Dict] = None) -> str:
     """保存 Active 精简模型结果，不持久化 confidence/evidence。"""
     model = _simple_model(parsed)
     status = Status.COMPLETED if model else Status.REVIEW_REQUIRED
@@ -979,11 +984,10 @@ def save_active_model(table, item_id: str, parsed: Dict) -> str:
     })
     return status
 
-def save_closed_model(table, item_id: str, parsed: Dict) -> str:
+def save_closed_model(table, item_id: str, parsed: Dict, item: Optional[Dict] = None) -> str:
     """保存 Closed 同型号及 listingType 结果，不保存条件和比较判断字段。"""
-    ai_models = parsed.get("models", []) or []
-    source_model = (get_record(table, item_id) or {}).get("sourceModel", {}) or {}
-    model = _simple_model({"models": [source_model]}) if ai_models else None
+    source_model = (item or {}).get("sourceModel", {}) or {}
+    model = _simple_model({"models": [source_model]}) if parsed.get("matched") is True else None
     listing_type = norm(parsed.get("listingType", "UNKNOWN")).upper()
     if listing_type not in {
         ListingType.MAIN_PRODUCT, ListingType.ACCESSORY,
@@ -1002,6 +1006,26 @@ def save_closed_model(table, item_id: str, parsed: Dict) -> str:
     })
     return status
 
+def resolve_closed_without_ai(item: Dict) -> Optional[Dict]:
+    """规范化型号已明确出现在标题时，用代码完成常见 Closed 判断。"""
+    source_model = item.get("sourceModel", {}) or {}
+    model_key = normalize_pricing_key(source_model.get("model", ""))
+    title = str(item.get("title", ""))
+    title_key = normalize_pricing_key(title)
+    if not model_key or model_key not in title_key:
+        return None
+
+    normalized_title = unicodedata.normalize("NFKC", title).upper()
+    keyword_types = (
+        (ListingType.BOX_ONLY, ("空箱", "箱のみ", "BOX ONLY", "EMPTY BOX")),
+        (ListingType.PARTS, ("部品取り", "パーツのみ", "PARTS ONLY")),
+        (ListingType.ACCESSORY, ("ケースのみ", "カバーのみ", "充電器のみ", "バッテリーのみ", "ACCESSORY ONLY")),
+    )
+    for listing_type, keywords in keyword_types:
+        if any(keyword in normalized_title for keyword in keywords):
+            return {"itemId": str(item.get("itemID", "")), "matched": True, "listingType": listing_type}
+    return {"itemId": str(item.get("itemID", "")), "matched": True, "listingType": ListingType.MAIN_PRODUCT}
+
 def mark_failed(table, item_id: str, error: str):
     update_record(table, item_id, {
         "modelStatus": Status.FAILED,
@@ -1010,7 +1034,8 @@ def mark_failed(table, item_id: str, error: str):
     })
     logger.warning(f"Model failed: {item_id} -> {error[:100]}")
 
-def batch_parse(table, items: List[Dict], prompt_builder, batch_size: int, max_tokens: int, saver=save_model) -> Dict:
+def batch_parse(table, items: List[Dict], prompt_builder, batch_size: int, max_tokens: int,
+                saver=save_model, resolver=None) -> Dict:
     if not items:
         return {"parsed":0,"excluded":0,"review":0,"failed":0,"errors":[]}
     totals = {"parsed":0,"excluded":0,"review":0,"failed":0,"errors":[]}
@@ -1020,6 +1045,25 @@ def batch_parse(table, items: List[Dict], prompt_builder, batch_size: int, max_t
     for start in range(0,len(items),batch_size):
         check_limits()
         batch = items[start:start+batch_size]
+        item_map = {str(item["itemID"]): item for item in batch}
+        unresolved = []
+        for item in batch:
+            resolved = resolver(item) if resolver else None
+            if resolved is None:
+                unresolved.append(item)
+                continue
+            status = saver(table, str(item["itemID"]), resolved, item)
+            if status == Status.COMPLETED:
+                totals["parsed"] += 1
+            elif status == Status.EXCLUDED:
+                totals["excluded"] += 1
+            elif status == Status.REVIEW_REQUIRED:
+                totals["review"] += 1
+            else:
+                totals["failed"] += 1
+        batch = unresolved
+        if not batch:
+            continue
         logger.info(f"AI parsing batch {start//batch_size+1}/{(len(items)-1)//batch_size+1}, size={len(batch)}")
         
         prompt = prompt_builder(batch)
@@ -1049,7 +1093,7 @@ def batch_parse(table, items: List[Dict], prompt_builder, batch_size: int, max_t
             if not iid or iid not in batch_ids:
                 continue
             returned.add(iid)
-            s = saver(table, iid, p)
+            s = saver(table, iid, p, item_map[iid])
             if s==Status.COMPLETED:
                 totals["parsed"]+=1
             elif s==Status.EXCLUDED:
@@ -1691,6 +1735,7 @@ def execute_workflow(kw: str, ac: int, cc: int, force: bool, source_model: Optio
             closed_result = batch_parse(
                 closed_db, closed_items, build_closed_parse_prompt, SIMPLE_BATCH,
                 SIMPLE_MAX_TOKENS, saver=save_closed_model,
+                resolver=resolve_closed_without_ai,
             )
             result["closed_parsed"] = closed_result
             logger.info(f"Closed parse result: {closed_result}")
