@@ -126,7 +126,6 @@ closed_db = dynamodb.Table(TABLE_CLOSED)
 secrets = boto3.client("secretsmanager")
 _total_tokens = 0
 _start_time = None
-_ai_state = {"failed_modes": {}}
 
 # ======================================
 # Repository
@@ -314,54 +313,80 @@ def check_limits():
 # AI Service
 # ======================================
 
-def _get_key(mode: str) -> str:
-    env = os.getenv("ENVIRONMENT", "dev")
-    secret_name = f"{mode}-api-key-{env}"
-    
-    logger.info(f"Reading secret: {secret_name}")
-    
+def _extract_secret_value(secret_string: str, mode: str) -> str:
+    """从 Secrets Manager 的 SecretString 中提取 API Key。"""
+    if not secret_string:
+        return ""
+
     try:
-        r = secrets.get_secret_value(SecretId=secret_name)
-        s = r.get("SecretString", "")
-        logger.info(f"Secret retrieved, length={len(s)}")
-        
-        # 尝试 JSON 解析
-        d = json.loads(s)
-        logger.info(f"Secret JSON keys: {list(d.keys())}")
-        
-        # 取第一个值（兼容各种 key 名）
-        for key_name in ["apiKey", "api_key", "key", f"{mode.upper()}_API_KEY"]:
-            val = d.get(key_name, "")
-            if val:
-                logger.info(f"Found key via '{key_name}'")
-                return val
-        
-        # 都没匹配到，取 JSON 里第一个值
-        first_val = list(d.values())[0] if d else ""
-        if first_val:
-            logger.info(f"Using first value from JSON")
-            return first_val
-        
+        secret_dict = json.loads(secret_string)
     except json.JSONDecodeError:
-        # 纯文本
-        logger.info("Secret is plaintext")
-        return s.strip()
-    except Exception as e:
-        logger.error(f"Secret read failed: {type(e).__name__}: {e}")
-    
+        return secret_string.strip()
+
+    if not isinstance(secret_dict, dict):
+        return ""
+
+    logger.info("Secret JSON keys: %s", list(secret_dict.keys()))
+    for key_name in (
+        "apiKey",
+        "api_key",
+        "key",
+        "GEMINI_API_KEY",
+        "DOUBAO_API_KEY",
+        "OPENAI_API_KEY",
+        f"{mode.upper()}_API_KEY",
+    ):
+        val = secret_dict.get(key_name)
+        if val:
+            logger.info("Found key via '%s'", key_name)
+            return str(val).strip()
+
+    first_val = next((v for v in secret_dict.values() if v), "")
+    if first_val:
+        logger.info("Using first non-empty value from JSON secret")
+        return str(first_val).strip()
+
     return ""
 
-def get_ai_cfg():
-    """获取AI配置，key 只从 Secrets Manager 读"""
+
+def _get_key(mode: str) -> str:
+    """仅从 Secrets Manager 获取 AI API Key。
+
+    API Key 不从 Lambda 环境变量读取，统一通过
+    <mode>-api-key-<ENVIRONMENT> 管理；SECRET_NAME 仅作为旧版 Secret 名称兜底。
+    """
+    env = os.getenv("ENVIRONMENT", "dev")
+    secret_names = [f"{mode}-api-key-{env}"]
+
+    legacy_secret = os.getenv("SECRET_NAME", "").strip()
+    if legacy_secret:
+        secret_names.append(legacy_secret)
+
+    for secret_name in dict.fromkeys(secret_names):
+        logger.info("Reading secret: %s", secret_name)
+        try:
+            response = secrets.get_secret_value(SecretId=secret_name)
+            secret_string = response.get("SecretString", "")
+            logger.info("Secret retrieved, length=%s", len(secret_string))
+            key = _extract_secret_value(secret_string, mode)
+            if key:
+                return key
+        except Exception as e:
+            logger.error("Secret read failed for %s: %s: %s", secret_name, type(e).__name__, e)
+
+    return ""
+
+def get_ai_cfg(excluded_modes=None):
+    """获取 AI 配置，key 只从 Secrets Manager 读取。
+
+    excluded_modes 只用于一次 call_ai 调用内的故障转移，避免失败状态跨批次保留。
+    """
+    excluded_modes = set(excluded_modes or ())
     order = [AI_MODE] + [m for m in ["gemini","doubao","openai"] if m != AI_MODE]
-    now = time.time()
-    
+
     for mode in order:
-        if mode in _ai_state["failed_modes"]:
-            cooldown = _env("AI_COOLDOWN", 300, int)
-            if now - _ai_state["failed_modes"][mode] < cooldown:
-                continue
-            del _ai_state["failed_modes"][mode]
+        if mode in excluded_modes:
+            continue
         
         original = AI_CONFIGS.get(mode, {})
         if not original:
@@ -391,14 +416,16 @@ def get_ai_cfg():
         logger.info("Selected AI mode=%s model=%s url=%s", mode, model, url)
         return cfg
     
+    logger.error("No AI config available after checking modes: %s", order)
     return None
 
 def call_ai(prompt: str) -> Tuple[Optional[Dict],Optional[str]]:
     global _total_tokens
     logger.info(f"AI call: prompt length={len(prompt)}, current tokens={_total_tokens}")
-    
+
+    failed_modes = set()
     for attempt in range(3):
-        cfg = get_ai_cfg()
+        cfg = get_ai_cfg(failed_modes)
         if not cfg:
             logger.error("All AI modes unavailable")
             return None,"ALL_MODES_UNAVAILABLE"
@@ -498,7 +525,7 @@ def call_ai(prompt: str) -> Tuple[Optional[Dict],Optional[str]]:
             if retry < AI_RETRIES-1:
                 time.sleep(2**retry+random.uniform(0,1))
         
-        _ai_state["failed_modes"][mode]=time.time()
+        failed_modes.add(mode)
         logger.warning(f"Mode {mode} failed, switching to next")
     
     return None,"ALL_MODES_EXHAUSTED"
