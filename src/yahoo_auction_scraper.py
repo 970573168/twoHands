@@ -35,7 +35,7 @@ AUCTION_ABATCH = os.getenv("AUCTION_ABATCH", "1,2")
 
 # ============ 详情爬取控制 ============
 ENABLE_DETAIL_SCRAPE_ON_SEARCH = os.getenv("ENABLE_DETAIL_SCRAPE_ON_SEARCH", "true").lower() == "true"
-DETAIL_REQUEST_INTERVAL = float(os.getenv("DETAIL_REQUEST_INTERVAL", "1.0"))
+DETAIL_REQUEST_INTERVAL = float(os.getenv("DETAIL_REQUEST_INTERVAL", "0.3"))
 DETAIL_DESCRIPTION_MAX_CHARS = int(os.getenv("DETAIL_DESCRIPTION_MAX_CHARS", "3000"))
 AUCTION_DETAIL_BASE = os.getenv("AUCTION_DETAIL_BASE", "https://auctions.yahoo.co.jp/jp/auction")
 
