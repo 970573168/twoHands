@@ -62,7 +62,7 @@ Parameters:
 
   GeminiMaxTokens:
     Type: Number
-    Default: 250000
+    Default: 12000
     MinValue: 100
     MaxValue: 1000000
 
@@ -91,7 +91,7 @@ Parameters:
 
   DoubaoMaxTokens:
     Type: Number
-    Default: 250000
+    Default: 12000
     MinValue: 100
     MaxValue: 1000000
 
@@ -120,7 +120,7 @@ Parameters:
 
   OpenaiMaxTokens:
     Type: Number
-    Default: 250000
+    Default: 12000
     MinValue: 100
     MaxValue: 1000000
 
@@ -230,13 +230,13 @@ Parameters:
   # ============ Yahoo Auction Analyzer 参数 ============
   ModelParseBatchSize:
     Type: Number
-    Default: 100
+    Default: 25
     MinValue: 1
     MaxValue: 1000
 
   ClosedParseBatchSize:
     Type: Number
-    Default: 100
+    Default: 25
     MinValue: 1
     MaxValue: 1000
 
@@ -913,11 +913,15 @@ Resources:
           AI_MAX_RETRIES: !Ref AiMaxRetries
 
           MAX_TOKENS: !Ref MaxTotalTokens
+          SIMPLE_MAX_TOKENS: "4000"
+          DETAIL_MAX_TOKENS: "12000"
           LAMBDA_TIMEOUT: "900"
           TIMEOUT_BUFFER: !Ref LambdaTimeoutBuffer
           
           MODEL_BATCH: !Ref ModelParseBatchSize
           CLOSED_BATCH: !Ref ClosedParseBatchSize
+          SIMPLE_BATCH: !Ref ModelParseBatchSize
+          DETAIL_BATCH: "10"
           REQ_INTERVAL: !Ref RequestInterval
           
           FEE_RATE: !Ref ExpectedSellingFeeRate
