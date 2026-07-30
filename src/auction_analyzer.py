@@ -21,7 +21,7 @@ from typing import List, Dict, Optional, Any, Set, Tuple, Union
 from collections import OrderedDict
 
 import boto3
-from yahoo_auction_scraper import scrape_auctions
+from yahoo_auction_scraper import scrape_auctions, scrape_item_detail
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -1313,12 +1313,47 @@ def price_active_item(item_id: str, idx: Dict[str,List[Dict]]) -> Optional[Dict]
 
 
 def should_reanalyze_description(item: Dict, pricing: Dict) -> bool:
-    """有正利润且缺关键参数时，才使用详情进行第二次 AI 分析。"""
+    """有正利润且缺关键参数时，才抓取详情并进行第二次 AI 分析。"""
     return (
-        bool(str(item.get("detailDescription", "")).strip())
-        and si(item.get("missingParameterCount", 0)) > 0
+        si(item.get("missingParameterCount", 0)) > 0
         and sd(pricing.get("netProfitAtCurrentBid", 0)) > 0
     )
+
+
+def scrape_profitable_active_detail(item_id: str) -> Optional[Dict]:
+    """为有利润且缺关键参数的 active 商品按需抓取并保存详情。"""
+    detail = scrape_item_detail(item_id)
+    if not detail:
+        update_record(active_db, item_id, {
+            "detailScrapeStatus": "FAILED",
+            "detailScrapeError": "scrape_item_detail returned None",
+            "detailScrapedAt": datetime.now(timezone.utc).isoformat(),
+        })
+        return None
+
+    description = detail.get("detailDescriptionCleaned", detail.get("description", "")) or ""
+    fields = {
+        "detailDescription": description,
+        "detailDescriptionRaw": detail.get("detailDescriptionRaw", ""),
+        "detailDescriptionCleaned": description,
+        "detailDescriptionRawLength": detail.get("detailDescriptionRawLength", 0),
+        "detailDescriptionCleanedLength": detail.get("detailDescriptionCleanedLength", len(description)),
+        "detailDescriptionLength": detail.get("detailDescriptionLength", len(description)),
+        "detailDescriptionCleanRatio": detail.get("detailDescriptionCleanRatio", Decimal("0")),
+        "detailCleanedAt": detail.get("detailCleanedAt", ""),
+        "detailTitle": detail.get("title", ""),
+        "detailUrl": detail.get("url", ""),
+        "detailScrapedAt": detail.get("scrapedAt", datetime.now(timezone.utc).isoformat()),
+        "detailScrapeStatus": "COMPLETED" if description else "EMPTY",
+        "detailScrapeError": "",
+    }
+    update_record(active_db, item_id, fields)
+    logger.info(
+        "On-demand detail scraped for profitable active item: %s cleaned_length=%s",
+        item_id,
+        len(description),
+    )
+    return {**(get_record(active_db, item_id) or {}), **fields}
 
 # ======================================
 # Workflow
@@ -1327,7 +1362,7 @@ def should_reanalyze_description(item: Dict, pricing: Dict) -> bool:
 def scrape_closed(kw: str, cnt: int, force: bool = False) -> List[str]:
     """抓取已结束商品，新商品自动设为 PENDING"""
     try:
-        items = scrape_auctions(kw, "closed", False)[:cnt]
+        items = scrape_auctions(kw, "closed", False, scrape_details=False)[:cnt]
         new_count = 0
         
         for item in items:
@@ -1353,13 +1388,6 @@ def scrape_closed(kw: str, cnt: int, force: bool = False) -> List[str]:
                         "isFreeShipping": item.get("isFreeShipping", False),
                         "itemCondition": item.get("itemCondition"),
                         "thumbnailUrl": item.get("thumbnailUrl", ""),
-                        "detailDescription": item.get("detailDescription", ""),
-                        "detailTitle": item.get("detailTitle", ""),
-                        "detailUrl": item.get("detailUrl", ""),
-                        "detailScrapedAt": item.get("detailScrapedAt", ""),
-                        "detailDescriptionLength": item.get("detailDescriptionLength", 0),
-                        "detailScrapeStatus": item.get("detailScrapeStatus", "NOT_SCRAPED"),
-                        "detailScrapeError": item.get("detailScrapeError", ""),
                     },
                     force=force
                 )
@@ -1375,7 +1403,13 @@ def scrape_closed(kw: str, cnt: int, force: bool = False) -> List[str]:
 def scrape_active(kw: str, cnt: int, min_p: int = 0, force: bool = False) -> List[str]:
     """抓取活跃商品，新商品自动设为 PENDING"""
     try:
-        items = scrape_auctions(kw, "active", False, min_price=min_p if min_p > 0 else None)
+        items = scrape_auctions(
+            kw,
+            "active",
+            False,
+            min_price=min_p if min_p > 0 else None,
+            scrape_details=False,
+        )
         if min_p > 0:
             items = [i for i in items if si(i.get("price", 0)) >= min_p]
         items = items[:cnt]
@@ -1405,13 +1439,6 @@ def scrape_active(kw: str, cnt: int, min_p: int = 0, force: bool = False) -> Lis
                         "isFreeShipping": item.get("isFreeShipping", False),
                         "itemCondition": item.get("itemCondition"),
                         "thumbnailUrl": item.get("thumbnailUrl", ""),
-                        "detailDescription": item.get("detailDescription", ""),
-                        "detailTitle": item.get("detailTitle", ""),
-                        "detailUrl": item.get("detailUrl", ""),
-                        "detailScrapedAt": item.get("detailScrapedAt", ""),
-                        "detailDescriptionLength": item.get("detailDescriptionLength", 0),
-                        "detailScrapeStatus": item.get("detailScrapeStatus", "NOT_SCRAPED"),
-                        "detailScrapeError": item.get("detailScrapeError", ""),
                     },
                     force=force
                 )
@@ -1561,7 +1588,7 @@ def execute_workflow(kw: str, ac: int, cc: int, force: bool) -> Dict:
                 if should_reanalyze_description(item, pricing):
                     description_recheck_ids.append(aid)
                     logger.info(
-                        "Active item queued for description reanalysis: %s missing=%s net_profit=%s",
+                        "Active item queued for on-demand detail scrape: %s missing=%s net_profit=%s",
                         aid,
                         item.get("missingCriticalParameters", []),
                         pricing.get("netProfitAtCurrentBid", 0),
@@ -1573,32 +1600,47 @@ def execute_workflow(kw: str, ac: int, cc: int, force: bool) -> Dict:
                 logger.error(f"Pricing {aid}: {e}")
 
         # Step 8: 仅对有利润且缺少关键参数的 active 商品使用详情二次分析
+        detail_scraped = 0
         reanalyzed = 0
         repriced = 0
         if description_recheck_ids:
             logger.info(
-                "Step 8: Description reanalysis for %s profitable active items",
+                "Step 8: On-demand detail scrape for %s profitable active items",
                 len(description_recheck_ids),
             )
-            recheck_items = [
-                item for item in (get_record(active_db, aid) for aid in description_recheck_ids)
-                if item
-            ]
-            reanalysis_result = batch_parse(
-                active_db,
-                recheck_items,
-                build_description_parse_prompt,
-                MODEL_BATCH,
-            )
-            result["active_description_reanalysis"] = reanalysis_result
-            reanalyzed = (
-                reanalysis_result.get("parsed", 0)
-                + reanalysis_result.get("review", 0)
-                + reanalysis_result.get("excluded", 0)
-            )
+            recheck_items = []
+            for index, aid in enumerate(description_recheck_ids):
+                check_limits()
+                detail_item = scrape_profitable_active_detail(aid)
+                if detail_item and str(detail_item.get("detailDescription", "")).strip():
+                    recheck_items.append(detail_item)
+                    detail_scraped += 1
+                if index < len(description_recheck_ids) - 1:
+                    time.sleep(_env("DETAIL_REQUEST_INTERVAL", 1.0, float))
+
+            if recheck_items:
+                logger.info(
+                    "Step 9: Description AI reanalysis for %s active items",
+                    len(recheck_items),
+                )
+                reanalysis_result = batch_parse(
+                    active_db,
+                    recheck_items,
+                    build_description_parse_prompt,
+                    MODEL_BATCH,
+                )
+                result["active_description_reanalysis"] = reanalysis_result
+                reanalyzed = (
+                    reanalysis_result.get("parsed", 0)
+                    + reanalysis_result.get("review", 0)
+                    + reanalysis_result.get("excluded", 0)
+                )
 
             # 使用详情补齐后的模型重新计算利润与推荐
-            for aid in description_recheck_ids:
+            for item in recheck_items:
+                aid = str(item.get("itemID", ""))
+                if not aid:
+                    continue
                 try:
                     check_limits()
                     if price_active_item(aid, idx):
@@ -1609,6 +1651,7 @@ def execute_workflow(kw: str, ac: int, cc: int, force: bool) -> Dict:
                     logger.error(f"Repricing after description analysis {aid}: {e}")
         
         result["priced"] = priced
+        result["profitable_detail_scraped"] = detail_scraped
         result["description_reanalyzed"] = reanalyzed
         result["description_repriced"] = repriced
         result["status"] = "COMPLETED"

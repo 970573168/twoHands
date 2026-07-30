@@ -758,8 +758,11 @@ def lambda_handler(event, context):
 # ======================================
 
 def scrape_auctions(keyword, search_type, include_paypay=True,
-                    exclude_keywords="", include_keywords="", min_price=None):
-    """抓取所有页面，并在解析列表时同步抓取详情"""
+                    exclude_keywords="", include_keywords="", min_price=None,
+                    scrape_details=None):
+    """抓取列表页；scrape_details 可显式控制是否同步抓取详情。"""
+    if scrape_details is None:
+        scrape_details = ENABLE_DETAIL_SCRAPE_ON_SEARCH
     if not exclude_keywords and USE_DEFAULT_EXCLUDE:
         exclude_keywords = os.getenv("CUSTOM_EXCLUDE_KEYWORDS", DEFAULT_EXCLUDE_KEYWORDS)
 
@@ -783,8 +786,8 @@ def scrape_auctions(keyword, search_type, include_paypay=True,
         if not items:
             break
 
-        # ========== 关键：列表解析后立即进入详情页抓取 ==========
-        if ENABLE_DETAIL_SCRAPE_ON_SEARCH:
+        # 普通爬虫可同步抓详情；分析工作流会显式关闭并按利润延迟抓取
+        if scrape_details:
             enriched_items = []
             for index, item in enumerate(items):
                 try:
