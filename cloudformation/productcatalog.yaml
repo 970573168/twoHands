@@ -364,7 +364,7 @@ Parameters:
 
   DetailRequestInterval:
     Type: Number
-    Default: 0.8
+    Default: 0.3
     MinValue: 0.1
     MaxValue: 5.0
 
