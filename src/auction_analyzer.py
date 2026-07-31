@@ -66,6 +66,10 @@ def _env(key, default, cast=str):
 
 TABLE_ACTIVE = _env("TABLE_NAME_ACTIVE", "YahooAuctionActiveItems")
 TABLE_CLOSED = _env("TABLE_NAME_CLOSED", "YahooAuctionItems")
+BUY_CANDIDATE_TABLE = os.environ.get(
+    "BUY_CANDIDATE_TABLE", "YahooAuctionBuyCandidates-dev"
+)
+FINAL_CHECK_BEFORE_MINUTES = _env("FINAL_CHECK_BEFORE_MINUTES", 15, int)
 AI_MODE = _env("AI_MODE", "doubao")
 
 _gemini_model = _env("GEMINI_MODEL", "gemini-2.0-flash")
@@ -150,6 +154,7 @@ LOG_AI_RESPONSE_JSON = _env("LOG_AI_RESPONSE_JSON", False, lambda x: x.lower() i
 dynamodb = boto3.resource("dynamodb")
 active_db = dynamodb.Table(TABLE_ACTIVE)
 closed_db = dynamodb.Table(TABLE_CLOSED)
+buy_candidate_db = dynamodb.Table(BUY_CANDIDATE_TABLE)
 secrets = boto3.client("secretsmanager")
 _total_tokens = 0
 _start_time = None
@@ -1516,6 +1521,139 @@ def save_pricing(iid: str, result: Dict, rec: str):
     logger.info(f"Pricing saved: {iid} -> {rec}")
 
 
+def parse_end_epoch(value: str) -> Optional[int]:
+    """将 Yahoo 结束时间转换为 epoch；无法识别时返回 None。"""
+    text = str(value or "").strip()
+    if not text or text.lower() == "unknown":
+        return None
+    try:
+        return int(datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp())
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M"):
+        try:
+            jst = timezone(timedelta(hours=9))
+            return int(datetime.strptime(text, fmt).replace(tzinfo=jst).timestamp())
+        except ValueError:
+            continue
+    return None
+
+
+def upsert_buy_candidate(item_id: str, item: Dict, pricing: Dict):
+    """保存 BUY_CANDIDATE；首次入库只排期，不发送通知。"""
+    market_price = si(pricing.get("estimatedMarketPrice", 0))
+    if market_price <= 0:
+        review_status = "NO_MARKET_PRICE"
+        reminder_status = "NOT_SCHEDULED"
+    else:
+        review_status = "WAITING_FINAL_CHECK"
+        reminder_status = "NOT_SENT"
+
+    now = int(time.time())
+    end_epoch = parse_end_epoch(item.get("endTime"))
+    final_check_at = None
+    candidate_status = "ACTIVE"
+    reminder_error = ""
+    if end_epoch is None:
+        review_status = "INVALID_END_TIME"
+        reminder_status = "NOT_SCHEDULED"
+        reminder_error = "INVALID_END_TIME"
+    elif end_epoch <= now:
+        candidate_status = "EXPIRED"
+        review_status = "EXPIRED"
+        reminder_status = "SKIPPED"
+        final_check_at = now
+    else:
+        final_check_at = max(now, end_epoch - FINAL_CHECK_BEFORE_MINUTES * 60)
+
+    existing = buy_candidate_db.get_item(Key={"itemID": str(item_id)}).get("Item", {})
+    # 已发送是终态，Analyzer 的再次定价不能造成重复提醒。
+    if existing.get("reminderStatus") == "SENT":
+        review_status = existing.get("reviewStatus", "FINAL_CHECK_DONE")
+        reminder_status = "SENT"
+        candidate_status = existing.get("candidateStatus", "ACTIVE")
+
+    models = item.get("models") or [{}]
+    model = models[0] if isinstance(models, list) and models else {}
+    current_price = si(pricing.get("currentBidPrice", item.get("price", 0)))
+    fields = {
+        "title": item.get("title", ""),
+        "url": item.get("url", ""),
+        "thumbnailUrl": item.get("thumbnailUrl", ""),
+        "keyword": item.get("keyword", ""),
+        "brand": model.get("brand", "") if isinstance(model, dict) else "",
+        "model": model.get("model", "") if isinstance(model, dict) else "",
+        "lastAnalyzedAt": now,
+        "updatedAt": now,
+        "firstCurrentPrice": existing.get("firstCurrentPrice", current_price),
+        "currentBidPrice": current_price,
+        "buynowPrice": si(item.get("buynowPrice", 0)),
+        "marketPrice": market_price,
+        "maxActivePrice": int(Decimal(market_price) * ACTIVE_MAX_RATIO),
+        "estimatedMarketPrice": market_price,
+        "netProfitAtCurrentBid": si(pricing.get("netProfitAtCurrentBid", 0)),
+        "profitMarginAtCurrentBid": str(pricing.get("profitMarginAtCurrentBid", 0)),
+        "roiAtCurrentBid": str(pricing.get("roiAtCurrentBid", 0)),
+        "purchaseRecommendation": Recommendation.BUY_CANDIDATE,
+        "pricingConfidence": str(pricing.get("pricingConfidence", 0)),
+        "riskLevel": pricing.get("riskLevel", "HIGH"),
+        "riskScore": si(pricing.get("riskScore", 0)),
+        "shippingCost": int(get_shipping(item)),
+        "endTime": item.get("endTime", ""),
+        "candidateStatus": candidate_status,
+        "reviewStatus": review_status,
+        "reminderStatus": reminder_status,
+        "source": "YahooAuctionAnalyzer",
+    }
+    if end_epoch is not None:
+        fields["endEpoch"] = end_epoch
+    if final_check_at is not None:
+        fields["finalCheckAtEpoch"] = final_check_at
+    if reminder_error:
+        fields["reminderError"] = reminder_error
+
+    expression_names = {}
+    values = {":first_detected": now}
+    assignments = ["firstDetectedAt = if_not_exists(firstDetectedAt, :first_detected)"]
+    for index, (key, value) in enumerate(fields.items()):
+        name = f"#field{index}"
+        expression_names[name] = key
+        token = f":{key}"
+        assignments.append(f"{name} = {token}")
+        values[token] = _to_dynamo(value)
+    buy_candidate_db.update_item(
+        Key={"itemID": str(item_id)},
+        UpdateExpression="SET " + ", ".join(assignments),
+        ExpressionAttributeNames=expression_names,
+        ExpressionAttributeValues=values,
+    )
+    logger.info(
+        "Buy candidate saved: itemID=%s current=%s market=%s profit=%s finalCheckAt=%s",
+        item_id, current_price, market_price,
+        fields["netProfitAtCurrentBid"], final_check_at,
+    )
+
+
+def deactivate_buy_candidate(item_id: str, reason: str):
+    """取消尚未发送提醒的候选记录。"""
+    existing = buy_candidate_db.get_item(Key={"itemID": str(item_id)}).get("Item")
+    if not existing or existing.get("reminderStatus") == "SENT":
+        return
+    now = int(time.time())
+    buy_candidate_db.update_item(
+        Key={"itemID": str(item_id)},
+        UpdateExpression=(
+            "SET candidateStatus = :cancelled, reviewStatus = :cancelled, "
+            "reminderStatus = :skipped, cancelReason = :reason, updatedAt = :now"
+        ),
+        ExpressionAttributeValues={
+            ":cancelled": "CANCELLED", ":skipped": "SKIPPED",
+            ":reason": reason, ":now": now,
+        },
+    )
+    logger.info("Buy candidate cancelled: itemID=%s reason=%s", item_id, reason)
+
+
 def has_usable_model(item: Dict) -> bool:
     """缺少参数或低置信度时仍允许使用已识别出的模型参与初步定价。"""
     models = item.get("models", [])
@@ -1550,6 +1688,14 @@ def price_active_item(item_id: str, idx: Dict[str,List[Dict]]) -> Optional[Dict]
         sd(pricing.get("profitMarginAtCurrentBid", 0)),
     )
     save_pricing(item_id, pricing, recommendation)
+    try:
+        if recommendation == Recommendation.BUY_CANDIDATE:
+            upsert_buy_candidate(item_id, item, pricing)
+        else:
+            deactivate_buy_candidate(item_id, "REPRICED_NOT_BUY_CANDIDATE")
+    except Exception as exc:
+        # 推荐库属于旁路能力，写入失败不能破坏现有 pricing 主流程。
+        logger.exception("Buy candidate sync failed: itemID=%s error=%s", item_id, exc)
     return pricing
 
 
@@ -1629,6 +1775,7 @@ def scrape_closed(kw: str, cnt: int, force: bool = False, source_model: Optional
                         "isFreeShipping": item.get("isFreeShipping", False),
                         "itemCondition": item.get("itemCondition"),
                         "thumbnailUrl": item.get("thumbnailUrl", ""),
+                        "keyword": kw,
                         "sourceModel": source_model or {},
                     },
                     force=force
@@ -1690,6 +1837,7 @@ def scrape_active(kw: str, cnt: int, max_p: int = 0, force: bool = False) -> Lis
                         "isFreeShipping": item.get("isFreeShipping", False),
                         "itemCondition": item.get("itemCondition"),
                         "thumbnailUrl": item.get("thumbnailUrl", ""),
+                        "keyword": kw,
                     },
                     force=force
                 )

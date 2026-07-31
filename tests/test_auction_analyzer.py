@@ -25,6 +25,7 @@ from auction_analyzer import (
     save_active_model,
     save_closed_model,
     scrape_active,
+    upsert_buy_candidate,
     update_record,
 )
 
@@ -58,6 +59,46 @@ class NormalizePricingKeyTest(unittest.TestCase):
 
 
 class LeanAiWorkflowTest(unittest.TestCase):
+    @patch("auction_analyzer.time.time", return_value=1_000)
+    @patch("auction_analyzer.buy_candidate_db")
+    def test_buy_candidate_is_scheduled_without_sending_email(self, candidate_db, _time):
+        candidate_db.get_item.return_value = {}
+        item = {
+            "title": "Nikon lens", "url": "https://example.test/item",
+            "thumbnailUrl": "thumb", "keyword": "Nikon lens",
+            "models": [{"brand": "Nikon", "model": "Z lens"}],
+            "price": 62000, "buynowPrice": 0, "shippingFee": 1000,
+            "endTime": "1970-01-01T00:33:20+00:00",
+        }
+        pricing = {
+            "estimatedMarketPrice": 77000, "currentBidPrice": 62000,
+            "netProfitAtCurrentBid": 11000,
+            "profitMarginAtCurrentBid": Decimal("0.143"),
+            "roiAtCurrentBid": Decimal("0.18"),
+            "pricingConfidence": Decimal("0.80"), "riskLevel": "LOW", "riskScore": 2,
+        }
+
+        upsert_buy_candidate("item-1", item, pricing)
+
+        kwargs = candidate_db.update_item.call_args.kwargs
+        values = kwargs["ExpressionAttributeValues"]
+        self.assertIn("firstDetectedAt = if_not_exists", kwargs["UpdateExpression"])
+        self.assertIn("WAITING_FINAL_CHECK", values.values())
+        self.assertIn("NOT_SENT", values.values())
+        self.assertIn(1100, values.values())
+
+    @patch("auction_analyzer.buy_candidate_db")
+    def test_buy_candidate_with_invalid_end_time_is_not_scheduled(self, candidate_db):
+        candidate_db.get_item.return_value = {}
+
+        upsert_buy_candidate("item-2", {"endTime": "unknown"}, {
+            "estimatedMarketPrice": 10000,
+        })
+
+        values = candidate_db.update_item.call_args.kwargs["ExpressionAttributeValues"]
+        self.assertIn("INVALID_END_TIME", values.values())
+        self.assertIn("NOT_SCHEDULED", values.values())
+
     @patch("auction_analyzer.upsert_scraped_item")
     @patch("auction_analyzer.get_record", return_value=None)
     @patch("auction_analyzer.scrape_auctions")

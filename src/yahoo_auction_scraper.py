@@ -411,6 +411,65 @@ def scrape_item_detail(item_id):
     return result
 
 
+def scrape_active_item_current_price(item_id):
+    """从商品详情页读取最终复核所需的当前价、即决价和结束时间。"""
+    url = build_detail_url(item_id)
+    try:
+        response = requests.get(
+            url, timeout=REQUEST_TIMEOUT, headers={"User-Agent": USER_AGENT}
+        )
+        response.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        logger.warning("Current price request failed for %s: %s", item_id, exc)
+        return None
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    result = {"itemId": str(item_id), "url": url}
+
+    def walk(value, depth=0):
+        if depth > 12:
+            return
+        if isinstance(value, dict):
+            for key, child in value.items():
+                normalized = str(key).lower()
+                if normalized in ("currentprice", "price") and "price" not in result:
+                    try:
+                        result["price"] = int(Decimal(str(child)))
+                    except (ValueError, TypeError, ArithmeticError):
+                        pass
+                elif normalized in ("buynowprice", "buyoutprice") and "buynowPrice" not in result:
+                    try:
+                        result["buynowPrice"] = int(Decimal(str(child)))
+                    except (ValueError, TypeError, ArithmeticError):
+                        pass
+                elif normalized in ("endtime", "enddate", "pricevaliduntil") and "endTime" not in result:
+                    if child:
+                        result["endTime"] = str(child)
+                elif normalized in ("isclosed", "isended", "ended") and child is True:
+                    result["isEnded"] = True
+                walk(child, depth + 1)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child, depth + 1)
+
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            walk(json.loads(script.string or "{}"))
+        except json.JSONDecodeError:
+            continue
+    next_data = soup.find("script", id="__NEXT_DATA__")
+    if next_data:
+        try:
+            walk(json.loads(next_data.string or "{}"))
+        except json.JSONDecodeError:
+            pass
+
+    page_text = soup.get_text(" ", strip=True)
+    if any(marker in page_text for marker in ("オークションは終了", "このオークションは終了")):
+        result["isEnded"] = True
+    return result if int(result.get("price", 0) or 0) > 0 else None
+
+
 def enrich_item_with_detail(item):
     """
     给列表页解析出的 item 补充详情描述。
