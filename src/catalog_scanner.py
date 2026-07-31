@@ -21,11 +21,9 @@ from boto3.dynamodb.conditions import Key
 # ============ 环境变量 ============
 TABLE_NAME = os.environ.get("TABLE_NAME", "ProductCatalog-dev")
 ANALYZER_FUNCTION_NAME = os.environ.get("ANALYZER_FUNCTION_NAME", "YahooAuctionAnalyzer-dev")
-SCAN_INTERVAL_MINUTES = int(os.environ.get("SCAN_INTERVAL_MINUTES", "120"))
 MAX_MODELS_PER_RUN = int(os.environ.get("MAX_MODELS_PER_RUN", "10"))
 MAX_ACTIVE_COUNT = int(os.environ.get("MAX_ACTIVE_COUNT", "20"))
 MAX_CLOSED_COUNT = int(os.environ.get("MAX_CLOSED_COUNT", "50"))
-ENABLE_SCHEDULED_SCAN = os.environ.get("ENABLE_SCHEDULED_SCAN", "false").lower() == "true"
 
 # ============ 平滑控制环境变量 ============
 DISPATCH_INTERVAL_SECONDS = float(os.environ.get("DISPATCH_INTERVAL_SECONDS", "0.3"))
@@ -411,28 +409,11 @@ def lambda_handler(event, context):
     """
     Lambda 入口函数
     
-    支持：
-    1. CloudWatch Events 定时触发
-    2. 手动触发（source != "aws.events"）
+    支持 CloudWatch Events 定时触发和手动触发。
+    定时任务的启停由 EventBridge 规则的 State 统一控制。
     """
     try:
-        # 检查是否启用定时扫描
-        if not ENABLE_SCHEDULED_SCAN:
-            if event.get("source") == "aws.events":
-                log("INFO", "定时扫描已禁用，跳过执行")
-                return {
-                    "statusCode": 200,
-                    "body": json.dumps({
-                        "message": "定时扫描已禁用",
-                        "skipped": True
-                    }, ensure_ascii=False)
-                }
-            else:
-                log("INFO", "定时扫描已禁用，但收到手动触发请求")
-        
-        log("INFO", "Lambda 执行开始",
-            source=event.get("source", "manual"),
-            enable_scheduled_scan=ENABLE_SCHEDULED_SCAN)
+        log("INFO", "Lambda 执行开始", source=event.get("source", "manual"))
         
         # 启动错峰：避免多个定时任务或重试实例同时投递
         startup_jitter = float(event.get("startup_jitter_seconds", STARTUP_JITTER_SECONDS))
