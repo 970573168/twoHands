@@ -160,6 +160,11 @@ _start_time = None
 
 def update_record(table, item_id: str, fields: Dict):
     """更新 DynamoDB 记录（修复 ExpressionAttributeNames 问题）"""
+    fields = {
+        **fields,
+        "modifiedIndexPk": "ALL",
+        "modifiedAt": datetime.now(timezone.utc).isoformat(),
+    }
     parts, values, names = [], {}, {}
     
     for k, v in fields.items():
@@ -207,6 +212,7 @@ def upsert_scraped_item(table, item_id: str, fields: Dict, force: bool = False):
     # ★ 核心：modelStatus 和 pricingStatus 的初始化
     values[":pending"] = Status.PENDING
     values[":now"] = now
+    values[":modified_index_pk"] = "ALL"
     
     if force:
         # 强制重置：覆盖已有状态
@@ -218,6 +224,8 @@ def upsert_scraped_item(table, item_id: str, fields: Dict, force: bool = False):
         parts.append("pricingStatus = if_not_exists(pricingStatus, :pending)")
     
     parts.append("lastScrapedAt = :now")
+    parts.append("modifiedIndexPk = :modified_index_pk")
+    parts.append("modifiedAt = :now")
     
     kwargs = {
         "Key": {"itemID": str(item_id)},
