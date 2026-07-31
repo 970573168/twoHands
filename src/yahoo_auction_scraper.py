@@ -4,6 +4,7 @@ import json
 import time
 import logging
 import ipaddress
+import unicodedata
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlencode, quote
@@ -41,20 +42,31 @@ AUCTION_DETAIL_BASE = os.getenv("AUCTION_DETAIL_BASE", "https://auctions.yahoo.c
 
 # ============ 过滤词库配置 ============
 DEFAULT_EXCLUDE_KEYWORDS = os.getenv("DEFAULT_EXCLUDE_KEYWORDS",
-    "液晶 LCD OLED パネル 画面 タッチパネル フロントパネル バックパネル "
-    "バッテリー 交換用 修理用 補修用 部品 パーツ "
-    "ケーブル ライトニングケーブル Lightning USB-C "
-    "充電器 急速充電 アダプター ACアダプター モバイルバッテリー "
-    "ワイヤレス充電 MagSafe "
-    "ケース カバー 手帳型 フィルム ガラスフィルム 保護フィルム "
-    "液晶フィルム レンズカバー ストラップ ホルダー スタンド "
-    "バンパー リング "
-    "保護 耐衝撃 防水ケース 防塵 ガード "
-    "ジャンク部品 空箱 箱のみ 説明書 付属品のみ "
-    "ケーブルのみ ケースのみ フィルムのみ")
+    "空箱 元箱のみ 説明書 カタログ レンタル")
 
 DEFAULT_INCLUDE_KEYWORDS = os.getenv("DEFAULT_INCLUDE_KEYWORDS", "")
 USE_DEFAULT_EXCLUDE = os.getenv("USE_DEFAULT_EXCLUDE", "true").lower() == "true"
+ENABLE_LOCAL_TITLE_FILTER = os.getenv("ENABLE_LOCAL_TITLE_FILTER", "true").lower() == "true"
+LOCAL_TITLE_FILTER_STRICT = os.getenv("LOCAL_TITLE_FILTER_STRICT", "false").lower() == "true"
+
+
+class LocalListingType:
+    MAIN_PRODUCT = "MAIN_PRODUCT"
+    ACCESSORY = "ACCESSORY"
+    BOX_ONLY = "BOX_ONLY"
+    PARTS = "PARTS"
+    RENTAL = "RENTAL"
+    BUNDLE = "BUNDLE"
+    MANUAL_OR_CATALOG = "MANUAL_OR_CATALOG"
+    CASE_OR_FILM = "CASE_OR_FILM"
+    BATTERY_OR_CHARGER = "BATTERY_OR_CHARGER"
+    ADAPTER_OR_MOUNT = "ADAPTER_OR_MOUNT"
+    REMOTE_ONLY = "REMOTE_ONLY"
+    CAR_AUDIO_OR_CARPLAY = "CAR_AUDIO_OR_CARPLAY"
+    USB_OR_CABLE = "USB_OR_CABLE"
+    CLOTHING_OR_BAG = "CLOTHING_OR_BAG"
+    OTHER_BRAND_NOISE = "OTHER_BRAND_NOISE"
+    UNKNOWN = "UNKNOWN"
 
 # ============ 运输相关关键词 ============
 SHIPPING_RELATED_KEYWORDS = [
@@ -139,11 +151,224 @@ def get_auction_params():
     return params
 
 
+def normalize_title_for_filter(title: str) -> str:
+    """统一全半角、大小写和空白，同时保留日文、英文、数字及型号符号。"""
+    normalized = unicodedata.normalize("NFKC", str(title or "")).upper()
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _contains_any(text, keywords):
+    return any(keyword in text for keyword in keywords)
+
+
+def classify_listing_type_by_title(title: str) -> str:
+    text = normalize_title_for_filter(title)
+    if "本体" in text and _contains_any(text, ("セット", "一式", "まとめ")):
+        return LocalListingType.BUNDLE
+    if _contains_any(text, ("カーディガン", "ショルダーバッグ", "レザーバッグ", "ペンケース", "バッグ", "財布")):
+        return LocalListingType.CLOTHING_OR_BAG
+    rules = (
+        (LocalListingType.RENTAL, (
+            "レンタル", "貸出", "貸し出し", "1日~", "2日間", "往復送料無料", "管理NL",
+        )),
+        (LocalListingType.BOX_ONLY, (
+            "空箱", "箱のみ", "元箱のみ", "外箱のみ", "レンズ用元箱",
+            "元箱 複数", "元箱 4個", "APPLE IPHONE 空箱", "EMPTY BOX", "BOX ONLY",
+        )),
+        (LocalListingType.MANUAL_OR_CATALOG, (
+            "カタログ", "説明書", "取扱説明書", "マニュアル", "パンフレット",
+            "雑誌", "COMMERCIAL PHOTO", "コマーシャル・フォト",
+        )),
+        (LocalListingType.CASE_OR_FILM, (
+            "スマホケース", "手帳型", "ガラスフィルム", "保護フィルム", "液晶フィルム",
+            "レンズカバー", "OVERLAY", "9H", "耐衝撃", "全面保護", "ケース", "カバー", "フィルム",
+        )),
+        (LocalListingType.REMOTE_ONLY, ("リモコン", "VXX", "AXD", "PWW")),
+        (LocalListingType.CAR_AUDIO_OR_CARPLAY, (
+            "CARPLAY", "ANDROID AUTO", "カーオーディオ", "ディスプレイオーディオ",
+            "楽ナビ", "バックカメラ", "カロッツェリア", "IPOD IPHONE",
+        )),
+        (LocalListingType.USB_OR_CABLE, (
+            "USBメモリ", "USB メモリ", "LIGHTNING", "USB-C", "TYPE-C",
+            "HDMI 変換ケーブル", "充電・転送ケーブル", "ミラーリング", "ケーブル",
+        )),
+        (LocalListingType.ADAPTER_OR_MOUNT, (
+            "マウントアダプター", "変換アダプター", "アダプター", "Mマウント", "Lマウント",
+            "L39", "M39", "LM →", "RFマウント", "Eマウントアダプター", "Kマウント", "ヘリコイド付",
+        )),
+        (LocalListingType.ACCESSORY, (
+            "レンズフード", "バヨネットフード", "フードキャップ", "レンズキャップ",
+            "アイカップ", "アイピース", "L型ブラケット", "フォグリップ", "ブラケット",
+            "グリップ", "ストラップ", "センターキャップ", "ヘッドシェル", "ツィーター",
+            "スピーカー", "シェル付きカートリッジ",
+        )),
+        (LocalListingType.BATTERY_OR_CHARGER, (
+            "互換バッテリー", "交換用バッテリー", "バッテリー交換", "修理 電池",
+            "急速充電器", "USB充電器", "ACアダプター", "モバイルバッテリー",
+            "充電器", "LP-E6", "NP-FZ100 互換",
+        )),
+        (LocalListingType.PARTS, (
+            "部品", "パーツ", "修理用", "補修用", "交換用", "部品取り",
+            "ジャンク部品", "背面カメラ", "SIMカードトレイ", "純正イヤホン",
+        )),
+        (LocalListingType.CLOTHING_OR_BAG, (
+            "カーディガン", "ショルダーバッグ", "レザーバッグ", "ペンケース",
+            "バッグ", "財布", "インク", "コンバーター",
+        )),
+    )
+    for listing_type, keywords in rules:
+        if _contains_any(text, keywords):
+            return listing_type
+    if re.search(r"(?:^|\s)(?:1D|2D|AUX)(?:\s|$)", text):
+        return LocalListingType.CAR_AUDIO_OR_CARPLAY
+    # 付属品を列挙しただけの本体商品は bundle にしない。
+    if not ("レンズ" in text and _contains_any(text, ("元箱", "フード付き"))):
+        if _contains_any(text, (
+            "まとめ売り", "5点セット", "2台セット", "4台セット", "5個セット",
+            "まとめ", "セット", "複数", "大量", "一式",
+        )):
+            return LocalListingType.BUNDLE
+    return LocalListingType.MAIN_PRODUCT
+
+
+def _model_tokens(text):
+    normalized = normalize_title_for_filter(text)
+    tokens = re.findall(r"(?=[A-Z0-9.-]*[A-Z])(?=[A-Z0-9.-]*\d)[A-Z0-9][A-Z0-9.-]{3,}", normalized)
+    return list(dict.fromkeys(token.strip(".-") for token in tokens if token.strip(".-")))
+
+
+def detect_target_context(keyword: str, category: str = "", brand: str = "", model: str = "") -> dict:
+    target = normalize_title_for_filter(" ".join((keyword or "", category or "", brand or "", model or "")))
+    keyword_model = normalize_title_for_filter(" ".join((keyword or "", model or "")))
+    def has(values, source=keyword_model):
+        return _contains_any(source, values)
+    return {
+        "is_phone": has(("IPHONE", "スマホ")),
+        "is_camera_body": has(("Α1", "Α7", "Α9", "EOS", "R5", "R6", "Z9", "カメラ")),
+        "is_lens": has(("NIKKOR", "SEL", "FE", "XF", "FUJINON", "SUMMILUX", "LUMIX", "DG", "F1.4", "F2.8", "24-70", "16-55", "24-200", "レンズ")),
+        "is_battery": has(("BL1830B", "BL1860B", "BL1850B", "BL1890", "NP-FZ100", "LP-E6", "バッテリー", "充電池")),
+        "is_charger": has(("充電器", "DC18RF", "ACアダプター", "ACK-E6")),
+        "is_adapter": has(("アダプター", "マウント", "変換")),
+        "is_measurement_device": _contains_any(target, ("KEYSIGHT", "AGILENT", "HIOKI", "ANALYZER", "MULTIMETER", "OSCILLOSCOPE", "FIELDFOX", "N9935B", "B2901A", "B2902A", "L4411A", "DAQ970A", "8163B", "測定器", "アナライザ")),
+        "is_industrial_unit": _contains_any(target, ("MITSUBISHI ELECTRIC", "三菱電機", "AJ65", "GT25", "GT27", "ユニット", "表示器", "GOT")),
+        "is_car_audio": _contains_any(target, ("CARPLAY", "カーオーディオ", "PIONEER", "カロッツェリア")),
+        "is_parts": has(("部品", "パーツ", "修理用", "補修用")),
+        "is_accessory": has(("フード", "キャップ", "グリップ", "ブラケット")),
+        "target_tokens": _model_tokens(" ".join((model or "", keyword or ""))),
+    }
+
+
+def should_filter_item_by_context(item: dict, context: dict, strict: bool = False) -> tuple[bool, str]:
+    listing_type = item.get("localListingType") or classify_listing_type_by_title(item.get("title", ""))
+    item["localListingType"] = listing_type
+    title = normalize_title_for_filter(item.get("title", ""))
+    model_tokens = context.get("target_tokens", [])
+    if context.get("is_measurement_device") and model_tokens:
+        if not any(token in title for token in model_tokens):
+            item["localListingType"] = LocalListingType.OTHER_BRAND_NOISE
+            return True, "DIFFERENT_MEASUREMENT_MODEL"
+    if context.get("is_industrial_unit") and model_tokens:
+        if not any(token in title for token in model_tokens):
+            item["localListingType"] = LocalListingType.OTHER_BRAND_NOISE
+            return True, "DIFFERENT_INDUSTRIAL_MODEL"
+
+    always_filtered = {
+        LocalListingType.RENTAL, LocalListingType.BOX_ONLY,
+        LocalListingType.MANUAL_OR_CATALOG, LocalListingType.CASE_OR_FILM,
+        LocalListingType.REMOTE_ONLY, LocalListingType.USB_OR_CABLE,
+        LocalListingType.CLOTHING_OR_BAG,
+    }
+    if listing_type in always_filtered:
+        return True, listing_type
+    if listing_type == LocalListingType.CAR_AUDIO_OR_CARPLAY:
+        return (False, "TARGET_CAR_AUDIO") if context.get("is_car_audio") else (True, listing_type)
+    if listing_type == LocalListingType.ACCESSORY:
+        if context.get("is_accessory"):
+            return False, "TARGET_ACCESSORY"
+        if context.get("is_lens") or context.get("is_camera_body"):
+            return True, "ACCESSORY_NOT_MAIN_PRODUCT"
+    if listing_type == LocalListingType.ADAPTER_OR_MOUNT and not context.get("is_adapter"):
+        return True, "ADAPTER_NOT_TARGET"
+    if listing_type == LocalListingType.BATTERY_OR_CHARGER:
+        if context.get("is_battery") or context.get("is_charger"):
+            return False, "TARGET_BATTERY_OR_CHARGER"
+        return True, "BATTERY_OR_CHARGER_NOT_TARGET"
+    if listing_type == LocalListingType.PARTS and not context.get("is_parts"):
+        return True, "PARTS_NOT_TARGET"
+    if listing_type == LocalListingType.BUNDLE and strict:
+        return True, "BUNDLE_STRICT"
+    return False, ""
+
+
+def sanitize_search_keyword(keyword: str) -> str:
+    text = unicodedata.normalize("NFKC", str(keyword or ""))
+    text = re.sub(r"[/()\[\]{}|→＋+]", " ", text)
+    text = re.sub(r"[^A-Za-z0-9ぁ-んァ-ヶ一-龥々ー.\-\sΑ-Ωα-ω]", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def simplify_search_keyword(keyword: str) -> str:
+    sanitized = sanitize_search_keyword(keyword)
+    words = sanitized.split()
+    if not words:
+        return ""
+    if len(words) <= 6:
+        return sanitized
+    tokens = _model_tokens(sanitized)
+    brand = words[0]
+    strongest = max(tokens, key=lambda token: (any(c.isdigit() for c in token), len(token)), default="")
+    if strongest and strongest.upper() != brand.upper():
+        return f"{brand} {strongest}"
+    return " ".join(words[:4])
+
+
+def build_contextual_exclude_keywords(event):
+    context = detect_target_context(
+        event.get("keyword", ""), event.get("category", ""),
+        event.get("brand", ""), event.get("model", ""),
+    )
+    words = ["空箱", "元箱のみ", "説明書", "カタログ", "レンタル"]
+    if context["is_lens"] or context["is_camera_body"] or context["is_phone"]:
+        words.extend(("ケース", "フィルム", "互換バッテリー", "レンズフード", "レンズキャップ"))
+        if not context["is_charger"]:
+            words.append("充電器")
+    if context["is_measurement_device"]:
+        words.extend(("ケース", "ケーブル", "取扱説明書", "カタログ"))
+        target = normalize_title_for_filter(" ".join((event.get("keyword", ""), event.get("model", ""))))
+        if "PROBE" not in target and "プローブ" not in target:
+            words.append("プローブ")
+    return " ".join(dict.fromkeys(words))
+
+
+def _optional_bool(value):
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    return str(value).lower() in ("true", "1", "yes")
+
+
+def _search_context_kwargs(event):
+    source_model = event.get("sourceModel", {}) or {}
+    if not isinstance(source_model, dict):
+        source_model = {}
+    return {
+        "category": event.get("category", ""),
+        "brand": event.get("brand", source_model.get("brand", "")),
+        "model": event.get("model", source_model.get("model", "")),
+        "enable_local_title_filter": _optional_bool(event.get("enable_local_title_filter")),
+        "local_title_filter_strict": _optional_bool(event.get("local_title_filter_strict")),
+    }
+
+
 def get_filter_keywords(event):
     """从事件中获取过滤关键词"""
-    exclude_keywords = event.get("exclude_keywords", "")
-    if not exclude_keywords and USE_DEFAULT_EXCLUDE:
-        exclude_keywords = os.getenv("CUSTOM_EXCLUDE_KEYWORDS", DEFAULT_EXCLUDE_KEYWORDS)
+    if "exclude_keywords" in event:
+        exclude_keywords = event.get("exclude_keywords", "")
+    elif USE_DEFAULT_EXCLUDE:
+        exclude_keywords = build_contextual_exclude_keywords(event)
+    else:
+        exclude_keywords = ""
     
     include_keywords = event.get("include_keywords", "")
     if not include_keywords:
@@ -174,7 +399,7 @@ def build_url(keyword, page, search_type, exclude_keywords="", include_keywords=
     params.update(get_auction_params())
     # Yahoo 的普通搜索框使用 p。此前改成高级搜索参数 va 后，部分关键词
     # （尤其是型号、英文编号）会得到不同或空的结果集。
-    params["p"] = keyword
+    params["p"] = sanitize_search_keyword(keyword)
     params["abatch"] = AUCTION_ABATCH
     
     if include_keywords:
@@ -411,6 +636,65 @@ def scrape_item_detail(item_id):
     return result
 
 
+def scrape_active_item_current_price(item_id):
+    """从商品详情页读取最终复核所需的当前价、即决价和结束时间。"""
+    url = build_detail_url(item_id)
+    try:
+        response = requests.get(
+            url, timeout=REQUEST_TIMEOUT, headers={"User-Agent": USER_AGENT}
+        )
+        response.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        logger.warning("Current price request failed for %s: %s", item_id, exc)
+        return None
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    result = {"itemId": str(item_id), "url": url}
+
+    def walk(value, depth=0):
+        if depth > 12:
+            return
+        if isinstance(value, dict):
+            for key, child in value.items():
+                normalized = str(key).lower()
+                if normalized in ("currentprice", "price") and "price" not in result:
+                    try:
+                        result["price"] = int(Decimal(str(child)))
+                    except (ValueError, TypeError, ArithmeticError):
+                        pass
+                elif normalized in ("buynowprice", "buyoutprice") and "buynowPrice" not in result:
+                    try:
+                        result["buynowPrice"] = int(Decimal(str(child)))
+                    except (ValueError, TypeError, ArithmeticError):
+                        pass
+                elif normalized in ("endtime", "enddate", "pricevaliduntil") and "endTime" not in result:
+                    if child:
+                        result["endTime"] = str(child)
+                elif normalized in ("isclosed", "isended", "ended") and child is True:
+                    result["isEnded"] = True
+                walk(child, depth + 1)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child, depth + 1)
+
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            walk(json.loads(script.string or "{}"))
+        except json.JSONDecodeError:
+            continue
+    next_data = soup.find("script", id="__NEXT_DATA__")
+    if next_data:
+        try:
+            walk(json.loads(next_data.string or "{}"))
+        except json.JSONDecodeError:
+            pass
+
+    page_text = soup.get_text(" ", strip=True)
+    if any(marker in page_text for marker in ("オークションは終了", "このオークションは終了")):
+        result["isEnded"] = True
+    return result if int(result.get("price", 0) or 0) > 0 else None
+
+
 def enrich_item_with_detail(item):
     """
     给列表页解析出的 item 补充详情描述。
@@ -495,7 +779,9 @@ def scrape_multiple_details(item_ids, save_to_db=False, search_type="active"):
                                 detailUrl = :url,
                                 detailScrapedAt = :now,
                                 detailDescriptionLength = :length,
-                                detailScrapeStatus = :status
+                                detailScrapeStatus = :status,
+                                modifiedIndexPk = :modified_index_pk,
+                                modifiedAt = :now
                         """,
                         ExpressionAttributeValues={
                             ":desc": desc[:DETAIL_DESCRIPTION_MAX_CHARS],
@@ -510,6 +796,7 @@ def scrape_multiple_details(item_ids, save_to_db=False, search_type="active"):
                             ":now": detail.get("scrapedAt", datetime.now(timezone.utc).isoformat()),
                             ":length": len(desc),
                             ":status": "COMPLETED" if desc else "EMPTY",
+                            ":modified_index_pk": "ALL",
                         }
                     )
                 except Exception as e:
@@ -562,7 +849,8 @@ def lambda_handler(event, context):
         logger.info(f"Scraping for keyword: '{keyword}', type: '{search_type}'")
         
         items = scrape_auctions(keyword, search_type, include_paypay,
-                                exclude_keywords, include_keywords, min_price)
+                                exclude_keywords, include_keywords, min_price,
+                                **_search_context_kwargs(event))
         
         if not items:
             return {
@@ -636,7 +924,9 @@ def lambda_handler(event, context):
                             detailUrl = :url,
                             detailScrapedAt = :now,
                             detailDescriptionLength = :len,
-                            detailScrapeStatus = :status
+                            detailScrapeStatus = :status,
+                            modifiedIndexPk = :modified_index_pk,
+                            modifiedAt = :now
                     """,
                     ExpressionAttributeValues={
                         ":desc": detail["description"],
@@ -650,7 +940,8 @@ def lambda_handler(event, context):
                         ":url": detail["url"],
                         ":now": detail["scrapedAt"],
                         ":len": len(detail["description"]),
-                        ":status": "COMPLETED" if detail["description"] else "EMPTY"
+                        ":status": "COMPLETED" if detail["description"] else "EMPTY",
+                        ":modified_index_pk": "ALL",
                     }
                 )
             except Exception as e:
@@ -715,7 +1006,8 @@ def lambda_handler(event, context):
         exclude_keywords, include_keywords = get_filter_keywords(event)
         
         items = scrape_auctions(keyword, search_type, include_paypay,
-                                exclude_keywords, include_keywords, event.get("min_price"))
+                                exclude_keywords, include_keywords, event.get("min_price"),
+                                **_search_context_kwargs(event))
         
         if not items:
             return {
@@ -764,12 +1056,20 @@ def lambda_handler(event, context):
 
 def scrape_auctions(keyword, search_type, include_paypay=True,
                     exclude_keywords="", include_keywords="", min_price=None,
-                    scrape_details=None):
+                    scrape_details=None, category="", brand="", model="",
+                    enable_local_title_filter=None,
+                    local_title_filter_strict=None):
     """抓取列表页；scrape_details 可显式控制是否同步抓取详情。"""
     if scrape_details is None:
         scrape_details = ENABLE_DETAIL_SCRAPE_ON_SEARCH
     if not exclude_keywords and USE_DEFAULT_EXCLUDE:
-        exclude_keywords = os.getenv("CUSTOM_EXCLUDE_KEYWORDS", DEFAULT_EXCLUDE_KEYWORDS)
+        exclude_keywords = build_contextual_exclude_keywords({
+            "keyword": keyword, "category": category, "brand": brand, "model": model,
+        })
+    if enable_local_title_filter is None:
+        enable_local_title_filter = ENABLE_LOCAL_TITLE_FILTER
+    if local_title_filter_strict is None:
+        local_title_filter_strict = LOCAL_TITLE_FILTER_STRICT
 
     if not include_keywords:
         include_keywords = DEFAULT_INCLUDE_KEYWORDS
@@ -783,6 +1083,33 @@ def scrape_auctions(keyword, search_type, include_paypay=True,
         try:
             resp = requests.get(url, timeout=REQUEST_TIMEOUT, headers={"User-Agent": USER_AGENT})
             resp.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            if e.response is not None and e.response.status_code == 404:
+                simplified = simplify_search_keyword(keyword)
+                if simplified:
+                    retry_url = build_url(
+                        simplified, page, search_type, exclude_keywords,
+                        include_keywords, min_price,
+                    )
+                    logger.warning(
+                        "Search returned 404; retrying once: original=%s simplified=%s",
+                        keyword, simplified,
+                    )
+                    try:
+                        resp = requests.get(
+                            retry_url, timeout=REQUEST_TIMEOUT,
+                            headers={"User-Agent": USER_AGENT},
+                        )
+                        resp.raise_for_status()
+                    except requests.exceptions.RequestException as retry_error:
+                        logger.error("Simplified search retry failed for page %s: %s", page, retry_error)
+                        continue
+                else:
+                    logger.error("Request failed for page %s: %s", page, e)
+                    continue
+            else:
+                logger.error("Request failed for page %s: %s", page, e)
+                continue
         except requests.exceptions.RequestException as e:
             logger.error(f"Request failed for page {page}: {e}")
             continue
@@ -790,6 +1117,29 @@ def scrape_auctions(keyword, search_type, include_paypay=True,
         items = parse_html(resp.text, search_type, include_paypay)
         if not items:
             break
+        parsed_item_count = len(items)
+
+        if enable_local_title_filter:
+            context = detect_target_context(keyword, category, brand, model)
+            before = len(items)
+            kept, removed = [], []
+            for item in items:
+                should_filter, reason = should_filter_item_by_context(
+                    item, context, strict=local_title_filter_strict,
+                )
+                item["localFilterReason"] = reason
+                (removed if should_filter else kept).append(item)
+            logger.info(
+                "Local title filter: keyword=%s before=%s after=%s removed=%s",
+                keyword, before, len(kept), len(removed),
+            )
+            for item in removed[:10]:
+                logger.info(
+                    "Filtered item: type=%s reason=%s title=%s",
+                    item.get("localListingType"), item.get("localFilterReason"),
+                    item.get("title", "")[:160],
+                )
+            items = kept
 
         # 普通爬虫可同步抓详情；分析工作流会显式关闭并按利润延迟抓取
         if scrape_details:
@@ -813,7 +1163,7 @@ def scrape_auctions(keyword, search_type, include_paypay=True,
 
         all_items.extend(items)
 
-        if len(items) < ITEMS_PER_PAGE:
+        if parsed_item_count < ITEMS_PER_PAGE:
             break
 
     logger.info(f"Total items scraped: {len(all_items)}")
@@ -1221,6 +1571,8 @@ def parse_item(li, include_paypay=True):
         "itemId": item_id,
         "itemType": item_type,
         "title": title,
+        "localListingType": classify_listing_type_by_title(title),
+        "localFilterReason": "",
         "price": price,
         "buynowPrice": buynow_price,
         "shippingFee": shipping["shippingFee"],
@@ -1274,11 +1626,16 @@ def save_items(items, table):
     for item in items:
         try:
             item_key = item["itemId"]
+            modified_at = datetime.now(timezone.utc).isoformat()
             table.put_item(
                 Item={
                     "itemID": item_key,
+                    "modifiedIndexPk": "ALL",
+                    "modifiedAt": modified_at,
                     "itemType": item.get("itemType", "unknown"),
                     "title": item.get("title", ""),
+                    "localListingType": item.get("localListingType", LocalListingType.UNKNOWN),
+                    "localFilterReason": item.get("localFilterReason", ""),
                     "price": item.get("price", 0),
                     "buynowPrice": item.get("buynowPrice"),
                     "shippingFee": item.get("shippingFee"),
@@ -1330,6 +1687,7 @@ def save_items(items, table):
                     "sellerRating = :seller_rating", "sellerType = :seller_type",
                     "prefecture = :prefecture", "itemCondition = :item_condition",
                     "#item_url = :item_url", "thumbnailUrl = :thumbnail", "scrapedAt = :scraped_at",
+                    "localListingType = :local_listing_type", "localFilterReason = :local_filter_reason",
                 ]
                 if title:
                     list_updates.insert(0, "#item_title = :item_title")
@@ -1349,7 +1707,9 @@ def save_items(items, table):
                             detailDescriptionLength = :detail_len,
                             detailScrapeStatus = :detail_status,
                             detailScrapeError = :detail_error,
-                            lastDetailUpdatedAt = :now
+                            lastDetailUpdatedAt = :now,
+                            modifiedIndexPk = :modified_index_pk,
+                            modifiedAt = :now
                     """,
                     ExpressionAttributeNames={
                         "#item_url": "url",
@@ -1372,6 +1732,9 @@ def save_items(items, table):
                         ":item_url": item.get("url") or "",
                         ":thumbnail": item.get("thumbnailUrl") or "",
                         ":scraped_at": item.get("scrapedAt") or datetime.now(timezone.utc).isoformat(),
+                        ":local_listing_type": item.get("localListingType", LocalListingType.UNKNOWN),
+                        ":local_filter_reason": item.get("localFilterReason", ""),
+                        ":modified_index_pk": "ALL",
                         ":desc": item.get("detailDescription", ""),
                         ":raw": item.get("detailDescriptionRaw", ""),
                         ":cleaned": item.get("detailDescriptionCleaned", ""),

@@ -1003,9 +1003,9 @@ def upsert_category(category):
         now = int(time.time())
         table.update_item(
             Key={"PK": f"CATEGORY#{key_part(category)}", "SK": "META"},
-            UpdateExpression="SET entity_type = :type, #name = :name, #status = :status, first_seen_at = if_not_exists(first_seen_at, :now), last_seen_at = :now, #source = :source",
+            UpdateExpression="SET entity_type = :type, #name = :name, #status = :status, first_seen_at = if_not_exists(first_seen_at, :now), last_seen_at = :now, modified_index_pk = :all, modified_at = :modified_at, #source = :source",
             ExpressionAttributeNames={"#name": "name", "#status": "status", "#source": "source"},
-            ExpressionAttributeValues={":type": "CATEGORY", ":name": category, ":status": "ACTIVE", ":now": now, ":source": DATA_SOURCE}
+            ExpressionAttributeValues={":type": "CATEGORY", ":name": category, ":status": "ACTIVE", ":now": now, ":all": "ALL", ":modified_at": datetime.now(timezone.utc).isoformat(), ":source": DATA_SOURCE}
         )
         if _tracker: _tracker.record_db_operation("upsert_category", 1)
     except Exception as e:
@@ -1021,9 +1021,9 @@ def upsert_brand(category, brand):
         now = int(time.time())
         table.update_item(
             Key={"PK": f"CATEGORY#{key_part(category)}", "SK": f"BRAND#{key_part(brand)}"},
-            UpdateExpression="SET entity_type = :type, category = :category, brand = :brand, #status = :status, first_seen_at = if_not_exists(first_seen_at, :now), last_seen_at = :now, #source = :source",
+            UpdateExpression="SET entity_type = :type, category = :category, brand = :brand, #status = :status, first_seen_at = if_not_exists(first_seen_at, :now), last_seen_at = :now, modified_index_pk = :all, modified_at = :modified_at, #source = :source",
             ExpressionAttributeNames={"#status": "status", "#source": "source"},
-            ExpressionAttributeValues={":type": "BRAND", ":category": category, ":brand": brand, ":status": "ACTIVE", ":now": now, ":source": DATA_SOURCE}
+            ExpressionAttributeValues={":type": "BRAND", ":category": category, ":brand": brand, ":status": "ACTIVE", ":now": now, ":all": "ALL", ":modified_at": datetime.now(timezone.utc).isoformat(), ":source": DATA_SOURCE}
         )
         if _tracker: _tracker.record_db_operation("upsert_brand", 1)
     except Exception as e:
@@ -1072,12 +1072,14 @@ def upsert_product(category, brand, model, confidence=None, release_date=None, o
             "SET entity_type = :type, category = :category, brand = :brand, "
             "model = :model, normalized_model = :normalized_model, "
             "#status = :status, verification_status = if_not_exists(verification_status, :unverified), "
-            "first_seen_at = if_not_exists(first_seen_at, :now), last_seen_at = :now, #source = :source"
+            "first_seen_at = if_not_exists(first_seen_at, :now), last_seen_at = :now, "
+            "modified_index_pk = :all, modified_at = :modified_at, #source = :source"
         )
         values = {
             ":type": "PRODUCT", ":category": category, ":brand": brand,
             ":model": model, ":normalized_model": normalize(model).casefold(),
-            ":status": "ACTIVE", ":unverified": "UNVERIFIED", ":now": now, ":source": DATA_SOURCE
+            ":status": "ACTIVE", ":unverified": "UNVERIFIED", ":now": now,
+            ":all": "ALL", ":modified_at": datetime.now(timezone.utc).isoformat(), ":source": DATA_SOURCE
         }
         
         if confidence is not None:
@@ -1124,6 +1126,8 @@ def upsert_product(category, brand, model, confidence=None, release_date=None, o
             "entity_type": "BRAND_MODEL",
             "category": category, "brand": brand, "model": model,
             "product_pk": product_pk, "last_seen_at": now,
+            "modified_index_pk": "ALL",
+            "modified_at": datetime.now(timezone.utc).isoformat(),
             "auction_analysis_score": auction_check["score"],
             "auction_analysis_risk_level": auction_check["risk_level"],
             "catalog_scan_disabled": auction_check["catalog_scan_disabled"],
