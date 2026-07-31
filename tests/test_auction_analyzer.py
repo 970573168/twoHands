@@ -21,6 +21,7 @@ from auction_analyzer import (
     build_description_parse_prompt,
     calc_market_price,
     calc_decision,
+    execute_workflow,
     normalize_pricing_key,
     pricing_key_with_condition,
     resolve_closed_without_ai,
@@ -118,10 +119,33 @@ class LeanAiWorkflowTest(unittest.TestCase):
             "itemID": "a1",
             "title": "NIKKOR Z 85mm 元箱",
             "detailDescription": "レンズ無し。元箱とマニュアルのみです。",
+            "sourceModel": {"brand": "Nikon", "model": "NIKKOR Z 85mm f/1.2 S"},
         }])
+        self.assertIn(
+            '"sourceModel":{"brand":"Nikon","model":"NIKKOR Z 85mm f/1.2 S","aliases":[]}',
+            prompt,
+        )
+        self.assertEqual(prompt.count('"sourceModel"'), 1)
+        self.assertIn('"matched": true', prompt)
         self.assertIn("レンズ無し", prompt)
         self.assertIn("本体は含まれません", prompt)
         self.assertIn("listingType は BOX_ONLY または ACCESSORY", prompt)
+
+    @patch("auction_analyzer.update_record")
+    def test_detail_source_model_mismatch_is_excluded(self, update_record):
+        status = save_model(Mock(), "a1", {
+            "matched": False,
+            "brand": "Sony",
+            "model": "INZONE H3",
+            "listingType": ListingType.MAIN_PRODUCT,
+            "condition": "USED",
+        }, {"sourceModel": {"brand": "Sony", "model": "PlayStation 5"}})
+
+        fields = update_record.call_args.args[2]
+        self.assertEqual(status, Status.EXCLUDED)
+        self.assertEqual(fields["models"], [])
+        self.assertEqual(fields["exclusionReason"], "SOURCE_MODEL_MISMATCH")
+        self.assertFalse(fields["isAnalysisEligible"])
 
     @patch("auction_analyzer.update_record")
     def test_detail_reanalysis_excludes_box_only_from_pricing(self, update_record):
@@ -188,12 +212,18 @@ class LeanAiWorkflowTest(unittest.TestCase):
             {"itemId": "expensive", "price": 101},
         ]
 
-        item_ids = scrape_active("camera", 10, max_p=100)
+        source_model = {"brand": "Sony", "model": "PlayStation 5"}
+        item_ids = scrape_active("camera", 10, max_p=100, source_model=source_model)
 
         self.assertEqual(item_ids, ["cheap", "limit"])
         self.assertNotIn("min_price", scrape_auctions.call_args.kwargs)
         saved_ids = [call.args[1] for call in upsert_scraped_item.call_args_list]
         self.assertEqual(saved_ids, ["cheap", "limit"])
+        for call in upsert_scraped_item.call_args_list:
+            self.assertEqual(call.args[2]["sourceModel"], source_model)
+            # A record without a previous sourceModel must be reset so that an
+            # old model result can never be reused for this target.
+            self.assertTrue(call.kwargs["force"])
 
     @patch("auction_analyzer.get_record")
     def test_market_price_uses_filtered_closed_median(self, get_record):
@@ -202,7 +232,6 @@ class LeanAiWorkflowTest(unittest.TestCase):
             "2": {"modelStatus": Status.COMPLETED, "listingType": "MAIN_PRODUCT", "price": 105},
             "3": {"modelStatus": Status.COMPLETED, "listingType": "MAIN_PRODUCT", "price": 110},
             "4": {"modelStatus": Status.COMPLETED, "listingType": "MAIN_PRODUCT", "price": 115},
-            "5": {"modelStatus": Status.COMPLETED, "listingType": "MAIN_PRODUCT", "price": 10000},
             "excluded": {"modelStatus": Status.COMPLETED, "listingType": "ACCESSORY", "price": 50},
             "pending": {"modelStatus": Status.PENDING, "listingType": "MAIN_PRODUCT", "price": 90},
         }
@@ -210,23 +239,105 @@ class LeanAiWorkflowTest(unittest.TestCase):
 
         result = calc_market_price(list(records))
 
-        self.assertEqual(result, {
-            "market_price": 107,
-            "avg_price": 107,
-            "median_price": 107,
-            "count": 4,
-            "raw_count": 5,
+        self.assertEqual(result["market_price"], 107)
+        self.assertEqual(result["avg_price"], 107)
+        self.assertEqual(result["median_price"], 107)
+        self.assertEqual(result["count"], 4)
+        self.assertEqual(result["raw_count"], 4)
+        self.assertFalse(result["market_price_suspicious"])
+        self.assertFalse(result["price_filter"]["low_price_cluster_removed"])
+
+    @patch("auction_analyzer.get_record")
+    def test_market_price_removes_low_price_accessory_cluster(self, get_record):
+        prices = [980, 1500, 2500, 3980, 4980, 6800, 8900, 98000, 110000, 125000]
+        records = {
+            str(index): {
+                "itemID": str(index),
+                "title": f"closed item {index}",
+                "modelStatus": Status.COMPLETED,
+                "listingType": ListingType.MAIN_PRODUCT,
+                "price": price,
+            }
+            for index, price in enumerate(prices)
+        }
+        get_record.side_effect = lambda _table, item_id: records[item_id]
+
+        result = calc_market_price(list(records))
+
+        self.assertEqual(result["market_price"], 110000)
+        self.assertEqual(result["avg_price"], 111000)
+        self.assertEqual(result["count"], 3)
+        self.assertEqual(result["raw_count"], 10)
+        self.assertFalse(result["market_price_suspicious"])
+        self.assertEqual(result["price_filter"], {
+            "low_price_cluster_removed": True,
+            "removed_low_price_count": 7,
+            "max_gap_ratio": "11.011",
+            "split_low_max": 8900,
+            "split_high_min": 98000,
         })
+
+    @patch("auction_analyzer.get_record")
+    def test_market_price_is_suspicious_when_high_cluster_is_too_small(self, get_record):
+        records = {
+            "1": {"modelStatus": Status.COMPLETED, "listingType": "MAIN_PRODUCT", "price": 100},
+            "2": {"modelStatus": Status.COMPLETED, "listingType": "MAIN_PRODUCT", "price": 105},
+            "3": {"modelStatus": Status.COMPLETED, "listingType": "MAIN_PRODUCT", "price": 110},
+            "4": {"modelStatus": Status.COMPLETED, "listingType": "MAIN_PRODUCT", "price": 10000},
+        }
+        get_record.side_effect = lambda _table, item_id: records[item_id]
+
+        result = calc_market_price(list(records))
+
+        self.assertTrue(result["market_price_suspicious"])
+        self.assertEqual(result["market_price"], 0)
+        self.assertEqual(result["raw_count"], 4)
+
+    @patch("auction_analyzer.get_record")
+    def test_market_price_is_suspicious_without_a_usable_gap(self, get_record):
+        prices = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
+        get_record.side_effect = lambda _table, item_id: {
+            "modelStatus": Status.COMPLETED,
+            "listingType": ListingType.MAIN_PRODUCT,
+            "price": prices[int(item_id)],
+        }
+
+        result = calc_market_price([str(index) for index in range(len(prices))])
+
+        self.assertTrue(result["market_price_suspicious"])
+        self.assertEqual(result["price_filter"]["max_gap_ratio"], "2.000")
+
+    @patch("auction_analyzer.scrape_active")
+    @patch("auction_analyzer.calc_market_price")
+    @patch("auction_analyzer.get_record")
+    @patch("auction_analyzer.scrape_closed", return_value=["c1"])
+    @patch("auction_analyzer.check_limits")
+    def test_workflow_skips_active_when_market_price_is_suspicious(
+        self, _check_limits, _scrape_closed, get_record, calc_market_price, scrape_active
+    ):
+        get_record.return_value = {"itemID": "c1", "modelStatus": Status.COMPLETED}
+        calc_market_price.return_value = {
+            "market_price": 0,
+            "market_price_suspicious": True,
+            "raw_count": 4,
+            "price_filter": {"low_price_cluster_removed": False},
+        }
+
+        result = execute_workflow("Nikon Z 7II", 10, 10, False, {
+            "brand": "Nikon", "model": "Z 7II",
+        })
+
+        self.assertEqual(result["status"], "MARKET_PRICE_SUSPICIOUS")
+        self.assertTrue(result["market_price_suspicious"])
+        scrape_active.assert_not_called()
 
     @patch("auction_analyzer.get_record", return_value=None)
     def test_market_price_returns_zero_statistics_without_prices(self, _get_record):
-        self.assertEqual(calc_market_price(["missing"]), {
-            "market_price": 0,
-            "avg_price": 0,
-            "median_price": 0,
-            "count": 0,
-            "raw_count": 0,
-        })
+        result = calc_market_price(["missing"])
+        self.assertEqual(result["market_price"], 0)
+        self.assertEqual(result["count"], 0)
+        self.assertEqual(result["raw_count"], 0)
+        self.assertFalse(result["market_price_suspicious"])
 
     def test_every_analyzer_update_refreshes_modified_order_fields(self):
         table = Mock()
@@ -240,13 +351,20 @@ class LeanAiWorkflowTest(unittest.TestCase):
             r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}",
         )
 
-    def test_active_prompt_keeps_item_id_and_only_requests_brand_model(self):
-        prompt = build_active_parse_prompt([{"itemID": "a1", "title": "Apple iPhone 15" + "x" * 200}])
+    def test_active_prompt_compares_title_with_source_model(self):
+        prompt = build_active_parse_prompt([{
+            "itemID": "a1",
+            "title": "Sony INZONE H3" + "x" * 200,
+            "sourceModel": {"brand": "Sony", "model": "PlayStation 5"},
+        }])
         self.assertIn('"itemId":"a1"', prompt)
-        self.assertIn('"models"', prompt)
+        self.assertIn('"sourceModel":{"brand":"Sony","model":"PlayStation 5"}', prompt)
+        self.assertIn('"matched":true', prompt)
         self.assertIn('"listingType":"MAIN_PRODUCT"', prompt)
+        self.assertIn("違う商品本体", prompt)
         self.assertIn("レンタルはRENTAL", prompt)
         self.assertNotIn("x" * 121, prompt)
+        self.assertEqual(prompt.count('"sourceModel"'), 1)
         for forbidden in (
             "confidence", "evidence", "reason", "exclusionReason", "condition",
             "conditionClass", "riskFactors",
@@ -310,6 +428,38 @@ class LeanAiWorkflowTest(unittest.TestCase):
         fields = update_record.call_args.args[2]
         self.assertEqual(status, Status.COMPLETED)
         self.assertEqual(fields["pricingStatus"], Status.PENDING)
+        self.assertTrue(fields["isAnalysisEligible"])
+
+    @patch("auction_analyzer.update_record")
+    def test_active_different_main_product_is_excluded_from_pricing(self, update_record):
+        source_model = {"brand": "Sony", "model": "PlayStation 5"}
+        status = save_active_model(Mock(), "different", {
+            "matched": False,
+            "listingType": ListingType.MAIN_PRODUCT,
+        }, {
+            "title": "Sony INZONE H3",
+            "sourceModel": source_model,
+        })
+
+        fields = update_record.call_args.args[2]
+        self.assertEqual(status, Status.EXCLUDED)
+        self.assertEqual(fields["models"], [])
+        self.assertEqual(fields["listingType"], ListingType.MAIN_PRODUCT)
+        self.assertEqual(fields["pricingStatus"], Status.NOT_APPLICABLE)
+        self.assertFalse(fields["isAnalysisEligible"])
+
+    @patch("auction_analyzer.update_record")
+    def test_active_matched_product_uses_source_model_for_pricing(self, update_record):
+        source_model = {"brand": "Sony", "model": "PlayStation 5"}
+        status = save_active_model(Mock(), "matched", {
+            "matched": True,
+            "listingType": ListingType.MAIN_PRODUCT,
+        }, {"sourceModel": source_model})
+
+        fields = update_record.call_args.args[2]
+        self.assertEqual(status, Status.COMPLETED)
+        self.assertEqual(fields["models"][0]["brand"], "Sony")
+        self.assertEqual(fields["models"][0]["model"], "PlayStation 5")
         self.assertTrue(fields["isAnalysisEligible"])
 
     @patch("auction_analyzer.update_record")
