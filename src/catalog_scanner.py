@@ -28,11 +28,11 @@ MAX_CLOSED_COUNT = int(os.environ.get("MAX_CLOSED_COUNT", "50"))
 ENABLE_SCHEDULED_SCAN = os.environ.get("ENABLE_SCHEDULED_SCAN", "false").lower() == "true"
 
 # ============ 平滑控制环境变量 ============
-DISPATCH_INTERVAL_SECONDS = float(os.environ.get("DISPATCH_INTERVAL_SECONDS", "5"))
-DISPATCH_JITTER_SECONDS = float(os.environ.get("DISPATCH_JITTER_SECONDS", "3"))
-STARTUP_JITTER_SECONDS = float(os.environ.get("STARTUP_JITTER_SECONDS", "10"))
-BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "1"))
-BATCH_INTERVAL_SECONDS = float(os.environ.get("BATCH_INTERVAL_SECONDS", "0"))
+DISPATCH_INTERVAL_SECONDS = float(os.environ.get("DISPATCH_INTERVAL_SECONDS", "0.3"))
+DISPATCH_JITTER_SECONDS = float(os.environ.get("DISPATCH_JITTER_SECONDS", "0.2"))
+STARTUP_JITTER_SECONDS = float(os.environ.get("STARTUP_JITTER_SECONDS", "1"))
+BATCH_SIZE = int(os.environ.get("BATCH_SIZE", "5"))
+BATCH_INTERVAL_SECONDS = float(os.environ.get("BATCH_INTERVAL_SECONDS", "1"))
 
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table(TABLE_NAME)
