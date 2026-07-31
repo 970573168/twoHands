@@ -666,10 +666,10 @@ def _parse_json(content: str) -> Optional[Dict]:
 # Prompt Templates
 # ======================================
 
-ACTIVE_PARSE_PROMPT = """Yahoo!オークションの商品タイトルから製品と出品タイプを判定してください。
+ACTIVE_PARSE_PROMPT = """Yahoo!オークションの出品中商品を参照製品と比較してください。
 入力:{items_json}
 次のJSONだけ返してください:
-{{"items":[{{"itemId":"123","models":[{{"brand":"Nikon","model":"NIKKOR Z 24-200mm f/4-6.3 VR"}}],"listingType":"MAIN_PRODUCT"}}]}}
+{{"items":[{{"itemId":"123","matched":true,"listingType":"MAIN_PRODUCT"}}]}}
 
 listingType:
 MAIN_PRODUCT=商品本体
@@ -681,6 +681,8 @@ BUNDLE=複数セット
 UNKNOWN=判断不能
 
 ルール:
+sourceModelと同じ本体ならmatched=true。
+ブランドまたはモデルが違う商品本体なら、listingType=MAIN_PRODUCTでもmatched=false。
 レンタルはRENTAL。
 元箱のみ/箱のみ/空箱はBOX_ONLY。
 レンズフード/HB-93/互換フードはACCESSORY。
@@ -782,7 +784,8 @@ condition: NEW/USED/BROKEN/UNKNOWN
 
 
 def build_active_parse_prompt(items: List[Dict]) -> str:
-    """Active 首次模型识别只发送 itemId 和 title。"""
+    """Active AI 接收一次 sourceModel，并判定标题是否为同一商品。"""
+    source_model = (items[0].get("sourceModel", {}) or {}) if items else {}
     items_data = []
     for item in items:
         data = {
@@ -790,7 +793,17 @@ def build_active_parse_prompt(items: List[Dict]) -> str:
             "title": str(item.get("title", ""))[:ACTIVE_TITLE_MAX],
         }
         items_data.append(data)
-    return ACTIVE_PARSE_PROMPT.replace("{items_json}", json.dumps(items_data, ensure_ascii=False, separators=(",",":")))
+    payload = {
+        "sourceModel": {
+            "brand": source_model.get("brand", ""),
+            "model": source_model.get("model", ""),
+        },
+        "items": items_data,
+    }
+    return ACTIVE_PARSE_PROMPT.replace(
+        "{items_json}",
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+    )
 
 
 def build_closed_parse_prompt(items: List[Dict]) -> str:
@@ -1026,7 +1039,15 @@ def _simple_model(parsed: Dict) -> Optional[Dict]:
 
 def save_active_model(table, item_id: str, parsed: Dict, item: Optional[Dict] = None) -> str:
     """保存 Active 精简模型和类型；非本体永不进入 pricing。"""
-    model = _simple_model(parsed)
+    source_model = (item or {}).get("sourceModel", {}) or {}
+    has_source_model = bool(source_model.get("brand") and source_model.get("model"))
+    matched = parsed.get("matched")
+    # Active 与 Closed 使用同一比较语义。有参照模型时不再相信 AI
+    # 抽取的“另一个正常商品”，只有 matched=true 才可进入定价。
+    if has_source_model:
+        model = _simple_model({"models": [source_model]}) if matched is True else None
+    else:
+        model = _simple_model(parsed)
     listing_type = norm(parsed.get("listingType", ListingType.UNKNOWN)).upper()
     if listing_type not in ALLOWED_LISTING_TYPES:
         listing_type = ListingType.UNKNOWN
@@ -1035,7 +1056,7 @@ def save_active_model(table, item_id: str, parsed: Dict, item: Optional[Dict] = 
         status = Status.COMPLETED
         pricing_status = Status.PENDING
         eligible = True
-    elif excluded:
+    elif excluded or (has_source_model and matched is False):
         status = Status.EXCLUDED
         pricing_status = Status.NOT_APPLICABLE
         eligible = False
@@ -1893,6 +1914,8 @@ def scrape_active(kw: str, cnt: int, max_p: int = 0, force: bool = False,
                 existing = get_record(active_db, iid)
                 if not existing:
                     new_count += 1
+                stored_source_model = (existing or {}).get("sourceModel", {}) or {}
+                source_model_changed = stored_source_model != (source_model or {})
                 
                 upsert_scraped_item(
                     active_db, iid,
@@ -1912,8 +1935,13 @@ def scrape_active(kw: str, cnt: int, max_p: int = 0, force: bool = False,
                         "itemCondition": item.get("itemCondition"),
                         "thumbnailUrl": item.get("thumbnailUrl", ""),
                         "keyword": kw,
+                        "sourceModel": source_model or {},
                     },
-                    force=force
+                    # Active records are global by auction ID.  Re-run model
+                    # matching whenever this auction is viewed under a new
+                    # target; otherwise a previous target's COMPLETED result
+                    # could be reused for an unrelated product search.
+                    force=force or source_model_changed
                 )
             except Exception as e:
                 logger.error(f"Save active failed itemId={item.get('itemId')}: {e}")
