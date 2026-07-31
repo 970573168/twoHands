@@ -102,7 +102,7 @@ def scan_unanalyzed_products(today: str, max_models: int = MAX_MODELS_PER_RUN) -
         today=today,
         max_models=max_models)
     
-    while len(unscanned_products) < max_models:
+    while True:
         scan_params = {
             "FilterExpression": (
                 "entity_type = :entity_type "
@@ -117,7 +117,7 @@ def scan_unanalyzed_products(today: str, max_models: int = MAX_MODELS_PER_RUN) -
             },
             "ProjectionExpression": (
                 "PK, category, brand, model, "
-                "last_scanned_date, last_analysis_status"
+                "last_scanned_date, last_analysis_status, modified_at"
             ),
             "Limit": 100
         }
@@ -130,9 +130,6 @@ def scan_unanalyzed_products(today: str, max_models: int = MAX_MODELS_PER_RUN) -
         total_scanned += response.get("ScannedCount", 0)
         
         for item in items:
-            if len(unscanned_products) >= max_models:
-                break
-            
             category = str(item.get("category", ""))
             brand = str(item.get("brand", ""))
             model = str(item.get("model", ""))
@@ -158,7 +155,8 @@ def scan_unanalyzed_products(today: str, max_models: int = MAX_MODELS_PER_RUN) -
                 "model": model,
                 "product_pk": product_pk,
                 "last_scanned_date": last_scanned_date,
-                "last_analysis_status": last_analysis_status
+                "last_analysis_status": last_analysis_status,
+                "modified_at": str(item.get("modified_at", "")),
             })
         
         last_evaluated_key = response.get("LastEvaluatedKey")
@@ -177,6 +175,8 @@ def scan_unanalyzed_products(today: str, max_models: int = MAX_MODELS_PER_RUN) -
             for p in unscanned_products
         ])
     
+    # Scan 本身不保证顺序；统一优先处理最近修改的产品。
+    unscanned_products.sort(key=lambda product: product["modified_at"], reverse=True)
     return unscanned_products[:max_models]
 
 
@@ -196,7 +196,9 @@ def mark_as_queued(product_pk: str, today: str) -> bool:
             UpdateExpression="""
                 SET last_analysis_status = :queued,
                     last_scanned_date = :today,
-                    last_scanned_at = :now
+                    last_scanned_at = :now,
+                    modified_index_pk = :all,
+                    modified_at = :modified_at
             """,
             ConditionExpression=(
                 "attribute_not_exists(last_analysis_status) "
@@ -205,7 +207,9 @@ def mark_as_queued(product_pk: str, today: str) -> bool:
             ExpressionAttributeValues={
                 ":queued": "QUEUED",
                 ":today": today,
-                ":now": now
+                ":now": now,
+                ":all": "ALL",
+                ":modified_at": datetime.now(timezone.utc).isoformat()
             }
         )
         return True

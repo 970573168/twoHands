@@ -312,11 +312,25 @@ Parameters:
     MinValue: 0
     MaxValue: 1
 
-  ActivePriceMinRatio:
+  ActiveMaxRatio:
     Type: Number
-    Default: 0.5
-    MinValue: 0.1
+    Default: 1.0
+    MinValue: 0
     MaxValue: 1.0
+    Description: active 商品当前价相对于 closed 市场价的最高比例
+
+  FinalCheckBeforeMinutes:
+    Type: Number
+    Default: 15
+    MinValue: 1
+    MaxValue: 60
+    Description: 在拍卖结束前多少分钟执行 BUY_CANDIDATE 最终复核
+
+  FinalCheckBatchSize:
+    Type: Number
+    Default: 20
+    MinValue: 1
+    MaxValue: 100
 
   BuyMarginThreshold:
     Type: Number
@@ -498,6 +512,10 @@ Resources:
           AttributeType: S
         - AttributeName: GSI1SK
           AttributeType: S
+        - AttributeName: modified_index_pk
+          AttributeType: S
+        - AttributeName: modified_at
+          AttributeType: S
       KeySchema:
         - AttributeName: PK
           KeyType: HASH
@@ -509,6 +527,14 @@ Resources:
             - AttributeName: GSI1PK
               KeyType: HASH
             - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: ModifiedAtIndex
+          KeySchema:
+            - AttributeName: modified_index_pk
+              KeyType: HASH
+            - AttributeName: modified_at
               KeyType: RANGE
           Projection:
             ProjectionType: ALL
@@ -531,9 +557,22 @@ Resources:
       AttributeDefinitions:
         - AttributeName: itemID
           AttributeType: S
+        - AttributeName: modifiedIndexPk
+          AttributeType: S
+        - AttributeName: modifiedAt
+          AttributeType: S
       KeySchema:
         - AttributeName: itemID
           KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: ModifiedAtIndex
+          KeySchema:
+            - AttributeName: modifiedIndexPk
+              KeyType: HASH
+            - AttributeName: modifiedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
       SSESpecification:
         SSEEnabled: true
       PointInTimeRecoverySpecification:
@@ -553,9 +592,22 @@ Resources:
       AttributeDefinitions:
         - AttributeName: itemID
           AttributeType: S
+        - AttributeName: modifiedIndexPk
+          AttributeType: S
+        - AttributeName: modifiedAt
+          AttributeType: S
       KeySchema:
         - AttributeName: itemID
           KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: ModifiedAtIndex
+          KeySchema:
+            - AttributeName: modifiedIndexPk
+              KeyType: HASH
+            - AttributeName: modifiedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
       SSESpecification:
         SSEEnabled: true
       PointInTimeRecoverySpecification:
@@ -565,6 +617,48 @@ Resources:
           Value: YahooAuctionScraper
         - Key: Environment
           Value: !Ref Environment
+
+  YahooAuctionBuyCandidateTable:
+    Type: AWS::DynamoDB::Table
+    Condition: DeployScraperCondition
+    Properties:
+      TableName: !Sub "YahooAuctionBuyCandidates-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: itemID
+          AttributeType: S
+        - AttributeName: reviewStatus
+          AttributeType: S
+        - AttributeName: finalCheckAtEpoch
+          AttributeType: N
+      KeySchema:
+        - AttributeName: itemID
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: GSI_FinalCheck
+          KeySchema:
+            - AttributeName: reviewStatus
+              KeyType: HASH
+            - AttributeName: finalCheckAtEpoch
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Application
+          Value: YahooAuctionAnalyzer
+        - Key: Environment
+          Value: !Ref Environment
+
+  YahooAuctionBuyCandidateReminderTopic:
+    Type: AWS::SNS::Topic
+    Condition: DeployScraperCondition
+    Properties:
+      TopicName: !Sub "YahooAuctionBuyCandidateReminder-${Environment}"
+      DisplayName: Yahoo Auction BUY 候选提醒
 
   # ============================================
   # Log Groups
@@ -589,6 +683,13 @@ Resources:
     Condition: DeployScraperCondition
     Properties:
       LogGroupName: !Sub "/aws/lambda/YahooAuctionAnalyzer-${Environment}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  YahooAuctionFinalCheckLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: DeployScraperCondition
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/YahooAuctionFinalCheckReminder-${Environment}"
       RetentionInDays: !Ref LogRetentionDays
 
   CatalogScannerLogGroup:
@@ -683,6 +784,44 @@ Resources:
                   - !Sub "${YahooAuctionScraperLogGroup.Arn}:*"
                   - !Sub "${YahooAuctionAnalyzerLogGroup.Arn}:*"
 
+  YahooAuctionFinalCheckRole:
+    Type: AWS::IAM::Role
+    Condition: DeployScraperCondition
+    Properties:
+      RoleName: !Sub "YahooAuctionFinalCheck-Role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: YahooAuctionFinalCheckPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: CandidateAndActiveAccess
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !GetAtt YahooAuctionBuyCandidateTable.Arn
+                  - !Sub "${YahooAuctionBuyCandidateTable.Arn}/index/*"
+                  - !GetAtt YahooAuctionActiveTable.Arn
+              - Sid: PublishReminder
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref YahooAuctionBuyCandidateReminderTopic
+              - Sid: WriteLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${YahooAuctionFinalCheckLogGroup.Arn}:*"
+
   YahooAuctionAnalyzerRole:
     Type: AWS::IAM::Role
     Condition: DeployScraperCondition
@@ -713,6 +852,8 @@ Resources:
                 Resource:
                   - !GetAtt YahooAuctionClosedTable.Arn
                   - !GetAtt YahooAuctionActiveTable.Arn
+                  - !GetAtt YahooAuctionBuyCandidateTable.Arn
+                  - !Sub "${YahooAuctionBuyCandidateTable.Arn}/index/*"
               - Sid: ReadAllApiSecrets
                 Effect: Allow
                 Action: secretsmanager:GetSecretValue
@@ -860,6 +1001,64 @@ Resources:
         - Key: Environment
           Value: !Ref Environment
 
+  YahooAuctionFinalCheckFunction:
+    Type: AWS::Lambda::Function
+    Condition: DeployScraperCondition
+    DependsOn:
+      - YahooAuctionFinalCheckLogGroup
+      - YahooAuctionFinalCheckRole
+    Properties:
+      FunctionName: !Sub "YahooAuctionFinalCheckReminder-${Environment}"
+      Description: BUY_CANDIDATE 结束前最终复核和 SNS 邮件提醒
+      Runtime: python3.12
+      Architectures:
+        - arm64
+      Handler: final_check_reminder.lambda_handler
+      Timeout: 120
+      MemorySize: 512
+      Role: !GetAtt YahooAuctionFinalCheckRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: !Ref LambdaCodeS3Key
+      Environment:
+        Variables:
+          BUY_CANDIDATE_TABLE: !Ref YahooAuctionBuyCandidateTable
+          ACTIVE_TABLE: !Ref YahooAuctionActiveTable
+          SNS_TOPIC_ARN: !Ref YahooAuctionBuyCandidateReminderTopic
+          FINAL_CHECK_BATCH_SIZE: !Ref FinalCheckBatchSize
+          FINAL_CHECK_BEFORE_MINUTES: !Ref FinalCheckBeforeMinutes
+          FEE_RATE: !Ref ExpectedSellingFeeRate
+          SHIPPING_COST: !Ref DefaultShippingCost
+          REPAIR_RESERVE: !Ref DefaultRepairReserveRate
+          RISK_RESERVE: !Ref RiskReserveRate
+          REQUEST_TIMEOUT: !Ref YahooAuctionRequestTimeout
+      Tags:
+        - Key: Application
+          Value: YahooAuctionFinalCheckReminder
+        - Key: Environment
+          Value: !Ref Environment
+
+  YahooAuctionFinalCheckScheduleRule:
+    Type: AWS::Events::Rule
+    Condition: DeployScraperCondition
+    Properties:
+      Name: !Sub "YahooAuctionFinalCheck-Schedule-${Environment}"
+      Description: 每分钟复核即将结束的 BUY_CANDIDATE
+      ScheduleExpression: rate(1 minute)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt YahooAuctionFinalCheckFunction.Arn
+          Id: YahooAuctionFinalCheckTarget
+
+  YahooAuctionFinalCheckInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: DeployScraperCondition
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref YahooAuctionFinalCheckFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt YahooAuctionFinalCheckScheduleRule.Arn
+
   AuctionAnalyzerFunction:
     Type: AWS::Lambda::Function
     Condition: DeployScraperCondition
@@ -883,6 +1082,8 @@ Resources:
         Variables:
           TABLE_NAME_ACTIVE: !Sub "YahooAuctionActiveItems-${Environment}"
           TABLE_NAME_CLOSED: !Sub "YahooAuctionItems-${Environment}"
+          BUY_CANDIDATE_TABLE: !Ref YahooAuctionBuyCandidateTable
+          FINAL_CHECK_BEFORE_MINUTES: !Ref FinalCheckBeforeMinutes
           ENVIRONMENT: !Ref Environment
 
           AI_MODE: !Ref AiMode
@@ -920,7 +1121,7 @@ Resources:
           REPAIR_RESERVE: !Ref DefaultRepairReserveRate
           RISK_RESERVE: !Ref RiskReserveRate
           MAX_PRICE_DEV: !Ref MaxPriceDeviation
-          PRICE_MIN_RATIO: !Ref ActivePriceMinRatio
+          ACTIVE_MAX_RATIO: !Ref ActiveMaxRatio
           MIN_ROI: !Ref MinRoi
           
           DETAIL_DESC_MAX: !Ref DetailDescMaxChars
@@ -1023,6 +1224,14 @@ Outputs:
   YahooAuctionActiveTableName:
     Condition: DeployScraperCondition
     Value: !Ref YahooAuctionActiveTable
+
+  YahooAuctionBuyCandidateTableName:
+    Condition: DeployScraperCondition
+    Value: !Ref YahooAuctionBuyCandidateTable
+
+  YahooAuctionBuyCandidateReminderTopicArn:
+    Condition: DeployScraperCondition
+    Value: !Ref YahooAuctionBuyCandidateReminderTopic
 
   AuctionAnalyzerFunctionName:
     Condition: DeployScraperCondition
