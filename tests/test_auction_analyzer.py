@@ -119,10 +119,33 @@ class LeanAiWorkflowTest(unittest.TestCase):
             "itemID": "a1",
             "title": "NIKKOR Z 85mm 元箱",
             "detailDescription": "レンズ無し。元箱とマニュアルのみです。",
+            "sourceModel": {"brand": "Nikon", "model": "NIKKOR Z 85mm f/1.2 S"},
         }])
+        self.assertIn(
+            '"sourceModel":{"brand":"Nikon","model":"NIKKOR Z 85mm f/1.2 S","aliases":[]}',
+            prompt,
+        )
+        self.assertEqual(prompt.count('"sourceModel"'), 1)
+        self.assertIn('"matched": true', prompt)
         self.assertIn("レンズ無し", prompt)
         self.assertIn("本体は含まれません", prompt)
         self.assertIn("listingType は BOX_ONLY または ACCESSORY", prompt)
+
+    @patch("auction_analyzer.update_record")
+    def test_detail_source_model_mismatch_is_excluded(self, update_record):
+        status = save_model(Mock(), "a1", {
+            "matched": False,
+            "brand": "Sony",
+            "model": "INZONE H3",
+            "listingType": ListingType.MAIN_PRODUCT,
+            "condition": "USED",
+        }, {"sourceModel": {"brand": "Sony", "model": "PlayStation 5"}})
+
+        fields = update_record.call_args.args[2]
+        self.assertEqual(status, Status.EXCLUDED)
+        self.assertEqual(fields["models"], [])
+        self.assertEqual(fields["exclusionReason"], "SOURCE_MODEL_MISMATCH")
+        self.assertFalse(fields["isAnalysisEligible"])
 
     @patch("auction_analyzer.update_record")
     def test_detail_reanalysis_excludes_box_only_from_pricing(self, update_record):

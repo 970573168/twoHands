@@ -726,6 +726,7 @@ DETAILED_PARSE_PROMPT = """あなたは中古電子製品の識別専門家で�
   "items": [
     {{
       "itemId": "ID",
+      "matched": true,
       "brand": "ブランド",
       "model": "完全なモデル名",
       "variant": "Pro/Pro Max/Plus/Ultra/Edition等、価格に影響する派生名。なければ空文字",
@@ -767,7 +768,7 @@ listingType: MAIN_PRODUCT/ACCESSORY/PARTS/BROKEN/BOX_ONLY/RENTAL/BUNDLE/UNKNOWN
 condition: NEW/USED/BROKEN/UNKNOWN
 
 重要ルール：
-1. title と description の両方を使って判断してください
+1. sourceModel と同じ商品本体かを title と description の両方で判断し、違うモデルなら matched=false にしてください
 2. 矛盾する場合、description の具体的な記載を優先してください
 3. スマホは Pro/Pro Max/Plus/mini/Ultra を必ず区別してください
 4. スマホは容量、SIMフリー、ネットワーク利用制限、バッテリー最大容量を可能な限り抽出
@@ -827,6 +828,7 @@ def build_closed_parse_prompt(items: List[Dict]) -> str:
 
 def build_description_parse_prompt(items: List[Dict]) -> str:
     """仅对有利润且缺少关键参数的 active 商品发送 title 和 description。"""
+    source_model = (items[0].get("sourceModel", {}) or {}) if items else {}
     items_data = []
     for item in items:
         items_data.append({
@@ -834,9 +836,17 @@ def build_description_parse_prompt(items: List[Dict]) -> str:
             "title": item.get("title", ""),
             "description": str(item.get("detailDescription", ""))[:DETAIL_DESC_MAX],
         })
+    payload = {
+        "sourceModel": {
+            "brand": source_model.get("brand", ""),
+            "model": source_model.get("model", ""),
+            "aliases": source_model.get("aliases") or source_model.get("alias") or [],
+        },
+        "items": items_data,
+    }
     return DETAILED_PARSE_PROMPT.replace(
         "{items_json}",
-        json.dumps(items_data, ensure_ascii=False, separators=(",", ":")),
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
     )
 
 # ======================================
@@ -989,17 +999,24 @@ def parse_ai_result(parsed: Dict) -> Tuple[List[Dict], str, str, int, List[str],
 
 def save_model(table, item_id: str, parsed: Dict, item: Optional[Dict] = None) -> str:
     models, lt, cond, mc, missing_critical, excl = parse_ai_result(parsed)
+    source_model = (item or {}).get("sourceModel", {}) or {}
+    source_mismatch = bool(source_model.get("model")) and parsed.get("matched") is False
+    if source_mismatch:
+        models = []
+        excl = "SOURCE_MODEL_MISMATCH"
     excluded = lt in EXCLUDED_TYPES
     condition_class = get_condition_class(parsed)
 
-    if not models:
+    if source_mismatch:
+        status = Status.EXCLUDED
+    elif not models:
         status = Status.REVIEW_REQUIRED
     elif excluded:
         status = Status.EXCLUDED
     else:
         status = Status.COMPLETED
     
-    eligible = not excluded and len(models)>0
+    eligible = not source_mismatch and not excluded and len(models)>0
     update_record(table, item_id, {
         "models": models,
         "modelStatus": status,
@@ -1841,6 +1858,7 @@ def scrape_closed(kw: str, cnt: int, force: bool = False, source_model: Optional
             kw, "closed", False, scrape_details=False,
             brand=(source_model or {}).get("brand", ""),
             model=(source_model or {}).get("model", ""),
+            aliases=(source_model or {}).get("aliases") or (source_model or {}).get("alias") or [],
         )[:cnt]
         new_count = 0
         
@@ -1892,6 +1910,7 @@ def scrape_active(kw: str, cnt: int, max_p: int = 0, force: bool = False,
             scrape_details=False,
             brand=(source_model or {}).get("brand", ""),
             model=(source_model or {}).get("model", ""),
+            aliases=(source_model or {}).get("aliases") or (source_model or {}).get("alias") or [],
         )
         if max_p > 0:
             before_count = len(items)
