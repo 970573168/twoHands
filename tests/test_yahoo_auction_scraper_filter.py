@@ -16,6 +16,7 @@ from yahoo_auction_scraper import (
     classify_listing_type_by_title,
     detect_target_context,
     get_filter_keywords,
+    has_main_product_signal,
     normalize_title_for_filter,
     sanitize_search_keyword,
     should_filter_item_by_context,
@@ -67,6 +68,41 @@ class LocalTitleFilterTest(unittest.TestCase):
         self.assertEqual(
             classify_listing_type_by_title("保護フィルム 2個セット"),
             LocalListingType.CASE_OR_FILM,
+        )
+
+    def test_attached_cables_do_not_turn_main_products_into_cable_listings(self):
+        titles = (
+            "PlayStation 5 CFI-1200A ゲーム機本体 電源ケーブル付き",
+            "PlayStation 5 CFI-1200A 本体 HDMI付き 動作確認済み",
+            "Nintendo Switch 本体 LANケーブル付属 初期化確認済み",
+            "PS5 CFI-2000A 本体 USB-Cケーブル コントローラーセット",
+        )
+        for title in titles:
+            with self.subTest(title=title):
+                self.assertTrue(has_main_product_signal(title))
+                self.assertEqual(
+                    classify_listing_type_by_title(title),
+                    LocalListingType.MAIN_PRODUCT
+                    if "セット" not in title else LocalListingType.BUNDLE,
+                )
+
+    def test_only_explicit_standalone_cables_are_filtered(self):
+        for title in (
+            "PS5 HDMIケーブルのみ",
+            "Nintendo Switch 電源ケーブルのみ",
+            "LAN ケーブル単体",
+        ):
+            with self.subTest(title=title):
+                self.assertEqual(
+                    classify_listing_type_by_title(title),
+                    LocalListingType.USB_OR_CABLE,
+                )
+
+    def test_negative_body_wording_is_not_a_strong_keep_signal(self):
+        self.assertFalse(has_main_product_signal("PlayStation 5 商品本体なし ケーブルのみ"))
+        self.assertEqual(
+            classify_listing_type_by_title("PlayStation 5 商品本体なし ケーブルのみ"),
+            LocalListingType.USB_OR_CABLE,
         )
 
     def test_context_keeps_target_battery_and_adapter(self):

@@ -161,6 +161,35 @@ def _contains_any(text, keywords):
     return any(keyword in text for keyword in keywords)
 
 
+MAIN_PRODUCT_SIGNALS = (
+    "ゲーム機本体", "通電確認", "初期化確認済み", "動作確認済み",
+)
+
+CABLE_ONLY_SIGNALS = (
+    "ケーブルのみ", "ケーブル単体", "HDMIケーブルのみ", "HDMI ケーブルのみ",
+    "電源ケーブルのみ", "電源 ケーブルのみ", "LANケーブルのみ", "LAN ケーブルのみ",
+    "充電ケーブルのみ", "充電 ケーブルのみ", "転送ケーブルのみ", "転送 ケーブルのみ",
+)
+
+
+def has_main_product_signal(title: str) -> bool:
+    """检测明确的本体/工作状态信号；不把“本体なし”当作保留依据。"""
+    text = normalize_title_for_filter(title)
+    if _contains_any(text, ("本体なし", "本体無し", "本体は含まれません", "商品本体なし")):
+        return False
+    return (
+        _contains_any(text, MAIN_PRODUCT_SIGNALS)
+        or "本体" in text
+        or re.search(r"(?:^|[^A-Z0-9])CFI-[A-Z0-9-]+", text) is not None
+    )
+
+
+def is_cable_only_title(title: str) -> bool:
+    """只识别明确表示线缆单卖的标题，避免误伤“电源线附带”的本体。"""
+    text = normalize_title_for_filter(title)
+    return _contains_any(text, CABLE_ONLY_SIGNALS)
+
+
 def classify_listing_type_by_title(title: str) -> str:
     text = normalize_title_for_filter(title)
     # Two explicit exceptions avoid ambiguous substrings: ペンケース is a bag
@@ -170,6 +199,19 @@ def classify_listing_type_by_title(title: str) -> str:
         return LocalListingType.BUNDLE
     if _contains_any(text, ("カーディガン", "ショルダーバッグ", "レザーバッグ", "ペンケース", "バッグ", "財布")):
         return LocalListingType.CLOTHING_OR_BAG
+    # Strong product evidence wins over weak port/cable/accessory wording, but
+    # never overrides an explicit standalone cable listing.
+    if has_main_product_signal(text) and not is_cable_only_title(text):
+        definitive_noise = (
+            "レンタル", "貸出", "貸し出し", "1日~", "2日間", "往復送料無料", "管理NL",
+            "空箱", "箱のみ", "元箱のみ", "外箱のみ", "EMPTY BOX", "BOX ONLY",
+            "カタログ", "説明書", "取扱説明書", "マニュアル", "パンフレット", "雑誌",
+            "スマホケース", "手帳型", "保護フィルム", "液晶フィルム", "ガラスフィルム",
+            "リモコン", "VXX", "AXD", "PWW", "CARPLAY", "カーオーディオ",
+            "USBメモリ", "USB メモリ",
+        )
+        if not _contains_any(text, definitive_noise):
+            return LocalListingType.MAIN_PRODUCT
     rules = (
         (LocalListingType.RENTAL, (
             "レンタル", "貸出", "貸し出し", "1日~", "2日間", "往復送料無料", "管理NL",
@@ -193,7 +235,7 @@ def classify_listing_type_by_title(title: str) -> str:
         )),
         (LocalListingType.USB_OR_CABLE, (
             "USBメモリ", "USB メモリ", "LIGHTNING", "USB-C", "TYPE-C",
-            "HDMI 変換ケーブル", "充電・転送ケーブル", "ミラーリング", "ケーブル",
+            "ミラーリング", *CABLE_ONLY_SIGNALS,
         )),
         (LocalListingType.ADAPTER_OR_MOUNT, (
             "マウントアダプター", "変換アダプター", "アダプター", "Mマウント", "Lマウント",
