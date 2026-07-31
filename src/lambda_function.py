@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from boto3.dynamodb.conditions import Key
 
 import boto3
+from token_usage import record_token_usage
 
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table(os.environ["TABLE_NAME"])
@@ -124,7 +125,7 @@ HIGH_PRIORITY_CATEGORIES = {
     "測定器", "レーザー測定器",
     
     # 高端文具
-    "万年筆", "筆記具", "高級文具",
+    "万年筆", "高級文具",
     
     # 收藏类（低风险）
     "フィギュア", "模型", "ホビー", "プラモデル",
@@ -952,6 +953,8 @@ def call_gemini_api(config: dict, task: dict) -> tuple:
         tokens_used = 0
         usage = result.get("usageMetadata", {})
         if usage: tokens_used = usage.get("promptTokenCount", 0) + usage.get("candidatesTokenCount", 0); update_token_usage({"total_tokens": tokens_used})
+        record_token_usage(config["name"], config["model"], usage,
+                           prompt=prompt, task_type=task.get("task_type", ""))
         
         content = ""
         if "candidates" in result and result["candidates"]:
@@ -976,6 +979,8 @@ def call_openai_compatible_api(config: dict, task: dict) -> tuple:
         usage = result.get("usage", {})
         tokens_used = usage.get("total_tokens", 0)
         update_token_usage(usage)
+        record_token_usage(config["name"], config["model"], usage,
+                           prompt=prompt, task_type=task.get("task_type", ""))
         
         content = ""
         if "choices" in result and result["choices"]:

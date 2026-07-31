@@ -412,16 +412,23 @@ Parameters:
       - "true"
       - "false"
 
-  CatalogScannerEnabled:
+  ScheduledJobsEnabled:
     Type: String
     Default: "false"
     AllowedValues:
       - "true"
       - "false"
+    Description: 是否启用 ProductCatalog Discovery 和 CatalogScanner 定时任务
+
+  ProductCatalogDiscoveryIntervalMinutes:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 1440
 
   CatalogScannerIntervalMinutes:
     Type: Number
-    Default: 5
+    Default: 3
     MinValue: 1
     MaxValue: 1440
 
@@ -437,7 +444,7 @@ Conditions:
   CreateOpenaiSecret: !Not [!Equals [!Ref OpenaiApiKey, ""]]
   DeployMainAppCondition: !Equals [!Ref DeployMainApp, "true"]
   DeployScraperCondition: !Equals [!Ref DeployScraper, "true"]
-  CatalogScannerEnabledCondition: !Equals [!Ref CatalogScannerEnabled, "true"]
+  ScheduledJobsEnabledCondition: !Equals [!Ref ScheduledJobsEnabled, "true"]
   DeployCatalogScannerCondition: !And
     - !Equals [!Ref DeployCatalogScanner, "true"]
     - !Condition DeployMainAppCondition
@@ -545,6 +552,27 @@ Resources:
       Tags:
         - Key: Application
           Value: ProductCatalog
+        - Key: Environment
+          Value: !Ref Environment
+
+  AiTokenUsageTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "AiTokenUsage-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: call_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: call_id
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Application
+          Value: AiTokenUsage
         - Key: Environment
           Value: !Ref Environment
 
@@ -731,6 +759,10 @@ Resources:
                 Resource:
                   - !GetAtt ProductCatalogTable.Arn
                   - !Sub "${ProductCatalogTable.Arn}/index/*"
+              - Sid: WriteTokenUsage
+                Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt AiTokenUsageTable.Arn
               - Sid: ReadApiSecrets
                 Effect: Allow
                 Action: secretsmanager:GetSecretValue
@@ -861,6 +893,10 @@ Resources:
                   - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:gemini-api-key-${Environment}-*"
                   - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:doubao-api-key-${Environment}-*"
                   - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:openai-api-key-${Environment}-*"
+              - Sid: WriteTokenUsage
+                Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt AiTokenUsageTable.Arn
               - Sid: WriteLogs
                 Effect: Allow
                 Action:
@@ -934,6 +970,7 @@ Resources:
       Environment:
         Variables:
           TABLE_NAME: !Ref ProductCatalogTable
+          TOKEN_USAGE_TABLE: !Ref AiTokenUsageTable
           ENVIRONMENT: !Ref Environment
           AI_MODE: !Ref AiMode
           GEMINI_MODEL: !Ref GeminiModel
@@ -963,6 +1000,28 @@ Resources:
           Value: ProductCatalog
         - Key: Environment
           Value: !Ref Environment
+
+  ProductCatalogDiscoveryScheduleRule:
+    Type: AWS::Events::Rule
+    Condition: DeployMainAppCondition
+    Properties:
+      Name: !Sub "ProductCatalog-Discovery-Schedule-${Environment}"
+      Description: 每 5 分钟触发产品目录 AI 发现
+      ScheduleExpression: !Sub "rate(${ProductCatalogDiscoveryIntervalMinutes} minutes)"
+      State: !If [ScheduledJobsEnabledCondition, ENABLED, DISABLED]
+      Targets:
+        - Arn: !GetAtt ProductCatalogDiscovery.Arn
+          Id: ProductCatalogDiscoveryTarget
+          Input: '{"source":"aws.events","task_type":"DISCOVER_CATEGORIES"}'
+
+  ProductCatalogDiscoveryInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: DeployMainAppCondition
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ProductCatalogDiscovery
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ProductCatalogDiscoveryScheduleRule.Arn
 
   YahooAuctionScraper:
     Type: AWS::Lambda::Function
@@ -1087,6 +1146,7 @@ Resources:
           BUY_CANDIDATE_TABLE: !Ref YahooAuctionBuyCandidateTable
           FINAL_CHECK_BEFORE_MINUTES: !Ref FinalCheckBeforeMinutes
           ENVIRONMENT: !Ref Environment
+          TOKEN_USAGE_TABLE: !Ref AiTokenUsageTable
 
           AI_MODE: !Ref AiMode
           GEMINI_MODEL: !Ref GeminiModel
@@ -1177,7 +1237,7 @@ Resources:
           MAX_MODELS_PER_RUN: !Ref CatalogScannerMaxModels
           MAX_ACTIVE_COUNT: !Ref MaxActiveItems
           MAX_CLOSED_COUNT: !Ref MaxClosedPerModel
-          ENABLE_SCHEDULED_SCAN: !Ref CatalogScannerEnabled
+          ENABLE_SCHEDULED_SCAN: !Ref ScheduledJobsEnabled
           DISPATCH_INTERVAL_SECONDS: "0.3"
           DISPATCH_JITTER_SECONDS: "0.2"
           STARTUP_JITTER_SECONDS: "1"
@@ -1198,10 +1258,7 @@ Resources:
       Name: !Sub "CatalogScanner-Schedule-${Environment}"
       Description: 定期触发目录扫描器
       ScheduleExpression: !Sub "rate(${CatalogScannerIntervalMinutes} minutes)"
-      State: !If
-        - CatalogScannerEnabledCondition
-        - ENABLED
-        - DISABLED
+      State: !If [ScheduledJobsEnabledCondition, ENABLED, DISABLED]
       Targets:
         - Arn: !GetAtt CatalogScannerFunction.Arn
           Id: "CatalogScannerTarget"
@@ -1217,6 +1274,9 @@ Resources:
       SourceArn: !GetAtt CatalogScannerScheduleRule.Arn
 
 Outputs:
+  AiTokenUsageTableName:
+    Value: !Ref AiTokenUsageTable
+
   ProductCatalogTableName:
     Condition: DeployMainAppCondition
     Value: !Ref ProductCatalogTable

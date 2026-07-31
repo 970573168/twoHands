@@ -21,6 +21,7 @@ from typing import List, Dict, Optional, Any, Set, Tuple, Union
 from collections import OrderedDict
 
 import boto3
+from token_usage import record_token_usage
 from yahoo_auction_scraper import scrape_auctions, scrape_item_detail
 
 logger = logging.getLogger()
@@ -553,6 +554,8 @@ def call_ai(prompt: str, max_tokens: int) -> Tuple[Optional[Dict],Optional[str]]
                 u = result.get("usageMetadata",{}) or result.get("usage",{})
                 tokens_used = u.get("total_tokens",u.get("totalTokenCount",0))
                 _total_tokens += tokens_used
+                record_token_usage(mode, cfg["model"], u, prompt=prompt,
+                                   task_type="AUCTION_ANALYSIS")
                 logger.info(f"AI response: mode={mode}, tokens={tokens_used}, total_tokens={_total_tokens}")
                 
                 if is_gem:
