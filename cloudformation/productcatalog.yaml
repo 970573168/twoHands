@@ -418,12 +418,6 @@ Parameters:
     MinValue: 1
     MaxValue: 1440
 
-  CatalogScannerIntervalMinutes:
-    Type: Number
-    Default: 3
-    MinValue: 1
-    MaxValue: 1440
-
   CatalogScannerMaxModels:
     Type: Number
     Default: 10
@@ -1224,7 +1218,6 @@ Resources:
         Variables:
           TABLE_NAME: !Ref ProductCatalogTable
           ANALYZER_FUNCTION_NAME: !Ref AuctionAnalyzerFunction
-          SCAN_INTERVAL_MINUTES: !Ref CatalogScannerIntervalMinutes
           MAX_MODELS_PER_RUN: !Ref CatalogScannerMaxModels
           MAX_ACTIVE_COUNT: !Ref MaxActiveItems
           MAX_CLOSED_COUNT: !Ref MaxClosedPerModel
@@ -1247,7 +1240,7 @@ Resources:
     Properties:
       Name: !Sub "CatalogScanner-Schedule-${Environment}"
       Description: 定期触发目录扫描器
-      ScheduleExpression: !Sub "rate(${CatalogScannerIntervalMinutes} minutes)"
+      ScheduleExpression: rate(3 minutes)
       State: ENABLED
       Targets:
         - Arn: !GetAtt CatalogScannerFunction.Arn
