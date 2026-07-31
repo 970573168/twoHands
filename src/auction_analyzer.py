@@ -743,6 +743,10 @@ DETAILED_PARSE_PROMPT = """あなたは中古電子製品の識別専門家で�
       "accessories": "付属品。本体のみ/箱あり/充電器あり等",
       "defects": ["画面割れ", "Face ID不良", "バッテリー劣化", "水没", "起動不可 等"],
       "conditionDetail": "商品の状態詳細。例: 美品, 傷あり, ジャンク, 動作確認済み",
+      "shortSummary": "100字以内で、商品一致性・状態・付属品・価格面の要点を簡潔にまとめる",
+      "riskSummary": "傷、不具合、欠品、動作確認範囲、返品不可などの注意点",
+      "buyReason": "marketPrice/currentPrice/profitを踏まえた簡潔な理由",
+      "conditionRisk": "LOW/MEDIUM/HIGH",
       "listingType": "MAIN_PRODUCT",
       "condition": "USED",
       "conditionClass": "NORMAL/JUNK",
@@ -781,7 +785,14 @@ condition: NEW/USED/BROKEN/UNKNOWN
 11. アクセサリ、部品、空箱、セット品は適切な listingType に分類する。故障した本体は MAIN_PRODUCT とする
 12. conditionClass は isJunk=true、defects あり、condition=BROKEN、または listingType=BROKEN の場合 JUNK、それ以外は NORMAL
 13. レンズ無し/レンズなし/本体無し/本体なし/本体は含まれません/商品本体なし は本体ではありません。その場合 listingType は BOX_ONLY または ACCESSORY、models は空配列にしてください
-14. JSONのみを出力してください"""
+14. JSONのみを出力してください
+15. matched=true の場合、brand と model は必ず sourceModel の brand/model を優先してください。title または description に sourceModel.model または aliases が明記されている場合、model を一般名に置き換えてはいけません。WH-1000XM5 をワイヤレスヘッドホン、Pixel Watch をスマートウォッチ、NIKKOR Z 24-70mm f/2.8 S をズームレンズ、Z7II をミラーレスカメラにしないでください
+16. description に「型番」「MODEL」「モデル」「品番」がある場合、その具体的な型番を model として優先してください
+17. matched=true だが model が sourceModel.model と異なる一般名になりそうな場合、model=sourceModel.model にしてください
+18. 入力の currentPrice、marketPrice、estimatedProfit、profitMargin、pricingConfidence は shortSummary と buyReason の参考情報です。最終 BUY/AVOID 判定はシステム側で行うため、購入推奨を断定しすぎないでください
+19. shortSummary は100字以内で、sourceModelとの一致、商品状態、付属品、価格面の概要を簡潔に含めてください
+20. riskSummary は説明文から読み取れる注意点だけを書き、推測しないでください
+21. conditionRisk は LOW/MEDIUM/HIGH のいずれかです。LOW=明確な不具合なし・動作確認済み、MEDIUM=傷・使用感・限定的確認・返品不可、HIGH=故障・動作未確認・ジャンク・部品取り・重要機能不良"""
 
 
 def build_active_parse_prompt(items: List[Dict]) -> str:
@@ -831,10 +842,17 @@ def build_description_parse_prompt(items: List[Dict]) -> str:
     source_model = (items[0].get("sourceModel", {}) or {}) if items else {}
     items_data = []
     for item in items:
+        pricing_result = item.get("pricingResult") or {}
         items_data.append({
             "itemId": str(item.get("itemID", "")),
             "title": item.get("title", ""),
             "description": str(item.get("detailDescription", ""))[:DETAIL_DESC_MAX],
+            "currentPrice": si(item.get("price", 0)),
+            "buynowPrice": si(item.get("buynowPrice", 0)),
+            "marketPrice": si(pricing_result.get("estimatedMarketPrice", 0)),
+            "estimatedProfit": si(pricing_result.get("netProfitAtCurrentBid", 0)),
+            "profitMargin": str(pricing_result.get("profitMarginAtCurrentBid", "")),
+            "pricingConfidence": str(pricing_result.get("pricingConfidence", "")),
         })
     payload = {
         "sourceModel": {
@@ -997,7 +1015,43 @@ def parse_ai_result(parsed: Dict) -> Tuple[List[Dict], str, str, int, List[str],
     
     return models, lt, cond, mc, missing_critical, "; ".join(reasons)
 
+def preserve_source_model_if_matched(parsed: Dict, item: Optional[Dict]) -> Dict:
+    """详情明确提到目标型号时，防止 AI 将型号降级成泛称。"""
+    parsed = dict(parsed or {})
+    source_model = (item or {}).get("sourceModel", {}) or {}
+    source_brand = source_model.get("brand", "")
+    source_model_name = source_model.get("model", "")
+    aliases = source_model.get("aliases") or source_model.get("alias") or []
+    if isinstance(aliases, str):
+        aliases = [aliases]
+    if not source_model_name:
+        return parsed
+
+    text = " ".join((
+        str((item or {}).get("title", "")),
+        str((item or {}).get("detailDescription", "")),
+    ))
+    text_key = normalize_pricing_key(text)
+    candidate_keys = [normalize_pricing_key(source_model_name)]
+    candidate_keys.extend(normalize_pricing_key(alias) for alias in aliases if alias)
+    mentioned = any(key and key in text_key for key in candidate_keys)
+    if mentioned and parsed.get("matched") is not False:
+        parsed["matched"] = True
+        parsed["brand"] = source_brand or parsed.get("brand", "")
+        parsed["model"] = source_model_name
+        compare_parts = dict(parsed.get("pricingCompareKeyParts") or {})
+        compare_parts["brand"] = source_brand or compare_parts.get("brand", parsed.get("brand", ""))
+        compare_parts["model"] = source_model_name
+        parsed["pricingCompareKeyParts"] = compare_parts
+        logger.info(
+            "Source model preserved during detail analysis: itemID=%s model=%s",
+            (item or {}).get("itemID", ""), source_model_name,
+        )
+    return parsed
+
+
 def save_model(table, item_id: str, parsed: Dict, item: Optional[Dict] = None) -> str:
+    parsed = preserve_source_model_if_matched(parsed, item)
     models, lt, cond, mc, missing_critical, excl = parse_ai_result(parsed)
     source_model = (item or {}).get("sourceModel", {}) or {}
     source_mismatch = bool(source_model.get("model")) and parsed.get("matched") is False
@@ -1030,8 +1084,19 @@ def save_model(table, item_id: str, parsed: Dict, item: Optional[Dict] = None) -
         "modelParsedAt": datetime.now(timezone.utc).isoformat(),
         "pricingStatus": Status.PENDING if eligible else Status.NOT_APPLICABLE,
         "isAnalysisEligible": eligible,
-        "hasAllCriticalParameters": len(models)>0 and mc==0
+        "hasAllCriticalParameters": len(models)>0 and mc==0,
+        "detailSummary": str(parsed.get("shortSummary", ""))[:500],
+        "riskSummary": str(parsed.get("riskSummary", ""))[:500],
+        "buyReason": str(parsed.get("buyReason", ""))[:500],
+        "conditionRisk": norm(parsed.get("conditionRisk", "")).upper(),
+        "aiMatched": parsed.get("matched"),
+        "detailAnalyzedAt": datetime.now(timezone.utc).isoformat(),
     })
+    logger.info(
+        "Detail summary saved: itemID=%s conditionRisk=%s matched=%s summary=%s",
+        item_id, parsed.get("conditionRisk", ""), parsed.get("matched"),
+        str(parsed.get("shortSummary", ""))[:120],
+    )
     
     logger.info(f"Model saved: {item_id} -> {status} (type={lt}, condition={cond}, models={len(models)})")
     return status
@@ -1639,6 +1704,30 @@ def parse_end_epoch(value: str) -> Optional[int]:
     return None
 
 
+def build_closed_reference_samples(pricing: Dict, limit: int = 10) -> List[Dict]:
+    """读取定价所用的 Closed 样本；单条读取失败不会阻断推荐写入。"""
+    samples = []
+    ids = pricing.get("comparableItemIds", []) or []
+    for cid in ids[:max(0, min(int(limit), 10))]:
+        try:
+            item = get_record(closed_db, str(cid))
+            if not item:
+                continue
+            samples.append({
+                "itemID": str(item.get("itemID", cid)),
+                "title": str(item.get("title", ""))[:160],
+                "price": si(item.get("price", 0)),
+                "endTime": item.get("endTime", ""),
+                "url": item.get("url", ""),
+                "sellerType": item.get("sellerType", ""),
+                "conditionClass": item.get("conditionClass", ""),
+                "listingType": item.get("listingType", ""),
+            })
+        except Exception as exc:
+            logger.warning("Closed reference sample read failed: itemID=%s error=%s", cid, exc)
+    return samples
+
+
 def upsert_buy_candidate(item_id: str, item: Dict, pricing: Dict):
     """保存 BUY_CANDIDATE；首次入库只排期，不发送通知。"""
     market_price = si(pricing.get("estimatedMarketPrice", 0))
@@ -1676,6 +1765,7 @@ def upsert_buy_candidate(item_id: str, item: Dict, pricing: Dict):
     models = item.get("models") or [{}]
     model = models[0] if isinstance(models, list) and models else {}
     current_price = si(pricing.get("currentBidPrice", item.get("price", 0)))
+    reference_samples = build_closed_reference_samples(pricing, limit=10)
     fields = {
         "title": item.get("title", ""),
         "url": item.get("url", ""),
@@ -1704,6 +1794,13 @@ def upsert_buy_candidate(item_id: str, item: Dict, pricing: Dict):
         "reviewStatus": review_status,
         "reminderStatus": reminder_status,
         "source": "YahooAuctionAnalyzer",
+        "detailSummary": item.get("detailSummary", ""),
+        "riskSummary": item.get("riskSummary", ""),
+        "buyReason": item.get("buyReason", ""),
+        "conditionRisk": item.get("conditionRisk", ""),
+        "aiMatched": item.get("aiMatched"),
+        "referenceClosedSamples": reference_samples,
+        "referenceClosedSampleCount": len(reference_samples),
     }
     if end_epoch is not None:
         fields["endEpoch"] = end_epoch
@@ -1731,6 +1828,10 @@ def upsert_buy_candidate(item_id: str, item: Dict, pricing: Dict):
         "Buy candidate saved: itemID=%s current=%s market=%s profit=%s finalCheckAt=%s",
         item_id, current_price, market_price,
         fields["netProfitAtCurrentBid"], final_check_at,
+    )
+    logger.info(
+        "Buy candidate reference samples saved: itemID=%s sampleCount=%s",
+        item_id, len(reference_samples),
     )
 
 
@@ -2411,9 +2512,13 @@ def lambda_handler(event, context):
         force = str(event.get("force_reprocess", "")).lower() in ("true", "1", "yes")
         
         logger.info(f"Starting workflow: kw={kw}, active={ac}, closed={cc_val}, force={force}")
+        aliases = event.get("aliases") or event.get("alias") or []
+        if isinstance(aliases, str):
+            aliases = [aliases]
         source_model = {
             "brand": norm(event.get("brand", "")),
             "model": norm(event.get("model", "")),
+            "aliases": [norm(alias) for alias in aliases if norm(alias)],
         }
         if not source_model["brand"] or not source_model["model"]:
             # 兼容直接调用：keyword 通常就是 "brand model"，但无法可靠拆分时
