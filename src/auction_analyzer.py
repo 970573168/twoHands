@@ -38,14 +38,23 @@ class Status:
 
 class ListingType:
     MAIN_PRODUCT = "MAIN_PRODUCT"; ACCESSORY = "ACCESSORY"; PARTS = "PARTS"
-    BROKEN = "BROKEN"; BOX_ONLY = "BOX_ONLY"; BUNDLE = "BUNDLE"; UNKNOWN = "UNKNOWN"
+    BROKEN = "BROKEN"; BOX_ONLY = "BOX_ONLY"; BUNDLE = "BUNDLE"
+    RENTAL = "RENTAL"; UNKNOWN = "UNKNOWN"
 
 class ConditionClass:
     NORMAL = "NORMAL"
     JUNK = "JUNK"
 
 # 故障主机是可比商品；只有下列非单一主商品类型会被程序排除。
-EXCLUDED_TYPES = {ListingType.ACCESSORY, ListingType.PARTS, ListingType.BOX_ONLY, ListingType.BUNDLE}
+EXCLUDED_TYPES = {
+    ListingType.ACCESSORY, ListingType.PARTS, ListingType.BOX_ONLY,
+    ListingType.BUNDLE, ListingType.RENTAL,
+}
+ALLOWED_LISTING_TYPES = {
+    ListingType.MAIN_PRODUCT, ListingType.ACCESSORY, ListingType.PARTS,
+    ListingType.BOX_ONLY, ListingType.RENTAL, ListingType.BUNDLE,
+    ListingType.UNKNOWN,
+}
 
 class Recommendation:
     BUY_CANDIDATE = "BUY_CANDIDATE"
@@ -66,6 +75,10 @@ def _env(key, default, cast=str):
 
 TABLE_ACTIVE = _env("TABLE_NAME_ACTIVE", "YahooAuctionActiveItems")
 TABLE_CLOSED = _env("TABLE_NAME_CLOSED", "YahooAuctionItems")
+BUY_CANDIDATE_TABLE = os.environ.get(
+    "BUY_CANDIDATE_TABLE", "YahooAuctionBuyCandidates-dev"
+)
+FINAL_CHECK_BEFORE_MINUTES = _env("FINAL_CHECK_BEFORE_MINUTES", 15, int)
 AI_MODE = _env("AI_MODE", "doubao")
 
 _gemini_model = _env("GEMINI_MODEL", "gemini-2.0-flash")
@@ -119,7 +132,7 @@ REVIEW_MARGIN = _env("REVIEW_MARGIN_THRESHOLD", Decimal("0.10"), Decimal)
 MIN_COMPARABLE = _env("MIN_COMPARABLE_COUNT", 3, int)
 HIGH_CONF = _env("HIGH_CONFIDENCE_COUNT", 10, int)
 MED_CONF = _env("MEDIUM_CONFIDENCE_COUNT", 5, int)
-PRICE_MIN_RATIO = _env("PRICE_MIN_RATIO", Decimal("0.5"), Decimal)
+ACTIVE_MAX_RATIO = _env("ACTIVE_MAX_RATIO", Decimal("1.0"), Decimal)
 MIN_ROI = _env("MIN_ROI", Decimal("0.15"), Decimal)
 FEE_RATE = _env("FEE_RATE", Decimal("0.10"), Decimal)
 SHIPPING_COST = _env("SHIPPING_COST", Decimal("1500"), Decimal)
@@ -150,6 +163,7 @@ LOG_AI_RESPONSE_JSON = _env("LOG_AI_RESPONSE_JSON", False, lambda x: x.lower() i
 dynamodb = boto3.resource("dynamodb")
 active_db = dynamodb.Table(TABLE_ACTIVE)
 closed_db = dynamodb.Table(TABLE_CLOSED)
+buy_candidate_db = dynamodb.Table(BUY_CANDIDATE_TABLE)
 secrets = boto3.client("secretsmanager")
 _total_tokens = 0
 _start_time = None
@@ -160,6 +174,11 @@ _start_time = None
 
 def update_record(table, item_id: str, fields: Dict):
     """更新 DynamoDB 记录（修复 ExpressionAttributeNames 问题）"""
+    fields = {
+        **fields,
+        "modifiedIndexPk": "ALL",
+        "modifiedAt": datetime.now(timezone.utc).isoformat(),
+    }
     parts, values, names = [], {}, {}
     
     for k, v in fields.items():
@@ -207,6 +226,7 @@ def upsert_scraped_item(table, item_id: str, fields: Dict, force: bool = False):
     # ★ 核心：modelStatus 和 pricingStatus 的初始化
     values[":pending"] = Status.PENDING
     values[":now"] = now
+    values[":modified_index_pk"] = "ALL"
     
     if force:
         # 强制重置：覆盖已有状态
@@ -218,6 +238,8 @@ def upsert_scraped_item(table, item_id: str, fields: Dict, force: bool = False):
         parts.append("pricingStatus = if_not_exists(pricingStatus, :pending)")
     
     parts.append("lastScrapedAt = :now")
+    parts.append("modifiedIndexPk = :modified_index_pk")
+    parts.append("modifiedAt = :now")
     
     kwargs = {
         "Key": {"itemID": str(item_id)},
@@ -644,18 +666,50 @@ def _parse_json(content: str) -> Optional[Dict]:
 # Prompt Templates
 # ======================================
 
-ACTIVE_PARSE_PROMPT = """Yahoo!オークションの商品タイトルから製品を特定してください。
-入力: {items_json}
-全 itemId を含む次の JSON だけを返してください:
-{{"items":[{{"itemId":"123","models":[{{"brand":"Apple","model":"iPhone 14 Pro"}}]}}]}}
-brand/model はタイトルに明記された値だけを返し、製品を特定できなければ models を空配列にしてください。他のフィールドは返さないでください。"""
+ACTIVE_PARSE_PROMPT = """Yahoo!オークションの商品タイトルから製品と出品タイプを判定してください。
+入力:{items_json}
+次のJSONだけ返してください:
+{{"items":[{{"itemId":"123","models":[{{"brand":"Nikon","model":"NIKKOR Z 24-200mm f/4-6.3 VR"}}],"listingType":"MAIN_PRODUCT"}}]}}
+
+listingType:
+MAIN_PRODUCT=商品本体
+ACCESSORY=フード/ケース/フィルター/バッテリー/充電器/互換品
+BOX_ONLY=箱のみ/元箱のみ/空箱
+PARTS=部品/修理用/部品取り
+RENTAL=レンタル/貸出/1日/2日間/往復送料無料
+BUNDLE=複数セット
+UNKNOWN=判断不能
+
+ルール:
+レンタルはRENTAL。
+元箱のみ/箱のみ/空箱はBOX_ONLY。
+レンズフード/HB-93/互換フードはACCESSORY。
+本体が含まれない場合はMAIN_PRODUCTにしない。
+商品本体を特定できなければmodels=[]。
+他のフィールドは禁止。"""
 
 CLOSED_PARSE_PROMPT = """Yahoo!オークションの終了商品を参照製品と比較してください。
-入力: {items_json}
-全 itemId を含む次の JSON だけを返してください:
+入力:{items_json}
+次のJSONだけ返してください:
 {{"items":[{{"itemId":"123","matched":true,"listingType":"MAIN_PRODUCT"}}]}}
-sourceModel と同じモデルなら matched=true、異なるモデルなら false にしてください。
-listingType は MAIN_PRODUCT/ACCESSORY/PARTS/BOX_ONLY のいずれかです。故障した本体は MAIN_PRODUCT としてください。他のフィールドは返さないでください。"""
+
+listingType:
+MAIN_PRODUCT=商品本体
+ACCESSORY=フード/ケース/フィルター/バッテリー/充電器/互換品
+BOX_ONLY=箱のみ/元箱のみ/空箱
+PARTS=部品/修理用/部品取り
+RENTAL=レンタル/貸出/1日/2日間/往復送料無料
+BUNDLE=複数セット
+UNKNOWN=判断不能
+
+ルール:
+sourceModelと同じ本体ならmatched=true。
+違うモデルならmatched=false。
+レンタルはRENTAL。
+元箱のみ/箱のみ/空箱はBOX_ONLY。
+レンズフード/HB-93/互換フードはACCESSORY。
+本体が含まれない場合はMAIN_PRODUCTにしない。
+他のフィールドは禁止。"""
 
 DETAILED_PARSE_PROMPT = """あなたは中古電子製品の識別専門家です。
 以下の商品タイトルと商品説明を解析し、価格比較に必要な詳細スペックを抽出してください。
@@ -707,7 +761,7 @@ DETAILED_PARSE_PROMPT = """あなたは中古電子製品の識別専門家で�
   ]
 }}
 
-listingType: MAIN_PRODUCT/ACCESSORY/PARTS/BROKEN/BOX_ONLY/BUNDLE/UNKNOWN
+listingType: MAIN_PRODUCT/ACCESSORY/PARTS/BROKEN/BOX_ONLY/RENTAL/BUNDLE/UNKNOWN
 condition: NEW/USED/BROKEN/UNKNOWN
 
 重要ルール：
@@ -723,7 +777,8 @@ condition: NEW/USED/BROKEN/UNKNOWN
 10. 商品説明から読み取れない重要情報は missing に入れる
 11. アクセサリ、部品、空箱、セット品は適切な listingType に分類する。故障した本体は MAIN_PRODUCT とする
 12. conditionClass は isJunk=true、defects あり、condition=BROKEN、または listingType=BROKEN の場合 JUNK、それ以外は NORMAL
-13. JSONのみを出力してください"""
+13. レンズ無し/レンズなし/本体無し/本体なし/本体は含まれません/商品本体なし は本体ではありません。その場合 listingType は BOX_ONLY または ACCESSORY、models は空配列にしてください
+14. JSONのみを出力してください"""
 
 
 def build_active_parse_prompt(items: List[Dict]) -> str:
@@ -970,16 +1025,31 @@ def _simple_model(parsed: Dict) -> Optional[Dict]:
     }
 
 def save_active_model(table, item_id: str, parsed: Dict, item: Optional[Dict] = None) -> str:
-    """保存 Active 精简模型结果，不持久化 confidence/evidence。"""
+    """保存 Active 精简模型和类型；非本体永不进入 pricing。"""
     model = _simple_model(parsed)
-    status = Status.COMPLETED if model else Status.REVIEW_REQUIRED
-    eligible = model is not None
+    listing_type = norm(parsed.get("listingType", ListingType.UNKNOWN)).upper()
+    if listing_type not in ALLOWED_LISTING_TYPES:
+        listing_type = ListingType.UNKNOWN
+    excluded = listing_type in EXCLUDED_TYPES
+    if model and listing_type == ListingType.MAIN_PRODUCT:
+        status = Status.COMPLETED
+        pricing_status = Status.PENDING
+        eligible = True
+    elif excluded:
+        status = Status.EXCLUDED
+        pricing_status = Status.NOT_APPLICABLE
+        eligible = False
+    else:
+        status = Status.REVIEW_REQUIRED
+        pricing_status = Status.NOT_APPLICABLE
+        eligible = False
+    stored_model = model if listing_type == ListingType.MAIN_PRODUCT else None
     update_record(table, item_id, {
-        "models": [model] if model else [],
+        "models": [stored_model] if stored_model else [],
         "modelStatus": status,
-        "listingType": ListingType.MAIN_PRODUCT,
+        "listingType": listing_type,
         "modelParsedAt": datetime.now(timezone.utc).isoformat(),
-        "pricingStatus": Status.PENDING if eligible else Status.NOT_APPLICABLE,
+        "pricingStatus": pricing_status,
         "isAnalysisEligible": eligible,
     })
     return status
@@ -989,13 +1059,14 @@ def save_closed_model(table, item_id: str, parsed: Dict, item: Optional[Dict] = 
     source_model = (item or {}).get("sourceModel", {}) or {}
     model = _simple_model({"models": [source_model]}) if parsed.get("matched") is True else None
     listing_type = norm(parsed.get("listingType", "UNKNOWN")).upper()
-    if listing_type not in {
-        ListingType.MAIN_PRODUCT, ListingType.ACCESSORY,
-        ListingType.PARTS, ListingType.BOX_ONLY,
-    }:
+    if listing_type not in ALLOWED_LISTING_TYPES:
         listing_type = ListingType.UNKNOWN
     eligible = model is not None and listing_type == ListingType.MAIN_PRODUCT
-    status = Status.COMPLETED if eligible else Status.EXCLUDED
+    status = (
+        Status.COMPLETED if eligible
+        else Status.EXCLUDED if parsed.get("matched") is False or listing_type in EXCLUDED_TYPES
+        else Status.REVIEW_REQUIRED
+    )
     update_record(table, item_id, {
         "models": [model] if model else [],
         "modelStatus": status,
@@ -1017,9 +1088,13 @@ def resolve_closed_without_ai(item: Dict) -> Optional[Dict]:
 
     normalized_title = unicodedata.normalize("NFKC", title).upper()
     keyword_types = (
-        (ListingType.BOX_ONLY, ("空箱", "箱のみ", "BOX ONLY", "EMPTY BOX")),
-        (ListingType.PARTS, ("部品取り", "パーツのみ", "PARTS ONLY")),
-        (ListingType.ACCESSORY, ("ケースのみ", "カバーのみ", "充電器のみ", "バッテリーのみ", "ACCESSORY ONLY")),
+        (ListingType.RENTAL, ("レンタル", "貸出", "1日", "2日間", "往復送料無料")),
+        (ListingType.BOX_ONLY, ("元箱のみ", "レンズ用元箱", "空箱", "箱のみ", "BOX ONLY", "EMPTY BOX")),
+        (ListingType.PARTS, ("部品取り", "修理用", "パーツのみ", "PARTS ONLY")),
+        (ListingType.ACCESSORY, (
+            "レンズフード", "互換フード", "HB-93", "ケースのみ", "カバーのみ",
+            "充電器のみ", "バッテリーのみ", "ACCESSORY ONLY",
+        )),
     )
     for listing_type, keywords in keyword_types:
         if any(keyword in normalized_title for keyword in keywords):
@@ -1508,6 +1583,139 @@ def save_pricing(iid: str, result: Dict, rec: str):
     logger.info(f"Pricing saved: {iid} -> {rec}")
 
 
+def parse_end_epoch(value: str) -> Optional[int]:
+    """将 Yahoo 结束时间转换为 epoch；无法识别时返回 None。"""
+    text = str(value or "").strip()
+    if not text or text.lower() == "unknown":
+        return None
+    try:
+        return int(datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp())
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M"):
+        try:
+            jst = timezone(timedelta(hours=9))
+            return int(datetime.strptime(text, fmt).replace(tzinfo=jst).timestamp())
+        except ValueError:
+            continue
+    return None
+
+
+def upsert_buy_candidate(item_id: str, item: Dict, pricing: Dict):
+    """保存 BUY_CANDIDATE；首次入库只排期，不发送通知。"""
+    market_price = si(pricing.get("estimatedMarketPrice", 0))
+    if market_price <= 0:
+        review_status = "NO_MARKET_PRICE"
+        reminder_status = "NOT_SCHEDULED"
+    else:
+        review_status = "WAITING_FINAL_CHECK"
+        reminder_status = "NOT_SENT"
+
+    now = int(time.time())
+    end_epoch = parse_end_epoch(item.get("endTime"))
+    final_check_at = None
+    candidate_status = "ACTIVE"
+    reminder_error = ""
+    if end_epoch is None:
+        review_status = "INVALID_END_TIME"
+        reminder_status = "NOT_SCHEDULED"
+        reminder_error = "INVALID_END_TIME"
+    elif end_epoch <= now:
+        candidate_status = "EXPIRED"
+        review_status = "EXPIRED"
+        reminder_status = "SKIPPED"
+        final_check_at = now
+    else:
+        final_check_at = max(now, end_epoch - FINAL_CHECK_BEFORE_MINUTES * 60)
+
+    existing = buy_candidate_db.get_item(Key={"itemID": str(item_id)}).get("Item", {})
+    # 已发送是终态，Analyzer 的再次定价不能造成重复提醒。
+    if existing.get("reminderStatus") == "SENT":
+        review_status = existing.get("reviewStatus", "FINAL_CHECK_DONE")
+        reminder_status = "SENT"
+        candidate_status = existing.get("candidateStatus", "ACTIVE")
+
+    models = item.get("models") or [{}]
+    model = models[0] if isinstance(models, list) and models else {}
+    current_price = si(pricing.get("currentBidPrice", item.get("price", 0)))
+    fields = {
+        "title": item.get("title", ""),
+        "url": item.get("url", ""),
+        "thumbnailUrl": item.get("thumbnailUrl", ""),
+        "keyword": item.get("keyword", ""),
+        "brand": model.get("brand", "") if isinstance(model, dict) else "",
+        "model": model.get("model", "") if isinstance(model, dict) else "",
+        "lastAnalyzedAt": now,
+        "updatedAt": now,
+        "firstCurrentPrice": existing.get("firstCurrentPrice", current_price),
+        "currentBidPrice": current_price,
+        "buynowPrice": si(item.get("buynowPrice", 0)),
+        "marketPrice": market_price,
+        "maxActivePrice": int(Decimal(market_price) * ACTIVE_MAX_RATIO),
+        "estimatedMarketPrice": market_price,
+        "netProfitAtCurrentBid": si(pricing.get("netProfitAtCurrentBid", 0)),
+        "profitMarginAtCurrentBid": str(pricing.get("profitMarginAtCurrentBid", 0)),
+        "roiAtCurrentBid": str(pricing.get("roiAtCurrentBid", 0)),
+        "purchaseRecommendation": Recommendation.BUY_CANDIDATE,
+        "pricingConfidence": str(pricing.get("pricingConfidence", 0)),
+        "riskLevel": pricing.get("riskLevel", "HIGH"),
+        "riskScore": si(pricing.get("riskScore", 0)),
+        "shippingCost": int(get_shipping(item)),
+        "endTime": item.get("endTime", ""),
+        "candidateStatus": candidate_status,
+        "reviewStatus": review_status,
+        "reminderStatus": reminder_status,
+        "source": "YahooAuctionAnalyzer",
+    }
+    if end_epoch is not None:
+        fields["endEpoch"] = end_epoch
+    if final_check_at is not None:
+        fields["finalCheckAtEpoch"] = final_check_at
+    if reminder_error:
+        fields["reminderError"] = reminder_error
+
+    expression_names = {}
+    values = {":first_detected": now}
+    assignments = ["firstDetectedAt = if_not_exists(firstDetectedAt, :first_detected)"]
+    for index, (key, value) in enumerate(fields.items()):
+        name = f"#field{index}"
+        expression_names[name] = key
+        token = f":{key}"
+        assignments.append(f"{name} = {token}")
+        values[token] = _to_dynamo(value)
+    buy_candidate_db.update_item(
+        Key={"itemID": str(item_id)},
+        UpdateExpression="SET " + ", ".join(assignments),
+        ExpressionAttributeNames=expression_names,
+        ExpressionAttributeValues=values,
+    )
+    logger.info(
+        "Buy candidate saved: itemID=%s current=%s market=%s profit=%s finalCheckAt=%s",
+        item_id, current_price, market_price,
+        fields["netProfitAtCurrentBid"], final_check_at,
+    )
+
+
+def deactivate_buy_candidate(item_id: str, reason: str):
+    """取消尚未发送提醒的候选记录。"""
+    existing = buy_candidate_db.get_item(Key={"itemID": str(item_id)}).get("Item")
+    if not existing or existing.get("reminderStatus") == "SENT":
+        return
+    now = int(time.time())
+    buy_candidate_db.update_item(
+        Key={"itemID": str(item_id)},
+        UpdateExpression=(
+            "SET candidateStatus = :cancelled, reviewStatus = :cancelled, "
+            "reminderStatus = :skipped, cancelReason = :reason, updatedAt = :now"
+        ),
+        ExpressionAttributeValues={
+            ":cancelled": "CANCELLED", ":skipped": "SKIPPED",
+            ":reason": reason, ":now": now,
+        },
+    )
+    logger.info("Buy candidate cancelled: itemID=%s reason=%s", item_id, reason)
+
+
 def has_usable_model(item: Dict) -> bool:
     """缺少参数或低置信度时仍允许使用已识别出的模型参与初步定价。"""
     models = item.get("models", [])
@@ -1520,11 +1728,12 @@ def has_usable_model(item: Dict) -> bool:
         item.get("modelStatus") in (Status.COMPLETED, Status.REVIEW_REQUIRED)
         and isinstance(models, list)
         and any(isinstance(model, dict) for model in models)
-        and str(item.get("listingType", "")).upper() not in EXCLUDED_TYPES
+        and str(item.get("listingType", "")).upper() == ListingType.MAIN_PRODUCT
     )
 
 
-def price_active_item(item_id: str, idx: Dict[str,List[Dict]]) -> Optional[Dict]:
+def price_active_item(item_id: str, idx: Dict[str,List[Dict]],
+                      sync_candidate: bool = True) -> Optional[Dict]:
     """计算并保存单个 active 商品利润；返回定价结果。"""
     item = get_record(active_db, item_id)
     if not item or not has_usable_model(item):
@@ -1542,15 +1751,27 @@ def price_active_item(item_id: str, idx: Dict[str,List[Dict]]) -> Optional[Dict]
         sd(pricing.get("profitMarginAtCurrentBid", 0)),
     )
     save_pricing(item_id, pricing, recommendation)
+    if sync_candidate:
+        try:
+            if recommendation == Recommendation.BUY_CANDIDATE:
+                upsert_buy_candidate(item_id, item, pricing)
+            else:
+                deactivate_buy_candidate(item_id, "REPRICED_NOT_BUY_CANDIDATE")
+        except Exception as exc:
+            # 推荐库属于旁路能力，写入失败不能破坏现有 pricing 主流程。
+            logger.exception("Buy candidate sync failed: itemID=%s error=%s", item_id, exc)
     return pricing
 
 
 def should_reanalyze_description(item: Dict, pricing: Dict) -> bool:
-    """有正利润且缺关键参数时，才抓取详情并进行第二次 AI 分析。"""
-    return (
-        si(item.get("missingParameterCount", 0)) > 0
-        and sd(pricing.get("netProfitAtCurrentBid", 0)) > 0
+    """所有初判 BUY_CANDIDATE/REVIEW 都必须经过详情复核。"""
+    if pricing.get("pricingStatus") != Status.COMPLETED:
+        return False
+    recommendation = calc_decision(
+        sd(pricing.get("netProfitAtCurrentBid", 0)),
+        sd(pricing.get("profitMarginAtCurrentBid", 0)),
     )
+    return recommendation in (Recommendation.BUY_CANDIDATE, Recommendation.REVIEW)
 
 
 def scrape_profitable_active_detail(item_id: str) -> Optional[Dict]:
@@ -1595,7 +1816,11 @@ def scrape_profitable_active_detail(item_id: str) -> Optional[Dict]:
 def scrape_closed(kw: str, cnt: int, force: bool = False, source_model: Optional[Dict] = None) -> List[str]:
     """抓取已结束商品，新商品自动设为 PENDING"""
     try:
-        items = scrape_auctions(kw, "closed", False, scrape_details=False)[:cnt]
+        items = scrape_auctions(
+            kw, "closed", False, scrape_details=False,
+            brand=(source_model or {}).get("brand", ""),
+            model=(source_model or {}).get("model", ""),
+        )[:cnt]
         new_count = 0
         
         for item in items:
@@ -1621,6 +1846,7 @@ def scrape_closed(kw: str, cnt: int, force: bool = False, source_model: Optional
                         "isFreeShipping": item.get("isFreeShipping", False),
                         "itemCondition": item.get("itemCondition"),
                         "thumbnailUrl": item.get("thumbnailUrl", ""),
+                        "keyword": kw,
                         "sourceModel": source_model or {},
                     },
                     force=force
@@ -1634,18 +1860,30 @@ def scrape_closed(kw: str, cnt: int, force: bool = False, source_model: Optional
         logger.error(f"Closed scrape: {e}")
         return []
 
-def scrape_active(kw: str, cnt: int, min_p: int = 0, force: bool = False) -> List[str]:
+def scrape_active(kw: str, cnt: int, max_p: int = 0, force: bool = False,
+                  source_model: Optional[Dict] = None) -> List[str]:
     """抓取活跃商品，新商品自动设为 PENDING"""
     try:
         items = scrape_auctions(
             kw,
             "active",
             False,
-            min_price=min_p if min_p > 0 else None,
             scrape_details=False,
+            brand=(source_model or {}).get("brand", ""),
+            model=(source_model or {}).get("model", ""),
         )
-        if min_p > 0:
-            items = [i for i in items if si(i.get("price", 0)) >= min_p]
+        if max_p > 0:
+            before_count = len(items)
+            items = [
+                item for item in items
+                if 0 < si(item.get("price", 0)) <= max_p
+            ]
+            logger.info(
+                "Active price upper filter applied: max_price=%s before=%s after=%s",
+                max_p,
+                before_count,
+                len(items),
+            )
         items = items[:cnt]
         new_count = 0
         
@@ -1673,6 +1911,7 @@ def scrape_active(kw: str, cnt: int, min_p: int = 0, force: bool = False) -> Lis
                         "isFreeShipping": item.get("isFreeShipping", False),
                         "itemCondition": item.get("itemCondition"),
                         "thumbnailUrl": item.get("thumbnailUrl", ""),
+                        "keyword": kw,
                     },
                     force=force
                 )
@@ -1685,7 +1924,8 @@ def scrape_active(kw: str, cnt: int, min_p: int = 0, force: bool = False) -> Lis
         logger.error(f"Active scrape: {e}")
         return []
 
-def calc_min_price(closed_ids: List[str]) -> Dict:
+def calc_market_price(closed_ids: List[str]) -> Dict:
+    """根据有效的已成交商品计算市场价，默认采用过滤异常值后的中位数。"""
     prices = []
     for cid in closed_ids:
         item = get_record(closed_db, cid)
@@ -1697,7 +1937,13 @@ def calc_min_price(closed_ids: List[str]) -> Dict:
         if p>0:
             prices.append(p)
     if not prices:
-        return {"min":0}
+        return {
+            "market_price": 0,
+            "avg_price": 0,
+            "median_price": 0,
+            "count": 0,
+            "raw_count": 0,
+        }
     prices.sort()
     n=len(prices)
     if n>=3:
@@ -1710,9 +1956,33 @@ def calc_min_price(closed_ids: List[str]) -> Dict:
         filtered = prices
     if not filtered:
         filtered = prices
-    min_price = max(1,int(sum(filtered)//len(filtered)*PRICE_MIN_RATIO))
-    logger.info(f"Calculated min price: {min_price} (from {len(prices)} prices)")
-    return {"min": min_price}
+
+    filtered.sort()
+    filtered_count = len(filtered)
+    avg_price = sum(filtered) // filtered_count
+    middle = filtered_count // 2
+    if filtered_count % 2:
+        median_price = filtered[middle]
+    else:
+        median_price = (filtered[middle - 1] + filtered[middle]) // 2
+    market_price = median_price
+
+    logger.info(
+        "Calculated market price: market_price=%s avg_price=%s median_price=%s "
+        "count=%s raw_count=%s",
+        market_price,
+        avg_price,
+        median_price,
+        filtered_count,
+        len(prices),
+    )
+    return {
+        "market_price": market_price,
+        "avg_price": avg_price,
+        "median_price": median_price,
+        "count": filtered_count,
+        "raw_count": len(prices),
+    }
 
 def execute_workflow(kw: str, ac: int, cc: int, force: bool, source_model: Optional[Dict] = None) -> Dict:
     global _start_time
@@ -1758,15 +2028,31 @@ def execute_workflow(kw: str, ac: int, cc: int, force: bool, source_model: Optio
         else:
             logger.info("No closed items need parsing (all already processed or not in PENDING state)")
         
-        # Step 3: 计算最低建议价格
-        logger.info("Step 3: Calculating min price")
-        pi = calc_min_price(closed_ids)
-        mp = pi.get("min",0)
-        result["min_price"] = mp
+        # Step 3: 计算已结束商品市场价和 active 商品价格上限
+        logger.info("Step 3: Calculating market price")
+        pi = calc_market_price(closed_ids)
+        market_price = pi.get("market_price", 0)
+        max_active_price = (
+            int(Decimal(market_price) * ACTIVE_MAX_RATIO)
+            if market_price > 0 else 0
+        )
+        result["market_price"] = market_price
+        result["avg_price"] = pi.get("avg_price", 0)
+        result["median_price"] = pi.get("median_price", 0)
+        result["market_price_count"] = pi.get("count", 0)
+        result["raw_price_count"] = pi.get("raw_count", 0)
+        result["active_max_ratio"] = str(ACTIVE_MAX_RATIO)
+        result["max_active_price"] = max_active_price
         
         # Step 4: 抓取活跃商品
-        logger.info(f"Step 4: Scraping active auctions (min_price={mp})")
-        active_ids = scrape_active(kw, ac, mp, force)
+        logger.info(
+            "Step 4: Scraping active auctions (market_price=%s, "
+            "max_active_price=%s, ratio=%s)",
+            market_price,
+            max_active_price,
+            ACTIVE_MAX_RATIO,
+        )
+        active_ids = scrape_active(kw, ac, max_active_price, force, source_model)
         result["active"] = len(active_ids)
         if not active_ids:
             logger.warning("No active items found")
@@ -1821,7 +2107,8 @@ def execute_workflow(kw: str, ac: int, cc: int, force: bool, source_model: Optio
                 if not force and item.get("pricingStatus") != Status.PENDING:
                     continue
 
-                pricing = price_active_item(aid, idx)
+                # 初步定价只写 active 表，必须等详情复核后才同步推荐库。
+                pricing = price_active_item(aid, idx, sync_candidate=False)
                 if not pricing:
                     continue
                 priced += 1
@@ -1829,9 +2116,12 @@ def execute_workflow(kw: str, ac: int, cc: int, force: bool, source_model: Optio
                 if should_reanalyze_description(item, pricing):
                     description_recheck_ids.append(aid)
                     logger.info(
-                        "Active item queued for on-demand detail scrape: %s missing=%s net_profit=%s",
+                        "Active item queued for detail recheck: %s recommendation=%s net_profit=%s",
                         aid,
-                        item.get("missingCriticalParameters", []),
+                        calc_decision(
+                            sd(pricing.get("netProfitAtCurrentBid", 0)),
+                            sd(pricing.get("profitMarginAtCurrentBid", 0)),
+                        ),
                         pricing.get("netProfitAtCurrentBid", 0),
                     )
                 
@@ -1840,22 +2130,32 @@ def execute_workflow(kw: str, ac: int, cc: int, force: bool, source_model: Optio
             except Exception as e:
                 logger.error(f"Pricing {aid}: {e}")
 
-        # Step 8: 仅对有利润且缺少关键参数的 active 商品使用详情二次分析
+        # Step 8: 所有 BUY_CANDIDATE/REVIEW 商品必须使用详情二次分析
         detail_scraped = 0
         reanalyzed = 0
         repriced = 0
         if description_recheck_ids:
             logger.info(
-                "Step 8: On-demand detail scrape for %s profitable active items",
+                "Step 8: On-demand detail scrape for %s candidate/review active items",
                 len(description_recheck_ids),
             )
             recheck_items = []
             for index, aid in enumerate(description_recheck_ids):
                 check_limits()
-                detail_item = scrape_profitable_active_detail(aid)
+                existing = get_record(active_db, aid)
+                if (
+                    existing
+                    and existing.get("detailScrapeStatus") == "COMPLETED"
+                    and str(existing.get("detailDescription", "")).strip()
+                ):
+                    detail_item = existing
+                    logger.info("Reusing existing active detail: itemID=%s", aid)
+                else:
+                    detail_item = scrape_profitable_active_detail(aid)
+                    if detail_item and str(detail_item.get("detailDescription", "")).strip():
+                        detail_scraped += 1
                 if detail_item and str(detail_item.get("detailDescription", "")).strip():
                     recheck_items.append(detail_item)
-                    detail_scraped += 1
                 if index < len(description_recheck_ids) - 1:
                     time.sleep(_env("DETAIL_REQUEST_INTERVAL", 0.3, float))
 
@@ -1878,14 +2178,26 @@ def execute_workflow(kw: str, ac: int, cc: int, force: bool, source_model: Optio
                     + reanalysis_result.get("excluded", 0)
                 )
 
-            # 使用详情补齐后的模型重新计算利润与推荐
+            # 使用详情分析后的最新记录重新计算利润，最终结果才同步推荐库。
             for item in recheck_items:
                 aid = str(item.get("itemID", ""))
                 if not aid:
                     continue
                 try:
                     check_limits()
-                    if price_active_item(aid, idx):
+                    item_after = get_record(active_db, aid)
+                    if not item_after or not has_usable_model(item_after):
+                        update_record(active_db, aid, {
+                            "purchaseRecommendation": Recommendation.AVOID,
+                            "pricingStatus": Status.NOT_APPLICABLE,
+                        })
+                        deactivate_buy_candidate(aid, "DETAIL_REANALYSIS_EXCLUDED")
+                        logger.info(
+                            "Detail reanalysis excluded active item: itemID=%s listingType=%s",
+                            aid, (item_after or {}).get("listingType", "UNKNOWN"),
+                        )
+                        continue
+                    if price_active_item(aid, idx, sync_candidate=True):
                         repriced += 1
                 except RuntimeError:
                     raise
