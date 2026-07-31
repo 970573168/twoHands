@@ -84,7 +84,7 @@ def smooth_sleep(
     time.sleep(sleep_seconds)
 
 
-def scan_unanalyzed_products(today: str, max_models: int = 3) -> List[Dict]:
+def scan_unanalyzed_products(today: str, max_models: int = MAX_MODELS_PER_RUN) -> List[Dict]:
     """
     直接扫描 PRODUCT 记录，找到今天未分析的产品。
     
