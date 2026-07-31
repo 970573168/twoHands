@@ -38,14 +38,23 @@ class Status:
 
 class ListingType:
     MAIN_PRODUCT = "MAIN_PRODUCT"; ACCESSORY = "ACCESSORY"; PARTS = "PARTS"
-    BROKEN = "BROKEN"; BOX_ONLY = "BOX_ONLY"; BUNDLE = "BUNDLE"; UNKNOWN = "UNKNOWN"
+    BROKEN = "BROKEN"; BOX_ONLY = "BOX_ONLY"; BUNDLE = "BUNDLE"
+    RENTAL = "RENTAL"; UNKNOWN = "UNKNOWN"
 
 class ConditionClass:
     NORMAL = "NORMAL"
     JUNK = "JUNK"
 
 # 故障主机是可比商品；只有下列非单一主商品类型会被程序排除。
-EXCLUDED_TYPES = {ListingType.ACCESSORY, ListingType.PARTS, ListingType.BOX_ONLY, ListingType.BUNDLE}
+EXCLUDED_TYPES = {
+    ListingType.ACCESSORY, ListingType.PARTS, ListingType.BOX_ONLY,
+    ListingType.BUNDLE, ListingType.RENTAL,
+}
+ALLOWED_LISTING_TYPES = {
+    ListingType.MAIN_PRODUCT, ListingType.ACCESSORY, ListingType.PARTS,
+    ListingType.BOX_ONLY, ListingType.RENTAL, ListingType.BUNDLE,
+    ListingType.UNKNOWN,
+}
 
 class Recommendation:
     BUY_CANDIDATE = "BUY_CANDIDATE"
@@ -657,18 +666,50 @@ def _parse_json(content: str) -> Optional[Dict]:
 # Prompt Templates
 # ======================================
 
-ACTIVE_PARSE_PROMPT = """Yahoo!オークションの商品タイトルから製品を特定してください。
-入力: {items_json}
-全 itemId を含む次の JSON だけを返してください:
-{{"items":[{{"itemId":"123","models":[{{"brand":"Apple","model":"iPhone 14 Pro"}}]}}]}}
-brand/model はタイトルに明記された値だけを返し、製品を特定できなければ models を空配列にしてください。他のフィールドは返さないでください。"""
+ACTIVE_PARSE_PROMPT = """Yahoo!オークションの商品タイトルから製品と出品タイプを判定してください。
+入力:{items_json}
+次のJSONだけ返してください:
+{{"items":[{{"itemId":"123","models":[{{"brand":"Nikon","model":"NIKKOR Z 24-200mm f/4-6.3 VR"}}],"listingType":"MAIN_PRODUCT"}}]}}
+
+listingType:
+MAIN_PRODUCT=商品本体
+ACCESSORY=フード/ケース/フィルター/バッテリー/充電器/互換品
+BOX_ONLY=箱のみ/元箱のみ/空箱
+PARTS=部品/修理用/部品取り
+RENTAL=レンタル/貸出/1日/2日間/往復送料無料
+BUNDLE=複数セット
+UNKNOWN=判断不能
+
+ルール:
+レンタルはRENTAL。
+元箱のみ/箱のみ/空箱はBOX_ONLY。
+レンズフード/HB-93/互換フードはACCESSORY。
+本体が含まれない場合はMAIN_PRODUCTにしない。
+商品本体を特定できなければmodels=[]。
+他のフィールドは禁止。"""
 
 CLOSED_PARSE_PROMPT = """Yahoo!オークションの終了商品を参照製品と比較してください。
-入力: {items_json}
-全 itemId を含む次の JSON だけを返してください:
+入力:{items_json}
+次のJSONだけ返してください:
 {{"items":[{{"itemId":"123","matched":true,"listingType":"MAIN_PRODUCT"}}]}}
-sourceModel と同じモデルなら matched=true、異なるモデルなら false にしてください。
-listingType は MAIN_PRODUCT/ACCESSORY/PARTS/BOX_ONLY のいずれかです。故障した本体は MAIN_PRODUCT としてください。他のフィールドは返さないでください。"""
+
+listingType:
+MAIN_PRODUCT=商品本体
+ACCESSORY=フード/ケース/フィルター/バッテリー/充電器/互換品
+BOX_ONLY=箱のみ/元箱のみ/空箱
+PARTS=部品/修理用/部品取り
+RENTAL=レンタル/貸出/1日/2日間/往復送料無料
+BUNDLE=複数セット
+UNKNOWN=判断不能
+
+ルール:
+sourceModelと同じ本体ならmatched=true。
+違うモデルならmatched=false。
+レンタルはRENTAL。
+元箱のみ/箱のみ/空箱はBOX_ONLY。
+レンズフード/HB-93/互換フードはACCESSORY。
+本体が含まれない場合はMAIN_PRODUCTにしない。
+他のフィールドは禁止。"""
 
 DETAILED_PARSE_PROMPT = """あなたは中古電子製品の識別専門家です。
 以下の商品タイトルと商品説明を解析し、価格比較に必要な詳細スペックを抽出してください。
@@ -983,16 +1024,31 @@ def _simple_model(parsed: Dict) -> Optional[Dict]:
     }
 
 def save_active_model(table, item_id: str, parsed: Dict, item: Optional[Dict] = None) -> str:
-    """保存 Active 精简模型结果，不持久化 confidence/evidence。"""
+    """保存 Active 精简模型和类型；非本体永不进入 pricing。"""
     model = _simple_model(parsed)
-    status = Status.COMPLETED if model else Status.REVIEW_REQUIRED
-    eligible = model is not None
+    listing_type = norm(parsed.get("listingType", ListingType.UNKNOWN)).upper()
+    if listing_type not in ALLOWED_LISTING_TYPES:
+        listing_type = ListingType.UNKNOWN
+    excluded = listing_type in EXCLUDED_TYPES
+    if model and listing_type == ListingType.MAIN_PRODUCT:
+        status = Status.COMPLETED
+        pricing_status = Status.PENDING
+        eligible = True
+    elif excluded:
+        status = Status.EXCLUDED
+        pricing_status = Status.NOT_APPLICABLE
+        eligible = False
+    else:
+        status = Status.REVIEW_REQUIRED
+        pricing_status = Status.NOT_APPLICABLE
+        eligible = False
+    stored_model = model if listing_type == ListingType.MAIN_PRODUCT else None
     update_record(table, item_id, {
-        "models": [model] if model else [],
+        "models": [stored_model] if stored_model else [],
         "modelStatus": status,
-        "listingType": ListingType.MAIN_PRODUCT,
+        "listingType": listing_type,
         "modelParsedAt": datetime.now(timezone.utc).isoformat(),
-        "pricingStatus": Status.PENDING if eligible else Status.NOT_APPLICABLE,
+        "pricingStatus": pricing_status,
         "isAnalysisEligible": eligible,
     })
     return status
@@ -1002,13 +1058,14 @@ def save_closed_model(table, item_id: str, parsed: Dict, item: Optional[Dict] = 
     source_model = (item or {}).get("sourceModel", {}) or {}
     model = _simple_model({"models": [source_model]}) if parsed.get("matched") is True else None
     listing_type = norm(parsed.get("listingType", "UNKNOWN")).upper()
-    if listing_type not in {
-        ListingType.MAIN_PRODUCT, ListingType.ACCESSORY,
-        ListingType.PARTS, ListingType.BOX_ONLY,
-    }:
+    if listing_type not in ALLOWED_LISTING_TYPES:
         listing_type = ListingType.UNKNOWN
     eligible = model is not None and listing_type == ListingType.MAIN_PRODUCT
-    status = Status.COMPLETED if eligible else Status.EXCLUDED
+    status = (
+        Status.COMPLETED if eligible
+        else Status.EXCLUDED if parsed.get("matched") is False or listing_type in EXCLUDED_TYPES
+        else Status.REVIEW_REQUIRED
+    )
     update_record(table, item_id, {
         "models": [model] if model else [],
         "modelStatus": status,
@@ -1030,9 +1087,13 @@ def resolve_closed_without_ai(item: Dict) -> Optional[Dict]:
 
     normalized_title = unicodedata.normalize("NFKC", title).upper()
     keyword_types = (
-        (ListingType.BOX_ONLY, ("空箱", "箱のみ", "BOX ONLY", "EMPTY BOX")),
-        (ListingType.PARTS, ("部品取り", "パーツのみ", "PARTS ONLY")),
-        (ListingType.ACCESSORY, ("ケースのみ", "カバーのみ", "充電器のみ", "バッテリーのみ", "ACCESSORY ONLY")),
+        (ListingType.RENTAL, ("レンタル", "貸出", "1日", "2日間", "往復送料無料")),
+        (ListingType.BOX_ONLY, ("元箱のみ", "レンズ用元箱", "空箱", "箱のみ", "BOX ONLY", "EMPTY BOX")),
+        (ListingType.PARTS, ("部品取り", "修理用", "パーツのみ", "PARTS ONLY")),
+        (ListingType.ACCESSORY, (
+            "レンズフード", "互換フード", "HB-93", "ケースのみ", "カバーのみ",
+            "充電器のみ", "バッテリーのみ", "ACCESSORY ONLY",
+        )),
     )
     for listing_type, keywords in keyword_types:
         if any(keyword in normalized_title for keyword in keywords):
@@ -1666,7 +1727,7 @@ def has_usable_model(item: Dict) -> bool:
         item.get("modelStatus") in (Status.COMPLETED, Status.REVIEW_REQUIRED)
         and isinstance(models, list)
         and any(isinstance(model, dict) for model in models)
-        and str(item.get("listingType", "")).upper() not in EXCLUDED_TYPES
+        and str(item.get("listingType", "")).upper() == ListingType.MAIN_PRODUCT
     )
 
 

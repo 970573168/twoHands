@@ -12,6 +12,7 @@ os.environ.setdefault("AWS_EC2_METADATA_DISABLED", "true")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from auction_analyzer import (
+    ListingType,
     Recommendation,
     Status,
     batch_parse,
@@ -168,9 +169,14 @@ class LeanAiWorkflowTest(unittest.TestCase):
         prompt = build_active_parse_prompt([{"itemID": "a1", "title": "Apple iPhone 15" + "x" * 200}])
         self.assertIn('"itemId":"a1"', prompt)
         self.assertIn('"models"', prompt)
+        self.assertIn('"listingType":"MAIN_PRODUCT"', prompt)
+        self.assertIn("レンタルはRENTAL", prompt)
         self.assertNotIn("x" * 121, prompt)
-        self.assertNotIn("confidence", prompt)
-        self.assertNotIn("evidence", prompt)
+        for forbidden in (
+            "confidence", "evidence", "reason", "exclusionReason", "condition",
+            "conditionClass", "riskFactors",
+        ):
+            self.assertNotIn(forbidden, prompt)
 
     def test_closed_prompt_uses_source_model_and_has_no_removed_fields(self):
         prompt = build_closed_parse_prompt([{
@@ -183,17 +189,81 @@ class LeanAiWorkflowTest(unittest.TestCase):
         self.assertIn('"matched":true', prompt)
         self.assertNotIn('"models"', prompt)
         self.assertEqual(prompt.count('"sourceModel"'), 1)
-        for removed in ("confidence", "condition", "isComparable", "exclusionReason"):
+        for removed in (
+            "confidence", "evidence", "reason", "condition", "conditionClass",
+            "isComparable", "exclusionReason", "riskFactors",
+        ):
             self.assertNotIn(removed, prompt)
 
     @patch("auction_analyzer.update_record")
     def test_active_storage_omits_confidence_and_evidence(self, update_record):
         save_active_model(Mock(), "a1", {
             "models": [{"brand": "Apple", "model": "iPhone 15", "confidence": 0.9, "evidence": "title"}],
+            "listingType": "MAIN_PRODUCT",
         })
         fields = update_record.call_args.args[2]
         self.assertNotIn("confidence", fields["models"][0])
         self.assertNotIn("evidence", fields["models"][0])
+
+    @patch("auction_analyzer.update_record")
+    def test_active_non_products_are_excluded_from_pricing(self, update_record):
+        cases = (
+            ("【2日間から~レンタル】Nikon NIKKOR Z 24-200mm f/4-6.3 VR", "RENTAL"),
+            ("【往復送料無料】NIKKOR Z 24-200mm レンタル", "RENTAL"),
+            ("G061b【中古美品 元箱のみ】Nikon NIKKOR Z 24-200mm レンズ用元箱", "BOX_ONLY"),
+            ("Nikon バヨネットフード HB-93 NIKKOR Z 24-200mm用", "ACCESSORY"),
+        )
+        for index, (title, listing_type) in enumerate(cases):
+            with self.subTest(title=title):
+                status = save_active_model(Mock(), str(index), {
+                    "models": [], "listingType": listing_type,
+                }, {"title": title})
+                fields = update_record.call_args.args[2]
+                self.assertEqual(status, Status.EXCLUDED)
+                self.assertEqual(fields["listingType"], listing_type)
+                self.assertEqual(fields["modelStatus"], Status.EXCLUDED)
+                self.assertEqual(fields["pricingStatus"], Status.NOT_APPLICABLE)
+                self.assertFalse(fields["isAnalysisEligible"])
+
+    @patch("auction_analyzer.update_record")
+    def test_active_main_product_is_eligible_for_pricing(self, update_record):
+        status = save_active_model(Mock(), "main", {
+            "models": [{"brand": "Nikon", "model": "NIKKOR Z 24-200mm f/4-6.3 VR"}],
+            "listingType": ListingType.MAIN_PRODUCT,
+        }, {"title": "ニコン NIKKOR Z 24-200mm f/4-6.3 VR"})
+
+        fields = update_record.call_args.args[2]
+        self.assertEqual(status, Status.COMPLETED)
+        self.assertEqual(fields["pricingStatus"], Status.PENDING)
+        self.assertTrue(fields["isAnalysisEligible"])
+
+    @patch("auction_analyzer.update_record")
+    def test_active_invalid_listing_type_is_unknown_and_not_eligible(self, update_record):
+        status = save_active_model(Mock(), "unknown", {
+            "models": [{"brand": "Nikon", "model": "Z"}],
+            "listingType": "INVALID",
+        })
+
+        fields = update_record.call_args.args[2]
+        self.assertEqual(status, Status.REVIEW_REQUIRED)
+        self.assertEqual(fields["listingType"], ListingType.UNKNOWN)
+        self.assertEqual(fields["pricingStatus"], Status.NOT_APPLICABLE)
+        self.assertFalse(fields["isAnalysisEligible"])
+
+    def test_closed_resolver_excludes_rental_box_and_accessory_titles(self):
+        source_model = {"brand": "Nikon", "model": "NIKKOR Z 24-200mm F4-6.3 VR"}
+        cases = (
+            ("【2日間から~レンタル】Nikon NIKKOR Z 24-200mm F4-6.3 VR", "RENTAL"),
+            ("中古美品 元箱のみ NIKKOR Z 24-200mm F4-6.3 VR", "BOX_ONLY"),
+            ("バヨネットフード HB-93 NIKKOR Z 24-200mm F4-6.3 VR用", "ACCESSORY"),
+        )
+        for index, (title, listing_type) in enumerate(cases):
+            with self.subTest(title=title):
+                self.assertEqual(resolve_closed_without_ai({
+                    "itemID": str(index), "title": title, "sourceModel": source_model,
+                }), {
+                    "itemId": str(index), "matched": True, "listingType": listing_type,
+                })
 
     @patch("auction_analyzer.update_record")
     def test_closed_storage_uses_source_model_and_omits_removed_fields(self, update_record):
