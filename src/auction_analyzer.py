@@ -1041,29 +1041,45 @@ def batch_parse(table, items: List[Dict], prompt_builder, batch_size: int, max_t
     totals = {"parsed":0,"excluded":0,"review":0,"failed":0,"errors":[]}
     
     logger.info(f"Batch parse starting: {len(items)} items, batch_size={batch_size}")
-    
-    for start in range(0,len(items),batch_size):
-        check_limits()
-        batch = items[start:start+batch_size]
-        item_map = {str(item["itemID"]): item for item in batch}
-        unresolved = []
-        for item in batch:
-            resolved = resolver(item) if resolver else None
+
+    if resolver:
+        program_counts = {"completed": 0, "excluded": 0, "review": 0, "failed": 0}
+        unresolved_items = []
+        for item in items:
+            resolved = resolver(item)
             if resolved is None:
-                unresolved.append(item)
+                unresolved_items.append(item)
                 continue
             status = saver(table, str(item["itemID"]), resolved, item)
             if status == Status.COMPLETED:
                 totals["parsed"] += 1
+                program_counts["completed"] += 1
             elif status == Status.EXCLUDED:
                 totals["excluded"] += 1
+                program_counts["excluded"] += 1
             elif status == Status.REVIEW_REQUIRED:
                 totals["review"] += 1
+                program_counts["review"] += 1
             else:
                 totals["failed"] += 1
-        batch = unresolved
-        if not batch:
-            continue
+                program_counts["failed"] += 1
+        logger.info(
+            "Program resolver result: total=%s handled=%s to_ai=%s "
+            "completed=%s excluded=%s review=%s failed=%s",
+            len(items),
+            len(items) - len(unresolved_items),
+            len(unresolved_items),
+            program_counts["completed"],
+            program_counts["excluded"],
+            program_counts["review"],
+            program_counts["failed"],
+        )
+        items = unresolved_items
+
+    for start in range(0,len(items),batch_size):
+        check_limits()
+        batch = items[start:start+batch_size]
+        item_map = {str(item["itemID"]): item for item in batch}
         logger.info(f"AI parsing batch {start//batch_size+1}/{(len(items)-1)//batch_size+1}, size={len(batch)}")
         
         prompt = prompt_builder(batch)

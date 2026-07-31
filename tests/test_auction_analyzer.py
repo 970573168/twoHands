@@ -13,6 +13,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from auction_analyzer import (
     Recommendation,
+    Status,
+    batch_parse,
     build_active_parse_prompt,
     build_closed_parse_prompt,
     calc_decision,
@@ -118,6 +120,46 @@ class LeanAiWorkflowTest(unittest.TestCase):
             "sourceModel": {"brand": "Bosch", "model": "GBH 2-26 DFR"},
         }
         self.assertIsNone(resolve_closed_without_ai(item))
+
+    @patch("auction_analyzer.call_ai")
+    @patch("auction_analyzer.check_limits")
+    @patch("auction_analyzer.logger.info")
+    def test_batch_parse_logs_program_and_ai_counts(self, log_info, _check_limits, call_ai):
+        items = [{"itemID": str(index)} for index in range(5)]
+        statuses = {
+            "0": Status.COMPLETED,
+            "1": Status.COMPLETED,
+            "2": Status.EXCLUDED,
+            "3": Status.COMPLETED,
+            "4": Status.EXCLUDED,
+        }
+
+        def resolver(item):
+            return {"status": statuses[item["itemID"]]} if int(item["itemID"]) < 3 else None
+
+        def saver(_table, item_id, parsed, _item):
+            return parsed.get("status", statuses[item_id])
+
+        call_ai.return_value = ({
+            "items": [
+                {"itemId": "3", "status": Status.COMPLETED},
+                {"itemId": "4", "status": Status.EXCLUDED},
+            ],
+        }, None)
+
+        result = batch_parse(
+            Mock(), items, lambda batch: "prompt", 10, 100,
+            saver=saver, resolver=resolver,
+        )
+
+        log_info.assert_any_call(
+            "Program resolver result: total=%s handled=%s to_ai=%s "
+            "completed=%s excluded=%s review=%s failed=%s",
+            5, 3, 2, 2, 1, 0, 0,
+        )
+        log_info.assert_any_call("AI parsing batch 1/1, size=2")
+        self.assertEqual(result["parsed"], 3)
+        self.assertEqual(result["excluded"], 2)
 
     def test_purchase_decision_uses_only_profit_rules(self):
         self.assertEqual(calc_decision(Decimal("-1"), Decimal("0.50")), Recommendation.AVOID)
