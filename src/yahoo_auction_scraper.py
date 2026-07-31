@@ -161,12 +161,57 @@ def _contains_any(text, keywords):
     return any(keyword in text for keyword in keywords)
 
 
+MAIN_PRODUCT_SIGNALS = (
+    "ゲーム機本体", "通電確認", "初期化確認済み", "動作確認済み",
+)
+
+CABLE_ONLY_SIGNALS = (
+    "ケーブルのみ", "ケーブル単体", "HDMIケーブルのみ", "HDMI ケーブルのみ",
+    "電源ケーブルのみ", "電源 ケーブルのみ", "LANケーブルのみ", "LAN ケーブルのみ",
+    "充電ケーブルのみ", "充電 ケーブルのみ", "転送ケーブルのみ", "転送 ケーブルのみ",
+)
+
+
+def has_main_product_signal(title: str) -> bool:
+    """检测明确的本体/工作状态信号；不把“本体なし”当作保留依据。"""
+    text = normalize_title_for_filter(title)
+    if _contains_any(text, ("本体なし", "本体無し", "本体は含まれません", "商品本体なし")):
+        return False
+    return (
+        _contains_any(text, MAIN_PRODUCT_SIGNALS)
+        or "本体" in text
+        or re.search(r"(?:^|[^A-Z0-9])CFI-[A-Z0-9-]+", text) is not None
+    )
+
+
+def is_cable_only_title(title: str) -> bool:
+    """只识别明确表示线缆单卖的标题，避免误伤“电源线附带”的本体。"""
+    text = normalize_title_for_filter(title)
+    return _contains_any(text, CABLE_ONLY_SIGNALS)
+
+
 def classify_listing_type_by_title(title: str) -> str:
     text = normalize_title_for_filter(title)
+    # Two explicit exceptions avoid ambiguous substrings: ペンケース is a bag
+    # rather than a device case, and a tool body with its battery/charger is a
+    # bundle even though the charger rule is evaluated before general bundles.
     if "本体" in text and _contains_any(text, ("セット", "一式", "まとめ")):
         return LocalListingType.BUNDLE
     if _contains_any(text, ("カーディガン", "ショルダーバッグ", "レザーバッグ", "ペンケース", "バッグ", "財布")):
         return LocalListingType.CLOTHING_OR_BAG
+    # Strong product evidence wins over weak port/cable/accessory wording, but
+    # never overrides an explicit standalone cable listing.
+    if has_main_product_signal(text) and not is_cable_only_title(text):
+        definitive_noise = (
+            "レンタル", "貸出", "貸し出し", "1日~", "2日間", "往復送料無料", "管理NL",
+            "空箱", "箱のみ", "元箱のみ", "外箱のみ", "EMPTY BOX", "BOX ONLY",
+            "カタログ", "説明書", "取扱説明書", "マニュアル", "パンフレット", "雑誌",
+            "スマホケース", "手帳型", "保護フィルム", "液晶フィルム", "ガラスフィルム",
+            "リモコン", "VXX", "AXD", "PWW", "CARPLAY", "カーオーディオ",
+            "USBメモリ", "USB メモリ",
+        )
+        if not _contains_any(text, definitive_noise):
+            return LocalListingType.MAIN_PRODUCT
     rules = (
         (LocalListingType.RENTAL, (
             "レンタル", "貸出", "貸し出し", "1日~", "2日間", "往復送料無料", "管理NL",
@@ -190,7 +235,7 @@ def classify_listing_type_by_title(title: str) -> str:
         )),
         (LocalListingType.USB_OR_CABLE, (
             "USBメモリ", "USB メモリ", "LIGHTNING", "USB-C", "TYPE-C",
-            "HDMI 変換ケーブル", "充電・転送ケーブル", "ミラーリング", "ケーブル",
+            "ミラーリング", *CABLE_ONLY_SIGNALS,
         )),
         (LocalListingType.ADAPTER_OR_MOUNT, (
             "マウントアダプター", "変換アダプター", "アダプター", "Mマウント", "Lマウント",
@@ -221,7 +266,7 @@ def classify_listing_type_by_title(title: str) -> str:
             return listing_type
     if re.search(r"(?:^|\s)(?:1D|2D|AUX)(?:\s|$)", text):
         return LocalListingType.CAR_AUDIO_OR_CARPLAY
-    # 付属品を列挙しただけの本体商品は bundle にしない。
+    # 付属品を列挙しただけのレンズ商品は bundle にしない。
     if not ("レンズ" in text and _contains_any(text, ("元箱", "フード付き"))):
         if _contains_any(text, (
             "まとめ売り", "5点セット", "2台セット", "4台セット", "5個セット",
@@ -237,11 +282,38 @@ def _model_tokens(text):
     return list(dict.fromkeys(token.strip(".-") for token in tokens if token.strip(".-")))
 
 
-def detect_target_context(keyword: str, category: str = "", brand: str = "", model: str = "") -> dict:
+def _core_model_terms(model, aliases=None):
+    normalized = normalize_title_for_filter(model).replace("F/", "F")
+    if isinstance(aliases, str):
+        aliases = [aliases]
+    alias_terms = [normalize_title_for_filter(alias) for alias in (aliases or []) if str(alias).strip()]
+    ranges = re.findall(r"\d{2,3}-\d{2,3}", normalized)
+    apertures = re.findall(r"F\d+(?:\.\d+)?", normalized)
+    compound = re.findall(r"(?=[A-Z0-9.-]*[A-Z])(?=[A-Z0-9.-]*\d)[A-Z0-9][A-Z0-9.-]{3,}", normalized)
+    compound = [term.strip(".-") for term in compound if not term.startswith("F")]
+    if ranges and apertures:
+        required = [ranges[0], apertures[0]]
+    elif compound:
+        required = [max(compound, key=len)]
+    else:
+        numeric = re.findall(r"(?=[A-Z0-9-]*\d)[A-Z0-9-]{3,}", normalized)
+        if numeric:
+            required = [max(numeric, key=len)]
+        else:
+            words = re.findall(r"[A-Z]{4,}|[ァ-ヶ一-龥]{3,}", normalized)
+            required = [max(words, key=len)] if words else []
+    return {"required": required, "aliases": alias_terms}
+
+
+def detect_target_context(keyword: str, category: str = "", brand: str = "", model: str = "",
+                          aliases=None) -> dict:
     target = normalize_title_for_filter(" ".join((keyword or "", category or "", brand or "", model or "")))
     keyword_model = normalize_title_for_filter(" ".join((keyword or "", model or "")))
     def has(values, source=keyword_model):
         return _contains_any(source, values)
+    core_terms = _core_model_terms(model, aliases)
+    if not core_terms["required"] and not core_terms["aliases"] and brand:
+        core_terms["required"] = [normalize_title_for_filter(brand)]
     return {
         "is_phone": has(("IPHONE", "スマホ")),
         "is_camera_body": has(("Α1", "Α7", "Α9", "EOS", "R5", "R6", "Z9", "カメラ")),
@@ -255,13 +327,77 @@ def detect_target_context(keyword: str, category: str = "", brand: str = "", mod
         "is_parts": has(("部品", "パーツ", "修理用", "補修用")),
         "is_accessory": has(("フード", "キャップ", "グリップ", "ブラケット")),
         "target_tokens": _model_tokens(" ".join((model or "", keyword or ""))),
+        "core_model_terms": core_terms,
     }
 
 
-def should_filter_item_by_context(item: dict, context: dict, strict: bool = False) -> tuple[bool, str]:
+ATTACHED_ACCESSORY_PATTERNS = (
+    r"(?:ケース|カバー|箱|元箱|バッテリー|充電器|チャージャー|USB\s*ケーブル|付属品)(?:\d+個)?\s*(?:付(?:き|属)?|あり)",
+    r"バッテリー\s*\d+個\s+充電器セット",
+    r"ケース\s+箱\s+等\s+付き",
+    r"写真にあるものが全て",
+    r"本品のみ",
+)
+
+
+def is_attached_accessory_title(title: str) -> bool:
+    text = normalize_title_for_filter(title)
+    return any(re.search(pattern, text) for pattern in ATTACHED_ACCESSORY_PATTERNS)
+
+
+def _strong_exclusion(title: str, search_type: str):
+    text = normalize_title_for_filter(title)
+    rules = (
+        (LocalListingType.RENTAL, ("レンタル", "貸出", "貸し出し", "往復送料無料")),
+        (LocalListingType.BOX_ONLY, ("空箱", "箱のみ", "元箱のみ", "外箱のみ", "EMPTY BOX", "BOX ONLY")),
+        (LocalListingType.CASE_OR_FILM, ("ケースのみ", "カバーのみ", "キャリングケースのみ", "専用ケースのみ", "保護フィルム", "ガラスフィルム", "フィルムのみ")),
+        (LocalListingType.BATTERY_OR_CHARGER, ("バッテリーのみ", "充電器のみ", "チャージャーのみ", "交換用バッテリー", "互換バッテリー", "互換充電器")),
+        (LocalListingType.USB_OR_CABLE, ("ケーブルのみ", "ケーブル単体", "コードのみ")),
+        (LocalListingType.REMOTE_ONLY, ("リモコンのみ", "レリーズのみ")),
+        (LocalListingType.ACCESSORY, ("イヤーパッド", "交換パッド")),
+        (LocalListingType.PARTS, ("部品取り", "パーツのみ", "修理用")),
+    )
+    manual_terms = (("説明書", "マニュアル", "カタログ", "パンフレット")
+                    if search_type == "active" else
+                    ("説明書のみ", "マニュアルのみ", "カタログのみ", "パンフレットのみ"))
+    rules += ((LocalListingType.MANUAL_OR_CATALOG, manual_terms),)
+    for listing_type, terms in rules:
+        if _contains_any(text, terms):
+            return listing_type, f"STRONG_EXCLUSION_{listing_type}"
+    return None, ""
+
+
+def _has_core_model_keyword(title: str, context: dict) -> bool:
+    core = context.get("core_model_terms", {}) or {}
+    required = core.get("required", []) or []
+    aliases = core.get("aliases", []) or []
+    if not required and not aliases:
+        return True
+    text = normalize_title_for_filter(title).replace("F/", "F")
+    compact = re.sub(r"[\s./_-]+", "", text)
+    if any(re.sub(r"[\s./_-]+", "", alias) in compact for alias in aliases):
+        return True
+    return bool(required) and all(re.sub(r"[\s./_-]+", "", term) in compact for term in required)
+
+
+def should_filter_item_by_context(item: dict, context: dict, strict: bool = False,
+                                  search_type: str = "active") -> tuple[bool, str]:
     listing_type = item.get("localListingType") or classify_listing_type_by_title(item.get("title", ""))
     item["localListingType"] = listing_type
     title = normalize_title_for_filter(item.get("title", ""))
+    strong_type, strong_reason = _strong_exclusion(title, search_type)
+    if strong_type:
+        if (strong_type == LocalListingType.BATTERY_OR_CHARGER
+                and (context.get("is_battery") or context.get("is_charger"))):
+            return False, "TARGET_BATTERY_OR_CHARGER"
+        item["localListingType"] = strong_type
+        return True, strong_reason
+    if not _has_core_model_keyword(title, context):
+        item["localListingType"] = LocalListingType.OTHER_BRAND_NOISE
+        return True, "NO_CORE_MODEL_KEYWORD"
+    if is_attached_accessory_title(title):
+        item["localListingType"] = LocalListingType.MAIN_PRODUCT
+        return False, "ATTACHED_ACCESSORY_KEPT"
     model_tokens = context.get("target_tokens", [])
     if context.get("is_measurement_device") and model_tokens:
         if not any(token in title for token in model_tokens):
@@ -272,29 +408,6 @@ def should_filter_item_by_context(item: dict, context: dict, strict: bool = Fals
             item["localListingType"] = LocalListingType.OTHER_BRAND_NOISE
             return True, "DIFFERENT_INDUSTRIAL_MODEL"
 
-    always_filtered = {
-        LocalListingType.RENTAL, LocalListingType.BOX_ONLY,
-        LocalListingType.MANUAL_OR_CATALOG, LocalListingType.CASE_OR_FILM,
-        LocalListingType.REMOTE_ONLY, LocalListingType.USB_OR_CABLE,
-        LocalListingType.CLOTHING_OR_BAG,
-    }
-    if listing_type in always_filtered:
-        return True, listing_type
-    if listing_type == LocalListingType.CAR_AUDIO_OR_CARPLAY:
-        return (False, "TARGET_CAR_AUDIO") if context.get("is_car_audio") else (True, listing_type)
-    if listing_type == LocalListingType.ACCESSORY:
-        if context.get("is_accessory"):
-            return False, "TARGET_ACCESSORY"
-        if context.get("is_lens") or context.get("is_camera_body"):
-            return True, "ACCESSORY_NOT_MAIN_PRODUCT"
-    if listing_type == LocalListingType.ADAPTER_OR_MOUNT and not context.get("is_adapter"):
-        return True, "ADAPTER_NOT_TARGET"
-    if listing_type == LocalListingType.BATTERY_OR_CHARGER:
-        if context.get("is_battery") or context.get("is_charger"):
-            return False, "TARGET_BATTERY_OR_CHARGER"
-        return True, "BATTERY_OR_CHARGER_NOT_TARGET"
-    if listing_type == LocalListingType.PARTS and not context.get("is_parts"):
-        return True, "PARTS_NOT_TARGET"
     if listing_type == LocalListingType.BUNDLE and strict:
         return True, "BUNDLE_STRICT"
     return False, ""
@@ -323,17 +436,33 @@ def simplify_search_keyword(keyword: str) -> str:
 
 
 def build_contextual_exclude_keywords(event):
+    source_model = event.get("sourceModel", {}) or {}
+    source_brand = source_model.get("brand", "") if isinstance(source_model, dict) else ""
+    source_model_name = source_model.get("model", "") if isinstance(source_model, dict) else str(source_model)
+    source_aliases = (
+        source_model.get("aliases") or source_model.get("alias") or []
+        if isinstance(source_model, dict) else []
+    )
     context = detect_target_context(
         event.get("keyword", ""), event.get("category", ""),
-        event.get("brand", ""), event.get("model", ""),
+        event.get("brand") or source_brand,
+        event.get("model") or source_model_name,
+        event.get("aliases") or event.get("alias") or source_aliases,
     )
-    words = ["空箱", "元箱のみ", "説明書", "カタログ", "レンタル"]
-    if context["is_lens"] or context["is_camera_body"] or context["is_phone"]:
-        words.extend(("ケース", "フィルム", "互換バッテリー", "レンズフード", "レンズキャップ"))
-        if not context["is_charger"]:
-            words.append("充電器")
+    words = [
+        "空箱", "箱のみ", "元箱のみ", "ケースのみ", "カバーのみ",
+        "保護フィルム", "ガラスフィルム", "レンタル", "部品取り",
+    ]
+    if event.get("search_type", "closed") == "active":
+        words.extend(("説明書", "カタログ"))
+    else:
+        words.extend(("説明書のみ", "カタログのみ"))
+    if not context["is_battery"]:
+        words.extend(("バッテリーのみ", "交換用バッテリー", "互換バッテリー"))
+    if not context["is_charger"]:
+        words.extend(("充電器のみ", "互換充電器"))
     if context["is_measurement_device"]:
-        words.extend(("ケース", "ケーブル", "取扱説明書", "カタログ"))
+        words.extend(("ケースのみ", "ケーブルのみ"))
         target = normalize_title_for_filter(" ".join((event.get("keyword", ""), event.get("model", ""))))
         if "PROBE" not in target and "プローブ" not in target:
             words.append("プローブ")
@@ -350,12 +479,21 @@ def _optional_bool(value):
 
 def _search_context_kwargs(event):
     source_model = event.get("sourceModel", {}) or {}
-    if not isinstance(source_model, dict):
-        source_model = {}
+    if isinstance(source_model, dict):
+        source_brand = source_model.get("brand", "")
+        source_model_name = source_model.get("model", "")
+        source_aliases = source_model.get("aliases") or source_model.get("alias") or []
+    else:
+        # Some upstream callers send sourceModel as the model-name string
+        # rather than the catalog object.  Accept both event shapes.
+        source_brand = ""
+        source_model_name = str(source_model)
+        source_aliases = []
     return {
         "category": event.get("category", ""),
-        "brand": event.get("brand", source_model.get("brand", "")),
-        "model": event.get("model", source_model.get("model", "")),
+        "brand": event.get("brand") or source_brand,
+        "model": event.get("model") or source_model_name,
+        "aliases": event.get("aliases") or event.get("alias") or source_aliases,
         "enable_local_title_filter": _optional_bool(event.get("enable_local_title_filter")),
         "local_title_filter_strict": _optional_bool(event.get("local_title_filter_strict")),
     }
@@ -1056,16 +1194,12 @@ def lambda_handler(event, context):
 
 def scrape_auctions(keyword, search_type, include_paypay=True,
                     exclude_keywords="", include_keywords="", min_price=None,
-                    scrape_details=None, category="", brand="", model="",
+                    scrape_details=None, category="", brand="", model="", aliases=None,
                     enable_local_title_filter=None,
                     local_title_filter_strict=None):
     """抓取列表页；scrape_details 可显式控制是否同步抓取详情。"""
     if scrape_details is None:
         scrape_details = ENABLE_DETAIL_SCRAPE_ON_SEARCH
-    if not exclude_keywords and USE_DEFAULT_EXCLUDE:
-        exclude_keywords = build_contextual_exclude_keywords({
-            "keyword": keyword, "category": category, "brand": brand, "model": model,
-        })
     if enable_local_title_filter is None:
         enable_local_title_filter = ENABLE_LOCAL_TITLE_FILTER
     if local_title_filter_strict is None:
@@ -1120,22 +1254,34 @@ def scrape_auctions(keyword, search_type, include_paypay=True,
         parsed_item_count = len(items)
 
         if enable_local_title_filter:
-            context = detect_target_context(keyword, category, brand, model)
+            context = detect_target_context(keyword, category, brand, model, aliases)
             before = len(items)
             kept, removed = [], []
             for item in items:
                 should_filter, reason = should_filter_item_by_context(
-                    item, context, strict=local_title_filter_strict,
+                    item, context, strict=local_title_filter_strict, search_type=search_type,
                 )
                 item["localFilterReason"] = reason
+                if reason == "ATTACHED_ACCESSORY_KEPT":
+                    logger.info(
+                        "Local filter kept attached accessory title: keyword=%s title=%s",
+                        keyword, item.get("title", "")[:160],
+                    )
                 (removed if should_filter else kept).append(item)
             logger.info(
                 "Local title filter: keyword=%s before=%s after=%s removed=%s",
                 keyword, before, len(kept), len(removed),
             )
             for item in removed[:10]:
+                reason = str(item.get("localFilterReason", ""))
+                if reason.startswith("STRONG_EXCLUSION_"):
+                    log_message = "Local filter strong excluded: type=%s reason=%s title=%s"
+                elif reason == "NO_CORE_MODEL_KEYWORD":
+                    log_message = "Local filter no core model keyword: type=%s reason=%s title=%s"
+                else:
+                    log_message = "Local filter excluded: type=%s reason=%s title=%s"
                 logger.info(
-                    "Filtered item: type=%s reason=%s title=%s",
+                    log_message,
                     item.get("localListingType"), item.get("localFilterReason"),
                     item.get("title", "")[:160],
                 )

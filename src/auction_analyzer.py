@@ -666,10 +666,10 @@ def _parse_json(content: str) -> Optional[Dict]:
 # Prompt Templates
 # ======================================
 
-ACTIVE_PARSE_PROMPT = """Yahoo!オークションの商品タイトルから製品と出品タイプを判定してください。
+ACTIVE_PARSE_PROMPT = """Yahoo!オークションの出品中商品を参照製品と比較してください。
 入力:{items_json}
 次のJSONだけ返してください:
-{{"items":[{{"itemId":"123","models":[{{"brand":"Nikon","model":"NIKKOR Z 24-200mm f/4-6.3 VR"}}],"listingType":"MAIN_PRODUCT"}}]}}
+{{"items":[{{"itemId":"123","matched":true,"listingType":"MAIN_PRODUCT"}}]}}
 
 listingType:
 MAIN_PRODUCT=商品本体
@@ -681,6 +681,8 @@ BUNDLE=複数セット
 UNKNOWN=判断不能
 
 ルール:
+sourceModelと同じ本体ならmatched=true。
+ブランドまたはモデルが違う商品本体なら、listingType=MAIN_PRODUCTでもmatched=false。
 レンタルはRENTAL。
 元箱のみ/箱のみ/空箱はBOX_ONLY。
 レンズフード/HB-93/互換フードはACCESSORY。
@@ -724,6 +726,7 @@ DETAILED_PARSE_PROMPT = """あなたは中古電子製品の識別専門家で�
   "items": [
     {{
       "itemId": "ID",
+      "matched": true,
       "brand": "ブランド",
       "model": "完全なモデル名",
       "variant": "Pro/Pro Max/Plus/Ultra/Edition等、価格に影響する派生名。なければ空文字",
@@ -740,6 +743,10 @@ DETAILED_PARSE_PROMPT = """あなたは中古電子製品の識別専門家で�
       "accessories": "付属品。本体のみ/箱あり/充電器あり等",
       "defects": ["画面割れ", "Face ID不良", "バッテリー劣化", "水没", "起動不可 等"],
       "conditionDetail": "商品の状態詳細。例: 美品, 傷あり, ジャンク, 動作確認済み",
+      "shortSummary": "100字以内で、商品一致性・状態・付属品・価格面の要点を簡潔にまとめる",
+      "riskSummary": "傷、不具合、欠品、動作確認範囲、返品不可などの注意点",
+      "buyReason": "marketPrice/currentPrice/profitを踏まえた簡潔な理由",
+      "conditionRisk": "LOW/MEDIUM/HIGH",
       "listingType": "MAIN_PRODUCT",
       "condition": "USED",
       "conditionClass": "NORMAL/JUNK",
@@ -765,7 +772,7 @@ listingType: MAIN_PRODUCT/ACCESSORY/PARTS/BROKEN/BOX_ONLY/RENTAL/BUNDLE/UNKNOWN
 condition: NEW/USED/BROKEN/UNKNOWN
 
 重要ルール：
-1. title と description の両方を使って判断してください
+1. sourceModel と同じ商品本体かを title と description の両方で判断し、違うモデルなら matched=false にしてください
 2. 矛盾する場合、description の具体的な記載を優先してください
 3. スマホは Pro/Pro Max/Plus/mini/Ultra を必ず区別してください
 4. スマホは容量、SIMフリー、ネットワーク利用制限、バッテリー最大容量を可能な限り抽出
@@ -778,11 +785,19 @@ condition: NEW/USED/BROKEN/UNKNOWN
 11. アクセサリ、部品、空箱、セット品は適切な listingType に分類する。故障した本体は MAIN_PRODUCT とする
 12. conditionClass は isJunk=true、defects あり、condition=BROKEN、または listingType=BROKEN の場合 JUNK、それ以外は NORMAL
 13. レンズ無し/レンズなし/本体無し/本体なし/本体は含まれません/商品本体なし は本体ではありません。その場合 listingType は BOX_ONLY または ACCESSORY、models は空配列にしてください
-14. JSONのみを出力してください"""
+14. JSONのみを出力してください
+15. matched=true の場合、brand と model は必ず sourceModel の brand/model を優先してください。title または description に sourceModel.model または aliases が明記されている場合、model を一般名に置き換えてはいけません。WH-1000XM5 をワイヤレスヘッドホン、Pixel Watch をスマートウォッチ、NIKKOR Z 24-70mm f/2.8 S をズームレンズ、Z7II をミラーレスカメラにしないでください
+16. description に「型番」「MODEL」「モデル」「品番」がある場合、その具体的な型番を model として優先してください
+17. matched=true だが model が sourceModel.model と異なる一般名になりそうな場合、model=sourceModel.model にしてください
+18. 入力の currentPrice、marketPrice、estimatedProfit、profitMargin、pricingConfidence は shortSummary と buyReason の参考情報です。最終 BUY/AVOID 判定はシステム側で行うため、購入推奨を断定しすぎないでください
+19. shortSummary は100字以内で、sourceModelとの一致、商品状態、付属品、価格面の概要を簡潔に含めてください
+20. riskSummary は説明文から読み取れる注意点だけを書き、推測しないでください
+21. conditionRisk は LOW/MEDIUM/HIGH のいずれかです。LOW=明確な不具合なし・動作確認済み、MEDIUM=傷・使用感・限定的確認・返品不可、HIGH=故障・動作未確認・ジャンク・部品取り・重要機能不良"""
 
 
 def build_active_parse_prompt(items: List[Dict]) -> str:
-    """Active 首次模型识别只发送 itemId 和 title。"""
+    """Active AI 接收一次 sourceModel，并判定标题是否为同一商品。"""
+    source_model = (items[0].get("sourceModel", {}) or {}) if items else {}
     items_data = []
     for item in items:
         data = {
@@ -790,7 +805,17 @@ def build_active_parse_prompt(items: List[Dict]) -> str:
             "title": str(item.get("title", ""))[:ACTIVE_TITLE_MAX],
         }
         items_data.append(data)
-    return ACTIVE_PARSE_PROMPT.replace("{items_json}", json.dumps(items_data, ensure_ascii=False, separators=(",",":")))
+    payload = {
+        "sourceModel": {
+            "brand": source_model.get("brand", ""),
+            "model": source_model.get("model", ""),
+        },
+        "items": items_data,
+    }
+    return ACTIVE_PARSE_PROMPT.replace(
+        "{items_json}",
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+    )
 
 
 def build_closed_parse_prompt(items: List[Dict]) -> str:
@@ -814,16 +839,32 @@ def build_closed_parse_prompt(items: List[Dict]) -> str:
 
 def build_description_parse_prompt(items: List[Dict]) -> str:
     """仅对有利润且缺少关键参数的 active 商品发送 title 和 description。"""
+    source_model = (items[0].get("sourceModel", {}) or {}) if items else {}
     items_data = []
     for item in items:
+        pricing_result = item.get("pricingResult") or {}
         items_data.append({
             "itemId": str(item.get("itemID", "")),
             "title": item.get("title", ""),
             "description": str(item.get("detailDescription", ""))[:DETAIL_DESC_MAX],
+            "currentPrice": si(item.get("price", 0)),
+            "buynowPrice": si(item.get("buynowPrice", 0)),
+            "marketPrice": si(pricing_result.get("estimatedMarketPrice", 0)),
+            "estimatedProfit": si(pricing_result.get("netProfitAtCurrentBid", 0)),
+            "profitMargin": str(pricing_result.get("profitMarginAtCurrentBid", "")),
+            "pricingConfidence": str(pricing_result.get("pricingConfidence", "")),
         })
+    payload = {
+        "sourceModel": {
+            "brand": source_model.get("brand", ""),
+            "model": source_model.get("model", ""),
+            "aliases": source_model.get("aliases") or source_model.get("alias") or [],
+        },
+        "items": items_data,
+    }
     return DETAILED_PARSE_PROMPT.replace(
         "{items_json}",
-        json.dumps(items_data, ensure_ascii=False, separators=(",", ":")),
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
     )
 
 # ======================================
@@ -974,19 +1015,62 @@ def parse_ai_result(parsed: Dict) -> Tuple[List[Dict], str, str, int, List[str],
     
     return models, lt, cond, mc, missing_critical, "; ".join(reasons)
 
+def preserve_source_model_if_matched(parsed: Dict, item: Optional[Dict]) -> Dict:
+    """详情明确提到目标型号时，防止 AI 将型号降级成泛称。"""
+    parsed = dict(parsed or {})
+    source_model = (item or {}).get("sourceModel", {}) or {}
+    source_brand = source_model.get("brand", "")
+    source_model_name = source_model.get("model", "")
+    aliases = source_model.get("aliases") or source_model.get("alias") or []
+    if isinstance(aliases, str):
+        aliases = [aliases]
+    if not source_model_name:
+        return parsed
+
+    text = " ".join((
+        str((item or {}).get("title", "")),
+        str((item or {}).get("detailDescription", "")),
+    ))
+    text_key = normalize_pricing_key(text)
+    candidate_keys = [normalize_pricing_key(source_model_name)]
+    candidate_keys.extend(normalize_pricing_key(alias) for alias in aliases if alias)
+    mentioned = any(key and key in text_key for key in candidate_keys)
+    if mentioned and parsed.get("matched") is not False:
+        parsed["matched"] = True
+        parsed["brand"] = source_brand or parsed.get("brand", "")
+        parsed["model"] = source_model_name
+        compare_parts = dict(parsed.get("pricingCompareKeyParts") or {})
+        compare_parts["brand"] = source_brand or compare_parts.get("brand", parsed.get("brand", ""))
+        compare_parts["model"] = source_model_name
+        parsed["pricingCompareKeyParts"] = compare_parts
+        logger.info(
+            "Source model preserved during detail analysis: itemID=%s model=%s",
+            (item or {}).get("itemID", ""), source_model_name,
+        )
+    return parsed
+
+
 def save_model(table, item_id: str, parsed: Dict, item: Optional[Dict] = None) -> str:
+    parsed = preserve_source_model_if_matched(parsed, item)
     models, lt, cond, mc, missing_critical, excl = parse_ai_result(parsed)
+    source_model = (item or {}).get("sourceModel", {}) or {}
+    source_mismatch = bool(source_model.get("model")) and parsed.get("matched") is False
+    if source_mismatch:
+        models = []
+        excl = "SOURCE_MODEL_MISMATCH"
     excluded = lt in EXCLUDED_TYPES
     condition_class = get_condition_class(parsed)
 
-    if not models:
+    if source_mismatch:
+        status = Status.EXCLUDED
+    elif not models:
         status = Status.REVIEW_REQUIRED
     elif excluded:
         status = Status.EXCLUDED
     else:
         status = Status.COMPLETED
     
-    eligible = not excluded and len(models)>0
+    eligible = not source_mismatch and not excluded and len(models)>0
     update_record(table, item_id, {
         "models": models,
         "modelStatus": status,
@@ -1000,8 +1084,19 @@ def save_model(table, item_id: str, parsed: Dict, item: Optional[Dict] = None) -
         "modelParsedAt": datetime.now(timezone.utc).isoformat(),
         "pricingStatus": Status.PENDING if eligible else Status.NOT_APPLICABLE,
         "isAnalysisEligible": eligible,
-        "hasAllCriticalParameters": len(models)>0 and mc==0
+        "hasAllCriticalParameters": len(models)>0 and mc==0,
+        "detailSummary": str(parsed.get("shortSummary", ""))[:500],
+        "riskSummary": str(parsed.get("riskSummary", ""))[:500],
+        "buyReason": str(parsed.get("buyReason", ""))[:500],
+        "conditionRisk": norm(parsed.get("conditionRisk", "")).upper(),
+        "aiMatched": parsed.get("matched"),
+        "detailAnalyzedAt": datetime.now(timezone.utc).isoformat(),
     })
+    logger.info(
+        "Detail summary saved: itemID=%s conditionRisk=%s matched=%s summary=%s",
+        item_id, parsed.get("conditionRisk", ""), parsed.get("matched"),
+        str(parsed.get("shortSummary", ""))[:120],
+    )
     
     logger.info(f"Model saved: {item_id} -> {status} (type={lt}, condition={cond}, models={len(models)})")
     return status
@@ -1026,7 +1121,15 @@ def _simple_model(parsed: Dict) -> Optional[Dict]:
 
 def save_active_model(table, item_id: str, parsed: Dict, item: Optional[Dict] = None) -> str:
     """保存 Active 精简模型和类型；非本体永不进入 pricing。"""
-    model = _simple_model(parsed)
+    source_model = (item or {}).get("sourceModel", {}) or {}
+    has_source_model = bool(source_model.get("brand") and source_model.get("model"))
+    matched = parsed.get("matched")
+    # Active 与 Closed 使用同一比较语义。有参照模型时不再相信 AI
+    # 抽取的“另一个正常商品”，只有 matched=true 才可进入定价。
+    if has_source_model:
+        model = _simple_model({"models": [source_model]}) if matched is True else None
+    else:
+        model = _simple_model(parsed)
     listing_type = norm(parsed.get("listingType", ListingType.UNKNOWN)).upper()
     if listing_type not in ALLOWED_LISTING_TYPES:
         listing_type = ListingType.UNKNOWN
@@ -1035,7 +1138,7 @@ def save_active_model(table, item_id: str, parsed: Dict, item: Optional[Dict] = 
         status = Status.COMPLETED
         pricing_status = Status.PENDING
         eligible = True
-    elif excluded:
+    elif excluded or (has_source_model and matched is False):
         status = Status.EXCLUDED
         pricing_status = Status.NOT_APPLICABLE
         eligible = False
@@ -1601,6 +1704,30 @@ def parse_end_epoch(value: str) -> Optional[int]:
     return None
 
 
+def build_closed_reference_samples(pricing: Dict, limit: int = 10) -> List[Dict]:
+    """读取定价所用的 Closed 样本；单条读取失败不会阻断推荐写入。"""
+    samples = []
+    ids = pricing.get("comparableItemIds", []) or []
+    for cid in ids[:max(0, min(int(limit), 10))]:
+        try:
+            item = get_record(closed_db, str(cid))
+            if not item:
+                continue
+            samples.append({
+                "itemID": str(item.get("itemID", cid)),
+                "title": str(item.get("title", ""))[:160],
+                "price": si(item.get("price", 0)),
+                "endTime": item.get("endTime", ""),
+                "url": item.get("url", ""),
+                "sellerType": item.get("sellerType", ""),
+                "conditionClass": item.get("conditionClass", ""),
+                "listingType": item.get("listingType", ""),
+            })
+        except Exception as exc:
+            logger.warning("Closed reference sample read failed: itemID=%s error=%s", cid, exc)
+    return samples
+
+
 def upsert_buy_candidate(item_id: str, item: Dict, pricing: Dict):
     """保存 BUY_CANDIDATE；首次入库只排期，不发送通知。"""
     market_price = si(pricing.get("estimatedMarketPrice", 0))
@@ -1638,6 +1765,7 @@ def upsert_buy_candidate(item_id: str, item: Dict, pricing: Dict):
     models = item.get("models") or [{}]
     model = models[0] if isinstance(models, list) and models else {}
     current_price = si(pricing.get("currentBidPrice", item.get("price", 0)))
+    reference_samples = build_closed_reference_samples(pricing, limit=10)
     fields = {
         "title": item.get("title", ""),
         "url": item.get("url", ""),
@@ -1666,6 +1794,13 @@ def upsert_buy_candidate(item_id: str, item: Dict, pricing: Dict):
         "reviewStatus": review_status,
         "reminderStatus": reminder_status,
         "source": "YahooAuctionAnalyzer",
+        "detailSummary": item.get("detailSummary", ""),
+        "riskSummary": item.get("riskSummary", ""),
+        "buyReason": item.get("buyReason", ""),
+        "conditionRisk": item.get("conditionRisk", ""),
+        "aiMatched": item.get("aiMatched"),
+        "referenceClosedSamples": reference_samples,
+        "referenceClosedSampleCount": len(reference_samples),
     }
     if end_epoch is not None:
         fields["endEpoch"] = end_epoch
@@ -1693,6 +1828,10 @@ def upsert_buy_candidate(item_id: str, item: Dict, pricing: Dict):
         "Buy candidate saved: itemID=%s current=%s market=%s profit=%s finalCheckAt=%s",
         item_id, current_price, market_price,
         fields["netProfitAtCurrentBid"], final_check_at,
+    )
+    logger.info(
+        "Buy candidate reference samples saved: itemID=%s sampleCount=%s",
+        item_id, len(reference_samples),
     )
 
 
@@ -1820,6 +1959,7 @@ def scrape_closed(kw: str, cnt: int, force: bool = False, source_model: Optional
             kw, "closed", False, scrape_details=False,
             brand=(source_model or {}).get("brand", ""),
             model=(source_model or {}).get("model", ""),
+            aliases=(source_model or {}).get("aliases") or (source_model or {}).get("alias") or [],
         )[:cnt]
         new_count = 0
         
@@ -1871,6 +2011,7 @@ def scrape_active(kw: str, cnt: int, max_p: int = 0, force: bool = False,
             scrape_details=False,
             brand=(source_model or {}).get("brand", ""),
             model=(source_model or {}).get("model", ""),
+            aliases=(source_model or {}).get("aliases") or (source_model or {}).get("alias") or [],
         )
         if max_p > 0:
             before_count = len(items)
@@ -1893,6 +2034,8 @@ def scrape_active(kw: str, cnt: int, max_p: int = 0, force: bool = False,
                 existing = get_record(active_db, iid)
                 if not existing:
                     new_count += 1
+                stored_source_model = (existing or {}).get("sourceModel", {}) or {}
+                source_model_changed = stored_source_model != (source_model or {})
                 
                 upsert_scraped_item(
                     active_db, iid,
@@ -1912,8 +2055,13 @@ def scrape_active(kw: str, cnt: int, max_p: int = 0, force: bool = False,
                         "itemCondition": item.get("itemCondition"),
                         "thumbnailUrl": item.get("thumbnailUrl", ""),
                         "keyword": kw,
+                        "sourceModel": source_model or {},
                     },
-                    force=force
+                    # Active records are global by auction ID.  Re-run model
+                    # matching whenever this auction is viewed under a new
+                    # target; otherwise a previous target's COMPLETED result
+                    # could be reused for an unrelated product search.
+                    force=force or source_model_changed
                 )
             except Exception as e:
                 logger.error(f"Save active failed itemId={item.get('itemId')}: {e}")
@@ -1925,8 +2073,8 @@ def scrape_active(kw: str, cnt: int, max_p: int = 0, force: bool = False,
         return []
 
 def calc_market_price(closed_ids: List[str]) -> Dict:
-    """根据有效的已成交商品计算市场价，默认采用过滤异常值后的中位数。"""
-    prices = []
+    """根据成交价分布剔除疑似低价配件簇，再计算市场价。"""
+    candidates = []
     for cid in closed_ids:
         item = get_record(closed_db, cid)
         if not item or item.get("modelStatus")!=Status.COMPLETED:
@@ -1935,36 +2083,141 @@ def calc_market_price(closed_ids: List[str]) -> Dict:
             continue
         p = si(item.get("price",0))
         if p>0:
-            prices.append(p)
-    if not prices:
+            candidates.append({
+                "itemID": str(item.get("itemID") or cid),
+                "title": str(item.get("title", "")),
+                "price": p,
+            })
+
+    empty_result = {
+        "market_price": 0, "avg_price": 0, "median_price": 0,
+        "count": 0, "raw_count": 0,
+        "raw_avg_price": 0, "raw_median_price": 0,
+        "raw_min_price": 0, "raw_max_price": 0,
+        "market_price_suspicious": False,
+        "price_filter": {
+            "low_price_cluster_removed": False,
+            "removed_low_price_count": 0,
+            "max_gap_ratio": "0",
+            "split_low_max": 0,
+            "split_high_min": 0,
+        },
+    }
+    if not candidates:
+        logger.info("Raw closed price stats: count=0")
+        return empty_result
+
+    candidates.sort(key=lambda candidate: candidate["price"])
+    prices = [candidate["price"] for candidate in candidates]
+    raw_count = len(prices)
+
+    def median(values):
+        count = len(values)
+        middle = count // 2
+        return values[middle] if count % 2 else (values[middle - 1] + values[middle]) // 2
+
+    raw_avg_price = sum(prices) // raw_count
+    raw_median_price = median(prices)
+    raw_min_price = prices[0]
+    raw_max_price = prices[-1]
+    avg_median_ratio = (
+        Decimal(raw_avg_price) / Decimal(raw_median_price)
+        if raw_median_price > 0 else Decimal("0")
+    )
+    distribution_suspicious = raw_median_price > 0 and avg_median_ratio >= Decimal("5")
+    logger.info(
+        "Raw closed price stats: count=%s avg=%s median=%s min=%s max=%s "
+        "avg_median_ratio=%s suspicious=%s",
+        raw_count, raw_avg_price, raw_median_price, raw_min_price,
+        raw_max_price, str(avg_median_ratio), distribution_suspicious,
+    )
+
+    max_gap_ratio = Decimal("0")
+    split_index = None
+    for index in range(raw_count - 1):
+        current_price = prices[index]
+        next_price = prices[index + 1]
+        gap_ratio = Decimal(next_price) / Decimal(current_price)
+        if gap_ratio > max_gap_ratio:
+            max_gap_ratio = gap_ratio
+            split_index = index + 1
+
+    price_filter = {
+        "low_price_cluster_removed": False,
+        "removed_low_price_count": 0,
+        "max_gap_ratio": str(max_gap_ratio.quantize(Decimal("0.001"))) if split_index is not None else "0",
+        "split_low_max": prices[split_index - 1] if split_index is not None else 0,
+        "split_high_min": prices[split_index] if split_index is not None else 0,
+    }
+    main_product_prices = prices
+    market_price_suspicious = False
+
+    if split_index is not None and max_gap_ratio >= Decimal("3.0"):
+        high_price_cluster = prices[split_index:]
+        if len(high_price_cluster) >= MIN_COMPARABLE:
+            main_product_prices = high_price_cluster
+            price_filter["low_price_cluster_removed"] = True
+            price_filter["removed_low_price_count"] = split_index
+            removed = candidates[:split_index]
+            logger.warning(
+                "Low-price accessory cluster removed: count=%s range=%s-%s "
+                "high_min=%s gap_ratio=%s samples=%s",
+                split_index, prices[0], prices[split_index - 1], prices[split_index],
+                price_filter["max_gap_ratio"],
+                [{"itemID": item["itemID"], "price": item["price"], "title": item["title"][:120]} for item in removed[:10]],
+            )
+        else:
+            market_price_suspicious = True
+            logger.warning(
+                "Price gap detected but high-price cluster is too small: high_count=%s "
+                "required=%s low_max=%s high_min=%s gap_ratio=%s",
+                len(high_price_cluster), MIN_COMPARABLE, prices[split_index - 1],
+                prices[split_index], price_filter["max_gap_ratio"],
+            )
+    elif distribution_suspicious:
+        market_price_suspicious = True
+        logger.warning("Suspicious price distribution has no usable price gap")
+
+    logger.info(
+        "Closed price cluster filter: removed=%s removed_count=%s low_max=%s "
+        "high_min=%s max_gap_ratio=%s suspicious=%s",
+        price_filter["low_price_cluster_removed"],
+        price_filter["removed_low_price_count"],
+        price_filter["split_low_max"],
+        price_filter["split_high_min"],
+        price_filter["max_gap_ratio"],
+        market_price_suspicious,
+    )
+    if market_price_suspicious:
+        logger.warning("Final market price: market_price=0 suspicious=true")
         return {
-            "market_price": 0,
-            "avg_price": 0,
-            "median_price": 0,
-            "count": 0,
-            "raw_count": 0,
+            **empty_result,
+            "raw_count": raw_count,
+            "raw_avg_price": raw_avg_price,
+            "raw_median_price": raw_median_price,
+            "raw_min_price": raw_min_price,
+            "raw_max_price": raw_max_price,
+            "market_price_suspicious": True,
+            "price_filter": price_filter,
         }
-    prices.sort()
-    n=len(prices)
-    if n>=3:
-        q1=prices[n//4]
-        q3=prices[n*3//4]
+
+    # Keep the existing IQR safety net when no accessory-cluster split was used.
+    if not price_filter["low_price_cluster_removed"] and len(main_product_prices)>=3:
+        n = len(main_product_prices)
+        q1=main_product_prices[n//4]
+        q3=main_product_prices[n*3//4]
         lo=int(q1-MAX_PRICE_DEV*(q3-q1))
         hi=int(q3+MAX_PRICE_DEV*(q3-q1))
-        filtered = [p for p in prices if lo<=p<=hi]
+        filtered = [p for p in main_product_prices if lo<=p<=hi]
     else:
-        filtered = prices
+        filtered = main_product_prices
     if not filtered:
-        filtered = prices
+        filtered = main_product_prices
 
     filtered.sort()
     filtered_count = len(filtered)
     avg_price = sum(filtered) // filtered_count
-    middle = filtered_count // 2
-    if filtered_count % 2:
-        median_price = filtered[middle]
-    else:
-        median_price = (filtered[middle - 1] + filtered[middle]) // 2
+    median_price = median(filtered)
     market_price = median_price
 
     logger.info(
@@ -1974,14 +2227,20 @@ def calc_market_price(closed_ids: List[str]) -> Dict:
         avg_price,
         median_price,
         filtered_count,
-        len(prices),
+        raw_count,
     )
     return {
         "market_price": market_price,
         "avg_price": avg_price,
         "median_price": median_price,
         "count": filtered_count,
-        "raw_count": len(prices),
+        "raw_count": raw_count,
+        "raw_avg_price": raw_avg_price,
+        "raw_median_price": raw_median_price,
+        "raw_min_price": raw_min_price,
+        "raw_max_price": raw_max_price,
+        "market_price_suspicious": False,
+        "price_filter": price_filter,
     }
 
 def execute_workflow(kw: str, ac: int, cc: int, force: bool, source_model: Optional[Dict] = None) -> Dict:
@@ -2041,8 +2300,21 @@ def execute_workflow(kw: str, ac: int, cc: int, force: bool, source_model: Optio
         result["median_price"] = pi.get("median_price", 0)
         result["market_price_count"] = pi.get("count", 0)
         result["raw_price_count"] = pi.get("raw_count", 0)
+        result["raw_avg_price"] = pi.get("raw_avg_price", 0)
+        result["raw_median_price"] = pi.get("raw_median_price", 0)
+        result["raw_min_price"] = pi.get("raw_min_price", 0)
+        result["raw_max_price"] = pi.get("raw_max_price", 0)
+        result["price_filter"] = pi.get("price_filter", {})
+        result["market_price_suspicious"] = bool(pi.get("market_price_suspicious", False))
         result["active_max_ratio"] = str(ACTIVE_MAX_RATIO)
         result["max_active_price"] = max_active_price
+
+        if result["market_price_suspicious"]:
+            logger.warning("Market price suspicious; skip active scraping")
+            return {**result, "status": "MARKET_PRICE_SUSPICIOUS"}
+        if market_price <= 0:
+            logger.warning("No valid market price; skip active scraping")
+            return {**result, "status": "NO_MARKET_PRICE"}
         
         # Step 4: 抓取活跃商品
         logger.info(
@@ -2240,9 +2512,13 @@ def lambda_handler(event, context):
         force = str(event.get("force_reprocess", "")).lower() in ("true", "1", "yes")
         
         logger.info(f"Starting workflow: kw={kw}, active={ac}, closed={cc_val}, force={force}")
+        aliases = event.get("aliases") or event.get("alias") or []
+        if isinstance(aliases, str):
+            aliases = [aliases]
         source_model = {
             "brand": norm(event.get("brand", "")),
             "model": norm(event.get("model", "")),
+            "aliases": [norm(alias) for alias in aliases if norm(alias)],
         }
         if not source_model["brand"] or not source_model["model"]:
             # 兼容直接调用：keyword 通常就是 "brand model"，但无法可靠拆分时
