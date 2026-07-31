@@ -17,12 +17,16 @@ from auction_analyzer import (
     batch_parse,
     build_active_parse_prompt,
     build_closed_parse_prompt,
+    calc_market_price,
     calc_decision,
     normalize_pricing_key,
     pricing_key_with_condition,
     resolve_closed_without_ai,
     save_active_model,
     save_closed_model,
+    scrape_active,
+    upsert_buy_candidate,
+    update_record,
 )
 
 
@@ -55,6 +59,111 @@ class NormalizePricingKeyTest(unittest.TestCase):
 
 
 class LeanAiWorkflowTest(unittest.TestCase):
+    @patch("auction_analyzer.time.time", return_value=1_000)
+    @patch("auction_analyzer.buy_candidate_db")
+    def test_buy_candidate_is_scheduled_without_sending_email(self, candidate_db, _time):
+        candidate_db.get_item.return_value = {}
+        item = {
+            "title": "Nikon lens", "url": "https://example.test/item",
+            "thumbnailUrl": "thumb", "keyword": "Nikon lens",
+            "models": [{"brand": "Nikon", "model": "Z lens"}],
+            "price": 62000, "buynowPrice": 0, "shippingFee": 1000,
+            "endTime": "1970-01-01T00:33:20+00:00",
+        }
+        pricing = {
+            "estimatedMarketPrice": 77000, "currentBidPrice": 62000,
+            "netProfitAtCurrentBid": 11000,
+            "profitMarginAtCurrentBid": Decimal("0.143"),
+            "roiAtCurrentBid": Decimal("0.18"),
+            "pricingConfidence": Decimal("0.80"), "riskLevel": "LOW", "riskScore": 2,
+        }
+
+        upsert_buy_candidate("item-1", item, pricing)
+
+        kwargs = candidate_db.update_item.call_args.kwargs
+        values = kwargs["ExpressionAttributeValues"]
+        self.assertIn("firstDetectedAt = if_not_exists", kwargs["UpdateExpression"])
+        self.assertIn("WAITING_FINAL_CHECK", values.values())
+        self.assertIn("NOT_SENT", values.values())
+        self.assertIn(1100, values.values())
+
+    @patch("auction_analyzer.buy_candidate_db")
+    def test_buy_candidate_with_invalid_end_time_is_not_scheduled(self, candidate_db):
+        candidate_db.get_item.return_value = {}
+
+        upsert_buy_candidate("item-2", {"endTime": "unknown"}, {
+            "estimatedMarketPrice": 10000,
+        })
+
+        values = candidate_db.update_item.call_args.kwargs["ExpressionAttributeValues"]
+        self.assertIn("INVALID_END_TIME", values.values())
+        self.assertIn("NOT_SCHEDULED", values.values())
+
+    @patch("auction_analyzer.upsert_scraped_item")
+    @patch("auction_analyzer.get_record", return_value=None)
+    @patch("auction_analyzer.scrape_auctions")
+    def test_active_scrape_filters_current_price_by_market_upper_limit(
+        self, scrape_auctions, _get_record, upsert_scraped_item
+    ):
+        scrape_auctions.return_value = [
+            {"itemId": "invalid", "price": 0, "buynowPrice": 10},
+            {"itemId": "cheap", "price": 80, "buynowPrice": 200},
+            {"itemId": "limit", "price": 100},
+            {"itemId": "expensive", "price": 101},
+        ]
+
+        item_ids = scrape_active("camera", 10, max_p=100)
+
+        self.assertEqual(item_ids, ["cheap", "limit"])
+        self.assertNotIn("min_price", scrape_auctions.call_args.kwargs)
+        saved_ids = [call.args[1] for call in upsert_scraped_item.call_args_list]
+        self.assertEqual(saved_ids, ["cheap", "limit"])
+
+    @patch("auction_analyzer.get_record")
+    def test_market_price_uses_filtered_closed_median(self, get_record):
+        records = {
+            "1": {"modelStatus": Status.COMPLETED, "listingType": "MAIN_PRODUCT", "price": 100},
+            "2": {"modelStatus": Status.COMPLETED, "listingType": "MAIN_PRODUCT", "price": 105},
+            "3": {"modelStatus": Status.COMPLETED, "listingType": "MAIN_PRODUCT", "price": 110},
+            "4": {"modelStatus": Status.COMPLETED, "listingType": "MAIN_PRODUCT", "price": 115},
+            "5": {"modelStatus": Status.COMPLETED, "listingType": "MAIN_PRODUCT", "price": 10000},
+            "excluded": {"modelStatus": Status.COMPLETED, "listingType": "ACCESSORY", "price": 50},
+            "pending": {"modelStatus": Status.PENDING, "listingType": "MAIN_PRODUCT", "price": 90},
+        }
+        get_record.side_effect = lambda _table, item_id: records[item_id]
+
+        result = calc_market_price(list(records))
+
+        self.assertEqual(result, {
+            "market_price": 107,
+            "avg_price": 107,
+            "median_price": 107,
+            "count": 4,
+            "raw_count": 5,
+        })
+
+    @patch("auction_analyzer.get_record", return_value=None)
+    def test_market_price_returns_zero_statistics_without_prices(self, _get_record):
+        self.assertEqual(calc_market_price(["missing"]), {
+            "market_price": 0,
+            "avg_price": 0,
+            "median_price": 0,
+            "count": 0,
+            "raw_count": 0,
+        })
+
+    def test_every_analyzer_update_refreshes_modified_order_fields(self):
+        table = Mock()
+
+        update_record(table, "a1", {"price": 100})
+
+        values = table.update_item.call_args.kwargs["ExpressionAttributeValues"]
+        self.assertEqual(values[":modifiedIndexPk"], "ALL")
+        self.assertRegex(
+            values[":modifiedAt"],
+            r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}",
+        )
+
     def test_active_prompt_keeps_item_id_and_only_requests_brand_model(self):
         prompt = build_active_parse_prompt([{"itemID": "a1", "title": "Apple iPhone 15" + "x" * 200}])
         self.assertIn('"itemId":"a1"', prompt)
