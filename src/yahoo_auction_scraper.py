@@ -495,7 +495,9 @@ def scrape_multiple_details(item_ids, save_to_db=False, search_type="active"):
                                 detailUrl = :url,
                                 detailScrapedAt = :now,
                                 detailDescriptionLength = :length,
-                                detailScrapeStatus = :status
+                                detailScrapeStatus = :status,
+                                modifiedIndexPk = :modified_index_pk,
+                                modifiedAt = :now
                         """,
                         ExpressionAttributeValues={
                             ":desc": desc[:DETAIL_DESCRIPTION_MAX_CHARS],
@@ -510,6 +512,7 @@ def scrape_multiple_details(item_ids, save_to_db=False, search_type="active"):
                             ":now": detail.get("scrapedAt", datetime.now(timezone.utc).isoformat()),
                             ":length": len(desc),
                             ":status": "COMPLETED" if desc else "EMPTY",
+                            ":modified_index_pk": "ALL",
                         }
                     )
                 except Exception as e:
@@ -636,7 +639,9 @@ def lambda_handler(event, context):
                             detailUrl = :url,
                             detailScrapedAt = :now,
                             detailDescriptionLength = :len,
-                            detailScrapeStatus = :status
+                            detailScrapeStatus = :status,
+                            modifiedIndexPk = :modified_index_pk,
+                            modifiedAt = :now
                     """,
                     ExpressionAttributeValues={
                         ":desc": detail["description"],
@@ -650,7 +655,8 @@ def lambda_handler(event, context):
                         ":url": detail["url"],
                         ":now": detail["scrapedAt"],
                         ":len": len(detail["description"]),
-                        ":status": "COMPLETED" if detail["description"] else "EMPTY"
+                        ":status": "COMPLETED" if detail["description"] else "EMPTY",
+                        ":modified_index_pk": "ALL",
                     }
                 )
             except Exception as e:
@@ -1274,9 +1280,12 @@ def save_items(items, table):
     for item in items:
         try:
             item_key = item["itemId"]
+            modified_at = datetime.now(timezone.utc).isoformat()
             table.put_item(
                 Item={
                     "itemID": item_key,
+                    "modifiedIndexPk": "ALL",
+                    "modifiedAt": modified_at,
                     "itemType": item.get("itemType", "unknown"),
                     "title": item.get("title", ""),
                     "price": item.get("price", 0),
@@ -1349,7 +1358,9 @@ def save_items(items, table):
                             detailDescriptionLength = :detail_len,
                             detailScrapeStatus = :detail_status,
                             detailScrapeError = :detail_error,
-                            lastDetailUpdatedAt = :now
+                            lastDetailUpdatedAt = :now,
+                            modifiedIndexPk = :modified_index_pk,
+                            modifiedAt = :now
                     """,
                     ExpressionAttributeNames={
                         "#item_url": "url",
@@ -1372,6 +1383,7 @@ def save_items(items, table):
                         ":item_url": item.get("url") or "",
                         ":thumbnail": item.get("thumbnailUrl") or "",
                         ":scraped_at": item.get("scrapedAt") or datetime.now(timezone.utc).isoformat(),
+                        ":modified_index_pk": "ALL",
                         ":desc": item.get("detailDescription", ""),
                         ":raw": item.get("detailDescriptionRaw", ""),
                         ":cleaned": item.get("detailDescriptionCleaned", ""),

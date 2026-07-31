@@ -498,6 +498,10 @@ Resources:
           AttributeType: S
         - AttributeName: GSI1SK
           AttributeType: S
+        - AttributeName: modified_index_pk
+          AttributeType: S
+        - AttributeName: modified_at
+          AttributeType: S
       KeySchema:
         - AttributeName: PK
           KeyType: HASH
@@ -509,6 +513,14 @@ Resources:
             - AttributeName: GSI1PK
               KeyType: HASH
             - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: ModifiedAtIndex
+          KeySchema:
+            - AttributeName: modified_index_pk
+              KeyType: HASH
+            - AttributeName: modified_at
               KeyType: RANGE
           Projection:
             ProjectionType: ALL
@@ -531,9 +543,22 @@ Resources:
       AttributeDefinitions:
         - AttributeName: itemID
           AttributeType: S
+        - AttributeName: modifiedIndexPk
+          AttributeType: S
+        - AttributeName: modifiedAt
+          AttributeType: S
       KeySchema:
         - AttributeName: itemID
           KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: ModifiedAtIndex
+          KeySchema:
+            - AttributeName: modifiedIndexPk
+              KeyType: HASH
+            - AttributeName: modifiedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
       SSESpecification:
         SSEEnabled: true
       PointInTimeRecoverySpecification:
@@ -553,9 +578,22 @@ Resources:
       AttributeDefinitions:
         - AttributeName: itemID
           AttributeType: S
+        - AttributeName: modifiedIndexPk
+          AttributeType: S
+        - AttributeName: modifiedAt
+          AttributeType: S
       KeySchema:
         - AttributeName: itemID
           KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: ModifiedAtIndex
+          KeySchema:
+            - AttributeName: modifiedIndexPk
+              KeyType: HASH
+            - AttributeName: modifiedAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
       SSESpecification:
         SSEEnabled: true
       PointInTimeRecoverySpecification:

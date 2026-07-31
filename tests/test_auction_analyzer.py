@@ -23,6 +23,7 @@ from auction_analyzer import (
     resolve_closed_without_ai,
     save_active_model,
     save_closed_model,
+    update_record,
 )
 
 
@@ -55,6 +56,18 @@ class NormalizePricingKeyTest(unittest.TestCase):
 
 
 class LeanAiWorkflowTest(unittest.TestCase):
+    def test_every_analyzer_update_refreshes_modified_order_fields(self):
+        table = Mock()
+
+        update_record(table, "a1", {"price": 100})
+
+        values = table.update_item.call_args.kwargs["ExpressionAttributeValues"]
+        self.assertEqual(values[":modifiedIndexPk"], "ALL")
+        self.assertRegex(
+            values[":modifiedAt"],
+            r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}",
+        )
+
     def test_active_prompt_keeps_item_id_and_only_requests_brand_model(self):
         prompt = build_active_parse_prompt([{"itemID": "a1", "title": "Apple iPhone 15" + "x" * 200}])
         self.assertIn('"itemId":"a1"', prompt)
