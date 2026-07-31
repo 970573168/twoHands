@@ -10,10 +10,12 @@ os.environ.setdefault("AWS_EC2_METADATA_DISABLED", "true")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from yahoo_auction_scraper import (
+    _search_context_kwargs,
     LocalListingType,
     build_contextual_exclude_keywords,
     classify_listing_type_by_title,
     detect_target_context,
+    get_filter_keywords,
     normalize_title_for_filter,
     sanitize_search_keyword,
     should_filter_item_by_context,
@@ -60,6 +62,12 @@ class LocalTitleFilterTest(unittest.TestCase):
         for title, expected in cases.items():
             with self.subTest(title=title):
                 self.assertEqual(classify_listing_type_by_title(title), expected)
+
+    def test_specific_noise_rule_wins_over_later_clothing_or_bundle_word(self):
+        self.assertEqual(
+            classify_listing_type_by_title("保護フィルム 2個セット"),
+            LocalListingType.CASE_OR_FILM,
+        )
 
     def test_context_keeps_target_battery_and_adapter(self):
         battery_context = detect_target_context("Makita BL1860B", model="BL1860B")
@@ -109,6 +117,24 @@ class LocalTitleFilterTest(unittest.TestCase):
         self.assertNotIn("バッテリー", excludes)
         self.assertNotIn("充電器", excludes)
         self.assertIn("空箱", excludes)
+
+    def test_explicit_empty_url_excludes_are_respected(self):
+        excludes, includes = get_filter_keywords({
+            "keyword": "Sony α7R IV",
+            "exclude_keywords": "",
+        })
+        self.assertEqual(excludes, "")
+        self.assertEqual(includes, "")
+
+    def test_source_model_accepts_object_and_string_event_shapes(self):
+        self.assertEqual(
+            _search_context_kwargs({"sourceModel": {"brand": "Sony", "model": "α7R IV"}})["model"],
+            "α7R IV",
+        )
+        self.assertEqual(
+            _search_context_kwargs({"sourceModel": "N9935B"})["model"],
+            "N9935B",
+        )
 
     def test_keyword_normalization_and_simplification_keep_model(self):
         self.assertEqual(normalize_title_for_filter("  ｉＰｈｏｎｅ　XR  "), "IPHONE XR")

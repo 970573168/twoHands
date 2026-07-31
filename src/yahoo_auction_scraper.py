@@ -163,6 +163,9 @@ def _contains_any(text, keywords):
 
 def classify_listing_type_by_title(title: str) -> str:
     text = normalize_title_for_filter(title)
+    # Two explicit exceptions avoid ambiguous substrings: ペンケース is a bag
+    # rather than a device case, and a tool body with its battery/charger is a
+    # bundle even though the charger rule is evaluated before general bundles.
     if "本体" in text and _contains_any(text, ("セット", "一式", "まとめ")):
         return LocalListingType.BUNDLE
     if _contains_any(text, ("カーディガン", "ショルダーバッグ", "レザーバッグ", "ペンケース", "バッグ", "財布")):
@@ -221,7 +224,7 @@ def classify_listing_type_by_title(title: str) -> str:
             return listing_type
     if re.search(r"(?:^|\s)(?:1D|2D|AUX)(?:\s|$)", text):
         return LocalListingType.CAR_AUDIO_OR_CARPLAY
-    # 付属品を列挙しただけの本体商品は bundle にしない。
+    # 付属品を列挙しただけのレンズ商品は bundle にしない。
     if not ("レンズ" in text and _contains_any(text, ("元箱", "フード付き"))):
         if _contains_any(text, (
             "まとめ売り", "5点セット", "2台セット", "4台セット", "5個セット",
@@ -350,12 +353,18 @@ def _optional_bool(value):
 
 def _search_context_kwargs(event):
     source_model = event.get("sourceModel", {}) or {}
-    if not isinstance(source_model, dict):
-        source_model = {}
+    if isinstance(source_model, dict):
+        source_brand = source_model.get("brand", "")
+        source_model_name = source_model.get("model", "")
+    else:
+        # Some upstream callers send sourceModel as the model-name string
+        # rather than the catalog object.  Accept both event shapes.
+        source_brand = ""
+        source_model_name = str(source_model)
     return {
         "category": event.get("category", ""),
-        "brand": event.get("brand", source_model.get("brand", "")),
-        "model": event.get("model", source_model.get("model", "")),
+        "brand": event.get("brand") or source_brand,
+        "model": event.get("model") or source_model_name,
         "enable_local_title_filter": _optional_bool(event.get("enable_local_title_filter")),
         "local_title_filter_strict": _optional_bool(event.get("local_title_filter_strict")),
     }
@@ -1062,10 +1071,6 @@ def scrape_auctions(keyword, search_type, include_paypay=True,
     """抓取列表页；scrape_details 可显式控制是否同步抓取详情。"""
     if scrape_details is None:
         scrape_details = ENABLE_DETAIL_SCRAPE_ON_SEARCH
-    if not exclude_keywords and USE_DEFAULT_EXCLUDE:
-        exclude_keywords = build_contextual_exclude_keywords({
-            "keyword": keyword, "category": category, "brand": brand, "model": model,
-        })
     if enable_local_title_filter is None:
         enable_local_title_filter = ENABLE_LOCAL_TITLE_FILTER
     if local_title_filter_strict is None:
