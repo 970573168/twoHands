@@ -883,7 +883,6 @@ Resources:
         Variables:
           TABLE_NAME_ACTIVE: !Sub "YahooAuctionActiveItems-${Environment}"
           TABLE_NAME_CLOSED: !Sub "YahooAuctionItems-${Environment}"
-          PRODUCT_TABLE_NAME: !Sub "ProductCatalog-${Environment}"
           ENVIRONMENT: !Ref Environment
 
           AI_MODE: !Ref AiMode
@@ -899,34 +898,9 @@ Resources:
           OPENAI_URL: !Ref OpenaiUrl
           OPENAI_TIMEOUT: !Ref OpenaiTimeout
           OPENAI_MAX_TOKENS: !Ref OpenaiMaxTokens
-          DEFAULT_SEARCH_COUNT: !Ref DefaultSearchCount
-          DEFAULT_ACTIVE_COUNT: !Ref MaxActiveItems
-          DEFAULT_CLOSED_COUNT: !Ref MaxClosedPerModel
-          MAX_ACTIVE_ITEMS: !Ref MaxActiveItems
-          MAX_CLOSED_ITEMS: !Ref MaxClosedPerModel
-          REQUEST_INTERVAL: !Ref RequestInterval
-          MODEL_PARSE_BATCH_SIZE: !Ref ModelParseBatchSize
-          CLOSED_PARSE_BATCH_SIZE: !Ref ClosedParseBatchSize
-
-          MAX_TOTAL_TOKENS: !Ref MaxTotalTokens
-          LAMBDA_TIMEOUT_SECONDS: "840"
-          LAMBDA_TIMEOUT_BUFFER: !Ref LambdaTimeoutBuffer
-
-          EXPECTED_SELLING_FEE_RATE: !Ref ExpectedSellingFeeRate
-          DEFAULT_SHIPPING_COST: !Ref DefaultShippingCost
-          DEFAULT_REPAIR_RESERVE_RATE: !Ref DefaultRepairReserveRate
           MIN_COMPARABLE_COUNT: !Ref MinComparableCount
-          MAX_PRICE_DEVIATION: !Ref MaxPriceDeviation
-          RISK_RESERVE_RATE: !Ref RiskReserveRate
-
-          ACTIVE_PRICE_MIN_RATIO: !Ref ActivePriceMinRatio
           BUY_MARGIN_THRESHOLD: !Ref BuyMarginThreshold
           REVIEW_MARGIN_THRESHOLD: !Ref ReviewMarginThreshold
-          HIGH_CONFIDENCE_COMPARABLE_COUNT: !Ref HighConfidenceComparableCount
-          MEDIUM_CONFIDENCE_COMPARABLE_COUNT: !Ref MediumConfidenceComparableCount
-
-          AI_REQUEST_TIMEOUT: !Ref AiRequestTimeout
-          AI_MAX_RETRIES: !Ref AiMaxRetries
 
           MAX_TOKENS: !Ref MaxTotalTokens
           SIMPLE_MAX_TOKENS: "4000"
@@ -937,7 +911,6 @@ Resources:
           TIMEOUT_BUFFER: !Ref LambdaTimeoutBuffer
           
           MODEL_BATCH: !Ref ModelParseBatchSize
-          CLOSED_BATCH: !Ref ClosedParseBatchSize
           SIMPLE_BATCH: !Ref ModelParseBatchSize
           DETAIL_BATCH: "10"
           REQ_INTERVAL: !Ref RequestInterval
@@ -960,7 +933,6 @@ Resources:
           ENABLE_DETAIL_SCRAPE_ON_SEARCH: !Ref EnableDetailScrape
           DETAIL_REQUEST_INTERVAL: !Ref DetailRequestInterval
           DETAIL_DESCRIPTION_MAX_CHARS: !Ref DetailDescMaxChars
-          DETAIL_SCRAPE_MAX_ITEMS: !Ref DetailScrapeMaxItems
 
           MAX_PAGES: !Ref YahooAuctionMaxPages
           REQUEST_TIMEOUT: !Ref YahooAuctionRequestTimeout
@@ -1001,11 +973,11 @@ Resources:
           MAX_ACTIVE_COUNT: !Ref MaxActiveItems
           MAX_CLOSED_COUNT: !Ref MaxClosedPerModel
           ENABLE_SCHEDULED_SCAN: !Ref CatalogScannerEnabled
-          DISPATCH_INTERVAL_SECONDS: "10"
-          DISPATCH_JITTER_SECONDS: "5"
-          STARTUP_JITTER_SECONDS: "15"
-          BATCH_SIZE: "1"
-          BATCH_INTERVAL_SECONDS: "0"
+          DISPATCH_INTERVAL_SECONDS: "0.3"
+          DISPATCH_JITTER_SECONDS: "0.2"
+          STARTUP_JITTER_SECONDS: "1"
+          BATCH_SIZE: "5"
+          BATCH_INTERVAL_SECONDS: "1"
           TODAY_TAG_KEY: "last_scanned_date"
           DATA_SOURCE: "AI_DISCOVERY"
       Tags:
