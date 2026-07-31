@@ -18,14 +18,18 @@ from auction_analyzer import (
     batch_parse,
     build_active_parse_prompt,
     build_closed_parse_prompt,
+    build_description_parse_prompt,
     calc_market_price,
     calc_decision,
     normalize_pricing_key,
     pricing_key_with_condition,
     resolve_closed_without_ai,
+    price_active_item,
     save_active_model,
     save_closed_model,
+    save_model,
     scrape_active,
+    should_reanalyze_description,
     upsert_buy_candidate,
     update_record,
 )
@@ -60,6 +64,77 @@ class NormalizePricingKeyTest(unittest.TestCase):
 
 
 class LeanAiWorkflowTest(unittest.TestCase):
+    def test_buy_and_review_always_require_detail_recheck(self):
+        base = {"pricingStatus": Status.COMPLETED, "netProfitAtCurrentBid": 1}
+        self.assertTrue(should_reanalyze_description({}, {
+            **base, "profitMarginAtCurrentBid": Decimal("0.20"),
+        }))
+        self.assertTrue(should_reanalyze_description({}, {
+            **base, "profitMarginAtCurrentBid": Decimal("0.10"),
+        }))
+        self.assertFalse(should_reanalyze_description({}, {
+            "pricingStatus": Status.COMPLETED,
+            "netProfitAtCurrentBid": -1,
+            "profitMarginAtCurrentBid": Decimal("0.50"),
+        }))
+        self.assertFalse(should_reanalyze_description({}, {
+            **base, "pricingStatus": Status.INSUFFICIENT_DATA,
+            "profitMarginAtCurrentBid": Decimal("0.30"),
+        }))
+
+    @patch("auction_analyzer.deactivate_buy_candidate")
+    @patch("auction_analyzer.upsert_buy_candidate")
+    @patch("auction_analyzer.save_pricing")
+    @patch("auction_analyzer.build_result")
+    @patch("auction_analyzer.calc_stats", return_value={})
+    @patch("auction_analyzer.find_comp", return_value=([], {}))
+    @patch("auction_analyzer.get_record")
+    def test_initial_pricing_does_not_sync_buy_candidate(
+        self, get_record, _find_comp, _calc_stats, build_result, save_pricing,
+        upsert_candidate, deactivate_candidate,
+    ):
+        item = {
+            "itemID": "a1", "modelStatus": Status.COMPLETED,
+            "listingType": ListingType.MAIN_PRODUCT,
+            "models": [{"brand": "Nikon", "model": "Z 85"}],
+            "price": 100, "shippingFee": 0,
+        }
+        get_record.return_value = item
+        build_result.return_value = {
+            "pricingStatus": Status.COMPLETED,
+            "netProfitAtCurrentBid": 100,
+            "profitMarginAtCurrentBid": Decimal("0.20"),
+        }
+
+        result = price_active_item("a1", {}, sync_candidate=False)
+
+        self.assertEqual(result, build_result.return_value)
+        save_pricing.assert_called_once()
+        upsert_candidate.assert_not_called()
+        deactivate_candidate.assert_not_called()
+
+    def test_detail_prompt_explicitly_excludes_missing_lens_or_body(self):
+        prompt = build_description_parse_prompt([{
+            "itemID": "a1",
+            "title": "NIKKOR Z 85mm 元箱",
+            "detailDescription": "レンズ無し。元箱とマニュアルのみです。",
+        }])
+        self.assertIn("レンズ無し", prompt)
+        self.assertIn("本体は含まれません", prompt)
+        self.assertIn("listingType は BOX_ONLY または ACCESSORY", prompt)
+
+    @patch("auction_analyzer.update_record")
+    def test_detail_reanalysis_excludes_box_only_from_pricing(self, update_record):
+        status = save_model(Mock(), "a1", {
+            "brand": "Nikon", "model": "NIKKOR Z 85mm f/1.2 S",
+            "listingType": ListingType.BOX_ONLY,
+        })
+        fields = update_record.call_args.args[2]
+        self.assertEqual(status, Status.EXCLUDED)
+        self.assertEqual(fields["modelStatus"], Status.EXCLUDED)
+        self.assertEqual(fields["pricingStatus"], Status.NOT_APPLICABLE)
+        self.assertFalse(fields["isAnalysisEligible"])
+
     @patch("auction_analyzer.time.time", return_value=1_000)
     @patch("auction_analyzer.buy_candidate_db")
     def test_buy_candidate_is_scheduled_without_sending_email(self, candidate_db, _time):

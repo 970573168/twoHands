@@ -761,7 +761,7 @@ DETAILED_PARSE_PROMPT = """あなたは中古電子製品の識別専門家で�
   ]
 }}
 
-listingType: MAIN_PRODUCT/ACCESSORY/PARTS/BROKEN/BOX_ONLY/BUNDLE/UNKNOWN
+listingType: MAIN_PRODUCT/ACCESSORY/PARTS/BROKEN/BOX_ONLY/RENTAL/BUNDLE/UNKNOWN
 condition: NEW/USED/BROKEN/UNKNOWN
 
 重要ルール：
@@ -777,7 +777,8 @@ condition: NEW/USED/BROKEN/UNKNOWN
 10. 商品説明から読み取れない重要情報は missing に入れる
 11. アクセサリ、部品、空箱、セット品は適切な listingType に分類する。故障した本体は MAIN_PRODUCT とする
 12. conditionClass は isJunk=true、defects あり、condition=BROKEN、または listingType=BROKEN の場合 JUNK、それ以外は NORMAL
-13. JSONのみを出力してください"""
+13. レンズ無し/レンズなし/本体無し/本体なし/本体は含まれません/商品本体なし は本体ではありません。その場合 listingType は BOX_ONLY または ACCESSORY、models は空配列にしてください
+14. JSONのみを出力してください"""
 
 
 def build_active_parse_prompt(items: List[Dict]) -> str:
@@ -1731,7 +1732,8 @@ def has_usable_model(item: Dict) -> bool:
     )
 
 
-def price_active_item(item_id: str, idx: Dict[str,List[Dict]]) -> Optional[Dict]:
+def price_active_item(item_id: str, idx: Dict[str,List[Dict]],
+                      sync_candidate: bool = True) -> Optional[Dict]:
     """计算并保存单个 active 商品利润；返回定价结果。"""
     item = get_record(active_db, item_id)
     if not item or not has_usable_model(item):
@@ -1749,23 +1751,27 @@ def price_active_item(item_id: str, idx: Dict[str,List[Dict]]) -> Optional[Dict]
         sd(pricing.get("profitMarginAtCurrentBid", 0)),
     )
     save_pricing(item_id, pricing, recommendation)
-    try:
-        if recommendation == Recommendation.BUY_CANDIDATE:
-            upsert_buy_candidate(item_id, item, pricing)
-        else:
-            deactivate_buy_candidate(item_id, "REPRICED_NOT_BUY_CANDIDATE")
-    except Exception as exc:
-        # 推荐库属于旁路能力，写入失败不能破坏现有 pricing 主流程。
-        logger.exception("Buy candidate sync failed: itemID=%s error=%s", item_id, exc)
+    if sync_candidate:
+        try:
+            if recommendation == Recommendation.BUY_CANDIDATE:
+                upsert_buy_candidate(item_id, item, pricing)
+            else:
+                deactivate_buy_candidate(item_id, "REPRICED_NOT_BUY_CANDIDATE")
+        except Exception as exc:
+            # 推荐库属于旁路能力，写入失败不能破坏现有 pricing 主流程。
+            logger.exception("Buy candidate sync failed: itemID=%s error=%s", item_id, exc)
     return pricing
 
 
 def should_reanalyze_description(item: Dict, pricing: Dict) -> bool:
-    """有正利润且缺关键参数时，才抓取详情并进行第二次 AI 分析。"""
-    return (
-        si(item.get("missingParameterCount", 0)) > 0
-        and sd(pricing.get("netProfitAtCurrentBid", 0)) > 0
+    """所有初判 BUY_CANDIDATE/REVIEW 都必须经过详情复核。"""
+    if pricing.get("pricingStatus") != Status.COMPLETED:
+        return False
+    recommendation = calc_decision(
+        sd(pricing.get("netProfitAtCurrentBid", 0)),
+        sd(pricing.get("profitMarginAtCurrentBid", 0)),
     )
+    return recommendation in (Recommendation.BUY_CANDIDATE, Recommendation.REVIEW)
 
 
 def scrape_profitable_active_detail(item_id: str) -> Optional[Dict]:
@@ -1810,7 +1816,11 @@ def scrape_profitable_active_detail(item_id: str) -> Optional[Dict]:
 def scrape_closed(kw: str, cnt: int, force: bool = False, source_model: Optional[Dict] = None) -> List[str]:
     """抓取已结束商品，新商品自动设为 PENDING"""
     try:
-        items = scrape_auctions(kw, "closed", False, scrape_details=False)[:cnt]
+        items = scrape_auctions(
+            kw, "closed", False, scrape_details=False,
+            brand=(source_model or {}).get("brand", ""),
+            model=(source_model or {}).get("model", ""),
+        )[:cnt]
         new_count = 0
         
         for item in items:
@@ -1850,7 +1860,8 @@ def scrape_closed(kw: str, cnt: int, force: bool = False, source_model: Optional
         logger.error(f"Closed scrape: {e}")
         return []
 
-def scrape_active(kw: str, cnt: int, max_p: int = 0, force: bool = False) -> List[str]:
+def scrape_active(kw: str, cnt: int, max_p: int = 0, force: bool = False,
+                  source_model: Optional[Dict] = None) -> List[str]:
     """抓取活跃商品，新商品自动设为 PENDING"""
     try:
         items = scrape_auctions(
@@ -1858,6 +1869,8 @@ def scrape_active(kw: str, cnt: int, max_p: int = 0, force: bool = False) -> Lis
             "active",
             False,
             scrape_details=False,
+            brand=(source_model or {}).get("brand", ""),
+            model=(source_model or {}).get("model", ""),
         )
         if max_p > 0:
             before_count = len(items)
@@ -2039,7 +2052,7 @@ def execute_workflow(kw: str, ac: int, cc: int, force: bool, source_model: Optio
             max_active_price,
             ACTIVE_MAX_RATIO,
         )
-        active_ids = scrape_active(kw, ac, max_active_price, force)
+        active_ids = scrape_active(kw, ac, max_active_price, force, source_model)
         result["active"] = len(active_ids)
         if not active_ids:
             logger.warning("No active items found")
@@ -2094,7 +2107,8 @@ def execute_workflow(kw: str, ac: int, cc: int, force: bool, source_model: Optio
                 if not force and item.get("pricingStatus") != Status.PENDING:
                     continue
 
-                pricing = price_active_item(aid, idx)
+                # 初步定价只写 active 表，必须等详情复核后才同步推荐库。
+                pricing = price_active_item(aid, idx, sync_candidate=False)
                 if not pricing:
                     continue
                 priced += 1
@@ -2102,9 +2116,12 @@ def execute_workflow(kw: str, ac: int, cc: int, force: bool, source_model: Optio
                 if should_reanalyze_description(item, pricing):
                     description_recheck_ids.append(aid)
                     logger.info(
-                        "Active item queued for on-demand detail scrape: %s missing=%s net_profit=%s",
+                        "Active item queued for detail recheck: %s recommendation=%s net_profit=%s",
                         aid,
-                        item.get("missingCriticalParameters", []),
+                        calc_decision(
+                            sd(pricing.get("netProfitAtCurrentBid", 0)),
+                            sd(pricing.get("profitMarginAtCurrentBid", 0)),
+                        ),
                         pricing.get("netProfitAtCurrentBid", 0),
                     )
                 
@@ -2113,22 +2130,32 @@ def execute_workflow(kw: str, ac: int, cc: int, force: bool, source_model: Optio
             except Exception as e:
                 logger.error(f"Pricing {aid}: {e}")
 
-        # Step 8: 仅对有利润且缺少关键参数的 active 商品使用详情二次分析
+        # Step 8: 所有 BUY_CANDIDATE/REVIEW 商品必须使用详情二次分析
         detail_scraped = 0
         reanalyzed = 0
         repriced = 0
         if description_recheck_ids:
             logger.info(
-                "Step 8: On-demand detail scrape for %s profitable active items",
+                "Step 8: On-demand detail scrape for %s candidate/review active items",
                 len(description_recheck_ids),
             )
             recheck_items = []
             for index, aid in enumerate(description_recheck_ids):
                 check_limits()
-                detail_item = scrape_profitable_active_detail(aid)
+                existing = get_record(active_db, aid)
+                if (
+                    existing
+                    and existing.get("detailScrapeStatus") == "COMPLETED"
+                    and str(existing.get("detailDescription", "")).strip()
+                ):
+                    detail_item = existing
+                    logger.info("Reusing existing active detail: itemID=%s", aid)
+                else:
+                    detail_item = scrape_profitable_active_detail(aid)
+                    if detail_item and str(detail_item.get("detailDescription", "")).strip():
+                        detail_scraped += 1
                 if detail_item and str(detail_item.get("detailDescription", "")).strip():
                     recheck_items.append(detail_item)
-                    detail_scraped += 1
                 if index < len(description_recheck_ids) - 1:
                     time.sleep(_env("DETAIL_REQUEST_INTERVAL", 0.3, float))
 
@@ -2151,14 +2178,26 @@ def execute_workflow(kw: str, ac: int, cc: int, force: bool, source_model: Optio
                     + reanalysis_result.get("excluded", 0)
                 )
 
-            # 使用详情补齐后的模型重新计算利润与推荐
+            # 使用详情分析后的最新记录重新计算利润，最终结果才同步推荐库。
             for item in recheck_items:
                 aid = str(item.get("itemID", ""))
                 if not aid:
                     continue
                 try:
                     check_limits()
-                    if price_active_item(aid, idx):
+                    item_after = get_record(active_db, aid)
+                    if not item_after or not has_usable_model(item_after):
+                        update_record(active_db, aid, {
+                            "purchaseRecommendation": Recommendation.AVOID,
+                            "pricingStatus": Status.NOT_APPLICABLE,
+                        })
+                        deactivate_buy_candidate(aid, "DETAIL_REANALYSIS_EXCLUDED")
+                        logger.info(
+                            "Detail reanalysis excluded active item: itemID=%s listingType=%s",
+                            aid, (item_after or {}).get("listingType", "UNKNOWN"),
+                        )
+                        continue
+                    if price_active_item(aid, idx, sync_candidate=True):
                         repriced += 1
                 except RuntimeError:
                     raise

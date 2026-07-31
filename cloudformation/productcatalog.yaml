@@ -995,6 +995,8 @@ Resources:
           DETAIL_REQUEST_INTERVAL: !Ref DetailRequestInterval
           DETAIL_DESCRIPTION_MAX_CHARS: !Ref DetailDescMaxChars
           DETAIL_SCRAPE_MAX_ITEMS: !Ref DetailScrapeMaxItems
+          ENABLE_LOCAL_TITLE_FILTER: "true"
+          LOCAL_TITLE_FILTER_STRICT: "false"
       Tags:
         - Key: Application
           Value: YahooAuctionScraper
@@ -1139,6 +1141,8 @@ Resources:
           REQUEST_TIMEOUT: !Ref YahooAuctionRequestTimeout
           DEBUG_LOG_HTML: !Ref YahooAuctionDebugLogHtml
           ITEMS_PER_PAGE: !Ref YahooAuctionItemsPerPage
+          ENABLE_LOCAL_TITLE_FILTER: "true"
+          LOCAL_TITLE_FILTER_STRICT: "false"
 
       Tags:
         - Key: Application
