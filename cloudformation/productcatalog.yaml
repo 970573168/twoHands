@@ -312,11 +312,12 @@ Parameters:
     MinValue: 0
     MaxValue: 1
 
-  ActivePriceMinRatio:
+  ActiveMaxRatio:
     Type: Number
-    Default: 0.5
-    MinValue: 0.1
+    Default: 1.0
+    MinValue: 0
     MaxValue: 1.0
+    Description: active 商品当前价相对于 closed 市场价的最高比例
 
   BuyMarginThreshold:
     Type: Number
@@ -958,7 +959,7 @@ Resources:
           REPAIR_RESERVE: !Ref DefaultRepairReserveRate
           RISK_RESERVE: !Ref RiskReserveRate
           MAX_PRICE_DEV: !Ref MaxPriceDeviation
-          PRICE_MIN_RATIO: !Ref ActivePriceMinRatio
+          ACTIVE_MAX_RATIO: !Ref ActiveMaxRatio
           MIN_ROI: !Ref MinRoi
           
           DETAIL_DESC_MAX: !Ref DetailDescMaxChars

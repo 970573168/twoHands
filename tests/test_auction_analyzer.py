@@ -17,12 +17,14 @@ from auction_analyzer import (
     batch_parse,
     build_active_parse_prompt,
     build_closed_parse_prompt,
+    calc_market_price,
     calc_decision,
     normalize_pricing_key,
     pricing_key_with_condition,
     resolve_closed_without_ai,
     save_active_model,
     save_closed_model,
+    scrape_active,
     update_record,
 )
 
@@ -56,6 +58,59 @@ class NormalizePricingKeyTest(unittest.TestCase):
 
 
 class LeanAiWorkflowTest(unittest.TestCase):
+    @patch("auction_analyzer.upsert_scraped_item")
+    @patch("auction_analyzer.get_record", return_value=None)
+    @patch("auction_analyzer.scrape_auctions")
+    def test_active_scrape_filters_current_price_by_market_upper_limit(
+        self, scrape_auctions, _get_record, upsert_scraped_item
+    ):
+        scrape_auctions.return_value = [
+            {"itemId": "invalid", "price": 0, "buynowPrice": 10},
+            {"itemId": "cheap", "price": 80, "buynowPrice": 200},
+            {"itemId": "limit", "price": 100},
+            {"itemId": "expensive", "price": 101},
+        ]
+
+        item_ids = scrape_active("camera", 10, max_p=100)
+
+        self.assertEqual(item_ids, ["cheap", "limit"])
+        self.assertNotIn("min_price", scrape_auctions.call_args.kwargs)
+        saved_ids = [call.args[1] for call in upsert_scraped_item.call_args_list]
+        self.assertEqual(saved_ids, ["cheap", "limit"])
+
+    @patch("auction_analyzer.get_record")
+    def test_market_price_uses_filtered_closed_median(self, get_record):
+        records = {
+            "1": {"modelStatus": Status.COMPLETED, "listingType": "MAIN_PRODUCT", "price": 100},
+            "2": {"modelStatus": Status.COMPLETED, "listingType": "MAIN_PRODUCT", "price": 105},
+            "3": {"modelStatus": Status.COMPLETED, "listingType": "MAIN_PRODUCT", "price": 110},
+            "4": {"modelStatus": Status.COMPLETED, "listingType": "MAIN_PRODUCT", "price": 115},
+            "5": {"modelStatus": Status.COMPLETED, "listingType": "MAIN_PRODUCT", "price": 10000},
+            "excluded": {"modelStatus": Status.COMPLETED, "listingType": "ACCESSORY", "price": 50},
+            "pending": {"modelStatus": Status.PENDING, "listingType": "MAIN_PRODUCT", "price": 90},
+        }
+        get_record.side_effect = lambda _table, item_id: records[item_id]
+
+        result = calc_market_price(list(records))
+
+        self.assertEqual(result, {
+            "market_price": 107,
+            "avg_price": 107,
+            "median_price": 107,
+            "count": 4,
+            "raw_count": 5,
+        })
+
+    @patch("auction_analyzer.get_record", return_value=None)
+    def test_market_price_returns_zero_statistics_without_prices(self, _get_record):
+        self.assertEqual(calc_market_price(["missing"]), {
+            "market_price": 0,
+            "avg_price": 0,
+            "median_price": 0,
+            "count": 0,
+            "raw_count": 0,
+        })
+
     def test_every_analyzer_update_refreshes_modified_order_fields(self):
         table = Mock()
 

@@ -119,7 +119,7 @@ REVIEW_MARGIN = _env("REVIEW_MARGIN_THRESHOLD", Decimal("0.10"), Decimal)
 MIN_COMPARABLE = _env("MIN_COMPARABLE_COUNT", 3, int)
 HIGH_CONF = _env("HIGH_CONFIDENCE_COUNT", 10, int)
 MED_CONF = _env("MEDIUM_CONFIDENCE_COUNT", 5, int)
-PRICE_MIN_RATIO = _env("PRICE_MIN_RATIO", Decimal("0.5"), Decimal)
+ACTIVE_MAX_RATIO = _env("ACTIVE_MAX_RATIO", Decimal("1.0"), Decimal)
 MIN_ROI = _env("MIN_ROI", Decimal("0.15"), Decimal)
 FEE_RATE = _env("FEE_RATE", Decimal("0.10"), Decimal)
 SHIPPING_COST = _env("SHIPPING_COST", Decimal("1500"), Decimal)
@@ -1642,18 +1642,27 @@ def scrape_closed(kw: str, cnt: int, force: bool = False, source_model: Optional
         logger.error(f"Closed scrape: {e}")
         return []
 
-def scrape_active(kw: str, cnt: int, min_p: int = 0, force: bool = False) -> List[str]:
+def scrape_active(kw: str, cnt: int, max_p: int = 0, force: bool = False) -> List[str]:
     """抓取活跃商品，新商品自动设为 PENDING"""
     try:
         items = scrape_auctions(
             kw,
             "active",
             False,
-            min_price=min_p if min_p > 0 else None,
             scrape_details=False,
         )
-        if min_p > 0:
-            items = [i for i in items if si(i.get("price", 0)) >= min_p]
+        if max_p > 0:
+            before_count = len(items)
+            items = [
+                item for item in items
+                if 0 < si(item.get("price", 0)) <= max_p
+            ]
+            logger.info(
+                "Active price upper filter applied: max_price=%s before=%s after=%s",
+                max_p,
+                before_count,
+                len(items),
+            )
         items = items[:cnt]
         new_count = 0
         
@@ -1693,7 +1702,8 @@ def scrape_active(kw: str, cnt: int, min_p: int = 0, force: bool = False) -> Lis
         logger.error(f"Active scrape: {e}")
         return []
 
-def calc_min_price(closed_ids: List[str]) -> Dict:
+def calc_market_price(closed_ids: List[str]) -> Dict:
+    """根据有效的已成交商品计算市场价，默认采用过滤异常值后的中位数。"""
     prices = []
     for cid in closed_ids:
         item = get_record(closed_db, cid)
@@ -1705,7 +1715,13 @@ def calc_min_price(closed_ids: List[str]) -> Dict:
         if p>0:
             prices.append(p)
     if not prices:
-        return {"min":0}
+        return {
+            "market_price": 0,
+            "avg_price": 0,
+            "median_price": 0,
+            "count": 0,
+            "raw_count": 0,
+        }
     prices.sort()
     n=len(prices)
     if n>=3:
@@ -1718,9 +1734,33 @@ def calc_min_price(closed_ids: List[str]) -> Dict:
         filtered = prices
     if not filtered:
         filtered = prices
-    min_price = max(1,int(sum(filtered)//len(filtered)*PRICE_MIN_RATIO))
-    logger.info(f"Calculated min price: {min_price} (from {len(prices)} prices)")
-    return {"min": min_price}
+
+    filtered.sort()
+    filtered_count = len(filtered)
+    avg_price = sum(filtered) // filtered_count
+    middle = filtered_count // 2
+    if filtered_count % 2:
+        median_price = filtered[middle]
+    else:
+        median_price = (filtered[middle - 1] + filtered[middle]) // 2
+    market_price = median_price
+
+    logger.info(
+        "Calculated market price: market_price=%s avg_price=%s median_price=%s "
+        "count=%s raw_count=%s",
+        market_price,
+        avg_price,
+        median_price,
+        filtered_count,
+        len(prices),
+    )
+    return {
+        "market_price": market_price,
+        "avg_price": avg_price,
+        "median_price": median_price,
+        "count": filtered_count,
+        "raw_count": len(prices),
+    }
 
 def execute_workflow(kw: str, ac: int, cc: int, force: bool, source_model: Optional[Dict] = None) -> Dict:
     global _start_time
@@ -1766,15 +1806,31 @@ def execute_workflow(kw: str, ac: int, cc: int, force: bool, source_model: Optio
         else:
             logger.info("No closed items need parsing (all already processed or not in PENDING state)")
         
-        # Step 3: 计算最低建议价格
-        logger.info("Step 3: Calculating min price")
-        pi = calc_min_price(closed_ids)
-        mp = pi.get("min",0)
-        result["min_price"] = mp
+        # Step 3: 计算已结束商品市场价和 active 商品价格上限
+        logger.info("Step 3: Calculating market price")
+        pi = calc_market_price(closed_ids)
+        market_price = pi.get("market_price", 0)
+        max_active_price = (
+            int(Decimal(market_price) * ACTIVE_MAX_RATIO)
+            if market_price > 0 else 0
+        )
+        result["market_price"] = market_price
+        result["avg_price"] = pi.get("avg_price", 0)
+        result["median_price"] = pi.get("median_price", 0)
+        result["market_price_count"] = pi.get("count", 0)
+        result["raw_price_count"] = pi.get("raw_count", 0)
+        result["active_max_ratio"] = str(ACTIVE_MAX_RATIO)
+        result["max_active_price"] = max_active_price
         
         # Step 4: 抓取活跃商品
-        logger.info(f"Step 4: Scraping active auctions (min_price={mp})")
-        active_ids = scrape_active(kw, ac, mp, force)
+        logger.info(
+            "Step 4: Scraping active auctions (market_price=%s, "
+            "max_active_price=%s, ratio=%s)",
+            market_price,
+            max_active_price,
+            ACTIVE_MAX_RATIO,
+        )
+        active_ids = scrape_active(kw, ac, max_active_price, force)
         result["active"] = len(active_ids)
         if not active_ids:
             logger.warning("No active items found")
