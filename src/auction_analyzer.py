@@ -1953,8 +1953,8 @@ def scrape_active(kw: str, cnt: int, max_p: int = 0, force: bool = False,
         return []
 
 def calc_market_price(closed_ids: List[str]) -> Dict:
-    """根据有效的已成交商品计算市场价，默认采用过滤异常值后的中位数。"""
-    prices = []
+    """根据成交价分布剔除疑似低价配件簇，再计算市场价。"""
+    candidates = []
     for cid in closed_ids:
         item = get_record(closed_db, cid)
         if not item or item.get("modelStatus")!=Status.COMPLETED:
@@ -1963,36 +1963,141 @@ def calc_market_price(closed_ids: List[str]) -> Dict:
             continue
         p = si(item.get("price",0))
         if p>0:
-            prices.append(p)
-    if not prices:
+            candidates.append({
+                "itemID": str(item.get("itemID") or cid),
+                "title": str(item.get("title", "")),
+                "price": p,
+            })
+
+    empty_result = {
+        "market_price": 0, "avg_price": 0, "median_price": 0,
+        "count": 0, "raw_count": 0,
+        "raw_avg_price": 0, "raw_median_price": 0,
+        "raw_min_price": 0, "raw_max_price": 0,
+        "market_price_suspicious": False,
+        "price_filter": {
+            "low_price_cluster_removed": False,
+            "removed_low_price_count": 0,
+            "max_gap_ratio": "0",
+            "split_low_max": 0,
+            "split_high_min": 0,
+        },
+    }
+    if not candidates:
+        logger.info("Raw closed price stats: count=0")
+        return empty_result
+
+    candidates.sort(key=lambda candidate: candidate["price"])
+    prices = [candidate["price"] for candidate in candidates]
+    raw_count = len(prices)
+
+    def median(values):
+        count = len(values)
+        middle = count // 2
+        return values[middle] if count % 2 else (values[middle - 1] + values[middle]) // 2
+
+    raw_avg_price = sum(prices) // raw_count
+    raw_median_price = median(prices)
+    raw_min_price = prices[0]
+    raw_max_price = prices[-1]
+    avg_median_ratio = (
+        Decimal(raw_avg_price) / Decimal(raw_median_price)
+        if raw_median_price > 0 else Decimal("0")
+    )
+    distribution_suspicious = raw_median_price > 0 and avg_median_ratio >= Decimal("5")
+    logger.info(
+        "Raw closed price stats: count=%s avg=%s median=%s min=%s max=%s "
+        "avg_median_ratio=%s suspicious=%s",
+        raw_count, raw_avg_price, raw_median_price, raw_min_price,
+        raw_max_price, str(avg_median_ratio), distribution_suspicious,
+    )
+
+    max_gap_ratio = Decimal("0")
+    split_index = None
+    for index in range(raw_count - 1):
+        current_price = prices[index]
+        next_price = prices[index + 1]
+        gap_ratio = Decimal(next_price) / Decimal(current_price)
+        if gap_ratio > max_gap_ratio:
+            max_gap_ratio = gap_ratio
+            split_index = index + 1
+
+    price_filter = {
+        "low_price_cluster_removed": False,
+        "removed_low_price_count": 0,
+        "max_gap_ratio": str(max_gap_ratio.quantize(Decimal("0.001"))) if split_index is not None else "0",
+        "split_low_max": prices[split_index - 1] if split_index is not None else 0,
+        "split_high_min": prices[split_index] if split_index is not None else 0,
+    }
+    main_product_prices = prices
+    market_price_suspicious = False
+
+    if split_index is not None and max_gap_ratio >= Decimal("3.0"):
+        high_price_cluster = prices[split_index:]
+        if len(high_price_cluster) >= MIN_COMPARABLE:
+            main_product_prices = high_price_cluster
+            price_filter["low_price_cluster_removed"] = True
+            price_filter["removed_low_price_count"] = split_index
+            removed = candidates[:split_index]
+            logger.warning(
+                "Low-price accessory cluster removed: count=%s range=%s-%s "
+                "high_min=%s gap_ratio=%s samples=%s",
+                split_index, prices[0], prices[split_index - 1], prices[split_index],
+                price_filter["max_gap_ratio"],
+                [{"itemID": item["itemID"], "price": item["price"], "title": item["title"][:120]} for item in removed[:10]],
+            )
+        else:
+            market_price_suspicious = True
+            logger.warning(
+                "Price gap detected but high-price cluster is too small: high_count=%s "
+                "required=%s low_max=%s high_min=%s gap_ratio=%s",
+                len(high_price_cluster), MIN_COMPARABLE, prices[split_index - 1],
+                prices[split_index], price_filter["max_gap_ratio"],
+            )
+    elif distribution_suspicious:
+        market_price_suspicious = True
+        logger.warning("Suspicious price distribution has no usable price gap")
+
+    logger.info(
+        "Closed price cluster filter: removed=%s removed_count=%s low_max=%s "
+        "high_min=%s max_gap_ratio=%s suspicious=%s",
+        price_filter["low_price_cluster_removed"],
+        price_filter["removed_low_price_count"],
+        price_filter["split_low_max"],
+        price_filter["split_high_min"],
+        price_filter["max_gap_ratio"],
+        market_price_suspicious,
+    )
+    if market_price_suspicious:
+        logger.warning("Final market price: market_price=0 suspicious=true")
         return {
-            "market_price": 0,
-            "avg_price": 0,
-            "median_price": 0,
-            "count": 0,
-            "raw_count": 0,
+            **empty_result,
+            "raw_count": raw_count,
+            "raw_avg_price": raw_avg_price,
+            "raw_median_price": raw_median_price,
+            "raw_min_price": raw_min_price,
+            "raw_max_price": raw_max_price,
+            "market_price_suspicious": True,
+            "price_filter": price_filter,
         }
-    prices.sort()
-    n=len(prices)
-    if n>=3:
-        q1=prices[n//4]
-        q3=prices[n*3//4]
+
+    # Keep the existing IQR safety net when no accessory-cluster split was used.
+    if not price_filter["low_price_cluster_removed"] and len(main_product_prices)>=3:
+        n = len(main_product_prices)
+        q1=main_product_prices[n//4]
+        q3=main_product_prices[n*3//4]
         lo=int(q1-MAX_PRICE_DEV*(q3-q1))
         hi=int(q3+MAX_PRICE_DEV*(q3-q1))
-        filtered = [p for p in prices if lo<=p<=hi]
+        filtered = [p for p in main_product_prices if lo<=p<=hi]
     else:
-        filtered = prices
+        filtered = main_product_prices
     if not filtered:
-        filtered = prices
+        filtered = main_product_prices
 
     filtered.sort()
     filtered_count = len(filtered)
     avg_price = sum(filtered) // filtered_count
-    middle = filtered_count // 2
-    if filtered_count % 2:
-        median_price = filtered[middle]
-    else:
-        median_price = (filtered[middle - 1] + filtered[middle]) // 2
+    median_price = median(filtered)
     market_price = median_price
 
     logger.info(
@@ -2002,14 +2107,20 @@ def calc_market_price(closed_ids: List[str]) -> Dict:
         avg_price,
         median_price,
         filtered_count,
-        len(prices),
+        raw_count,
     )
     return {
         "market_price": market_price,
         "avg_price": avg_price,
         "median_price": median_price,
         "count": filtered_count,
-        "raw_count": len(prices),
+        "raw_count": raw_count,
+        "raw_avg_price": raw_avg_price,
+        "raw_median_price": raw_median_price,
+        "raw_min_price": raw_min_price,
+        "raw_max_price": raw_max_price,
+        "market_price_suspicious": False,
+        "price_filter": price_filter,
     }
 
 def execute_workflow(kw: str, ac: int, cc: int, force: bool, source_model: Optional[Dict] = None) -> Dict:
@@ -2069,8 +2180,21 @@ def execute_workflow(kw: str, ac: int, cc: int, force: bool, source_model: Optio
         result["median_price"] = pi.get("median_price", 0)
         result["market_price_count"] = pi.get("count", 0)
         result["raw_price_count"] = pi.get("raw_count", 0)
+        result["raw_avg_price"] = pi.get("raw_avg_price", 0)
+        result["raw_median_price"] = pi.get("raw_median_price", 0)
+        result["raw_min_price"] = pi.get("raw_min_price", 0)
+        result["raw_max_price"] = pi.get("raw_max_price", 0)
+        result["price_filter"] = pi.get("price_filter", {})
+        result["market_price_suspicious"] = bool(pi.get("market_price_suspicious", False))
         result["active_max_ratio"] = str(ACTIVE_MAX_RATIO)
         result["max_active_price"] = max_active_price
+
+        if result["market_price_suspicious"]:
+            logger.warning("Market price suspicious; skip active scraping")
+            return {**result, "status": "MARKET_PRICE_SUSPICIOUS"}
+        if market_price <= 0:
+            logger.warning("No valid market price; skip active scraping")
+            return {**result, "status": "NO_MARKET_PRICE"}
         
         # Step 4: 抓取活跃商品
         logger.info(
