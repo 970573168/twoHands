@@ -1,10 +1,11 @@
 """
 产品目录定期扫描器 - 纯调度器版本
 职责：
-1. 扫描 PRODUCT 表找到今天未分析的型号
-2. 标记为 QUEUED
-3. 异步触发 YahooAuctionAnalyzer
-4. 不等待结果，不管理状态-
+1. 扫描 PRODUCT 表，找到从未扫描或已到扫描周期的型号
+2. 优先从未扫描的型号，其次按上次扫描日期从旧到新处理
+3. 标记为 QUEUED
+4. 异步触发 YahooAuctionAnalyzer
+5. 不等待结果，不管理状态
 """
 
 import os
@@ -24,6 +25,7 @@ ANALYZER_FUNCTION_NAME = os.environ.get("ANALYZER_FUNCTION_NAME", "YahooAuctionA
 MAX_MODELS_PER_RUN = int(os.environ.get("MAX_MODELS_PER_RUN", "10"))
 MAX_ACTIVE_COUNT = int(os.environ.get("MAX_ACTIVE_COUNT", "20"))
 MAX_CLOSED_COUNT = int(os.environ.get("MAX_CLOSED_COUNT", "50"))
+SCAN_INTERVAL_DAYS = int(os.environ.get("SCAN_INTERVAL_DAYS", "3"))
 
 # ============ 平滑控制环境变量 ============
 DISPATCH_INTERVAL_SECONDS = float(os.environ.get("DISPATCH_INTERVAL_SECONDS", "0.3"))
@@ -84,20 +86,30 @@ def smooth_sleep(
 
 def scan_unanalyzed_products(today: str, max_models: int = MAX_MODELS_PER_RUN) -> List[Dict]:
     """
-    直接扫描 PRODUCT 记录，找到今天未分析的产品。
+    直接扫描 PRODUCT 记录，找到已到扫描周期的产品。
     
     筛选条件：
     - entity_type = PRODUCT
     - status = ACTIVE
-    - last_scanned_date != today（包括 None/空字符串）
+    - 从未扫描，或 last_scanned_date 距今天至少 SCAN_INTERVAL_DAYS 天
     - analysis_status != QUEUED（避免重复投递）
+
+    排序：从未扫描（包含无效日期）优先，然后按扫描日期从旧到新。
     """
     unscanned_products = []
     last_evaluated_key = None
     total_scanned = 0
     
-    log("INFO", "开始扫描未分析 PRODUCT",
+    try:
+        today_date = datetime.strptime(today, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise ValueError("today 必须是 YYYY-MM-DD 格式") from exc
+    cutoff_date = today_date - timedelta(days=SCAN_INTERVAL_DAYS)
+
+    log("INFO", "开始查找到期 PRODUCT",
         today=today,
+        scan_interval_days=SCAN_INTERVAL_DAYS,
+        cutoff_date=cutoff_date.isoformat(),
         max_models=max_models)
     
     while True:
@@ -139,12 +151,25 @@ def scan_unanalyzed_products(today: str, max_models: int = MAX_MODELS_PER_RUN) -
             if not category or not brand or not model or not product_pk:
                 continue
             
-            # 跳过今天已扫描的
-            if last_scanned_date == today:
-                continue
-            
             # 跳过已经 QUEUED 的（避免重复投递）
             if last_analysis_status == "QUEUED":
+                continue
+
+            # 只保留从未扫描或已到 3 天扫描周期的型号。无效日期按未扫描处理，
+            # 避免历史脏数据导致型号永久不再扫描。
+            parsed_last_scanned_date = None
+            if last_scanned_date:
+                try:
+                    parsed_last_scanned_date = datetime.strptime(
+                        last_scanned_date, "%Y-%m-%d"
+                    ).date()
+                except ValueError:
+                    log("WARNING", "上次扫描日期无效，按未扫描处理",
+                        product_pk=product_pk,
+                        last_scanned_date=last_scanned_date)
+
+            if (parsed_last_scanned_date is not None
+                    and parsed_last_scanned_date > cutoff_date):
                 continue
             
             unscanned_products.append({
@@ -153,6 +178,7 @@ def scan_unanalyzed_products(today: str, max_models: int = MAX_MODELS_PER_RUN) -
                 "model": model,
                 "product_pk": product_pk,
                 "last_scanned_date": last_scanned_date,
+                "_parsed_last_scanned_date": parsed_last_scanned_date,
                 "last_analysis_status": last_analysis_status,
                 "modified_at": str(item.get("modified_at", "")),
             })
@@ -173,17 +199,29 @@ def scan_unanalyzed_products(today: str, max_models: int = MAX_MODELS_PER_RUN) -
             for p in unscanned_products
         ])
     
-    # Scan 本身不保证顺序；统一优先处理最近修改的产品。
-    unscanned_products.sort(key=lambda product: product["modified_at"], reverse=True)
-    return unscanned_products[:max_models]
+    # None 优先；有日期的产品按上次扫描日期从旧到新。PK 用于保证同日期时顺序稳定。
+    unscanned_products.sort(key=lambda product: (
+        product["_parsed_last_scanned_date"] is not None,
+        product["_parsed_last_scanned_date"] or datetime.min.date(),
+        product["product_pk"],
+    ))
+    selected_products = unscanned_products[:max_models]
+    for product in selected_products:
+        product.pop("_parsed_last_scanned_date", None)
+    return selected_products
 
 
 def mark_as_queued(product_pk: str, today: str) -> bool:
     """
     标记产品为 QUEUED 状态。
-    使用 ConditionExpression 防止重复标记。
+    使用 ConditionExpression 防止重复标记，也防止并发扫描器在
+    Analyzer 快速完成后将同一型号再次投递。
     """
     now = int(time.time())
+    cutoff_date = (
+        datetime.strptime(today, "%Y-%m-%d").date()
+        - timedelta(days=SCAN_INTERVAL_DAYS)
+    ).isoformat()
     
     try:
         table.update_item(
@@ -199,12 +237,15 @@ def mark_as_queued(product_pk: str, today: str) -> bool:
                     modified_at = :modified_at
             """,
             ConditionExpression=(
-                "attribute_not_exists(last_analysis_status) "
-                "OR last_analysis_status <> :queued"
+                "(attribute_not_exists(last_analysis_status) "
+                "OR last_analysis_status <> :queued) "
+                "AND (attribute_not_exists(last_scanned_date) "
+                "OR last_scanned_date <= :cutoff_date)"
             ),
             ExpressionAttributeValues={
                 ":queued": "QUEUED",
                 ":today": today,
+                ":cutoff_date": cutoff_date,
                 ":now": now,
                 ":all": "ALL",
                 ":modified_at": datetime.now(timezone.utc).isoformat()
@@ -308,9 +349,12 @@ def scan_and_dispatch(event: Dict) -> Dict:
     )
 
     if not products:
-        log("INFO", "没有需要分析的产品", today=today)
+        log("INFO", "没有从未扫描或已超过扫描周期的产品，直接停止",
+            today=today,
+            scan_interval_days=SCAN_INTERVAL_DAYS)
         return {
             "status": "NO_PRODUCTS_TO_SCAN",
+            "message": "没有到期产品，本次扫描已停止",
             "today": today,
             "dispatched": 0,
             "results": []
