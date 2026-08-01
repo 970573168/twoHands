@@ -68,6 +68,72 @@ class NormalizePricingKeyTest(unittest.TestCase):
 
 
 class LeanAiWorkflowTest(unittest.TestCase):
+    @patch("auction_analyzer.product_catalog_db.update_item")
+    @patch("auction_analyzer.execute_workflow", return_value={"status": "COMPLETED"})
+    def test_lambda_handler_marks_catalog_product_completed(self, execute_workflow, update_item):
+        response = lambda_handler({
+            "keyword": "Nikon Z 7II",
+            "source": "catalog_scanner",
+            "product_pk": "PRODUCT#Nikon#Z 7II",
+        }, None)
+
+        self.assertEqual(response["statusCode"], 200)
+        update_item.assert_called_once_with(
+            Key={"PK": "PRODUCT#Nikon#Z 7II", "SK": "META"},
+            UpdateExpression="SET last_analysis_status = :status",
+            ExpressionAttributeValues={":status": "COMPLETED"},
+        )
+
+    @patch("auction_analyzer.product_catalog_db.update_item")
+    @patch("auction_analyzer.execute_workflow", return_value={"status": "NO_CLOSED"})
+    def test_lambda_handler_marks_non_completed_catalog_product_failed(self, execute_workflow, update_item):
+        response = lambda_handler({
+            "keyword": "Nikon Z 7II",
+            "source": "catalog_scanner",
+            "product_pk": "PRODUCT#Nikon#Z 7II",
+        }, None)
+
+        self.assertEqual(response["statusCode"], 200)
+        self.assertEqual(
+            update_item.call_args.kwargs["ExpressionAttributeValues"],
+            {":status": "FAILED"},
+        )
+
+    @patch("auction_analyzer.product_catalog_db.update_item")
+    @patch("auction_analyzer.execute_workflow", return_value={"status": "COMPLETED"})
+    def test_lambda_handler_does_not_update_catalog_for_manual_call(self, execute_workflow, update_item):
+        response = lambda_handler({
+            "keyword": "Nikon Z 7II",
+            "product_pk": "PRODUCT#Nikon#Z 7II",
+        }, None)
+
+        self.assertEqual(response["statusCode"], 200)
+        update_item.assert_not_called()
+
+    @patch("auction_analyzer.product_catalog_db.update_item")
+    @patch("auction_analyzer.execute_workflow", return_value={"status": "COMPLETED"})
+    def test_lambda_handler_does_not_update_catalog_without_product_pk(self, execute_workflow, update_item):
+        response = lambda_handler({
+            "keyword": "Nikon Z 7II",
+            "source": "catalog_scanner",
+            "product_pk": "   ",
+        }, None)
+
+        self.assertEqual(response["statusCode"], 200)
+        update_item.assert_not_called()
+
+    @patch("auction_analyzer.product_catalog_db.update_item", side_effect=RuntimeError("write failed"))
+    @patch("auction_analyzer.execute_workflow", return_value={"status": "COMPLETED"})
+    def test_catalog_update_failure_does_not_change_analyzer_response(self, execute_workflow, update_item):
+        response = lambda_handler({
+            "keyword": "Nikon Z 7II",
+            "source": "catalog_scanner",
+            "product_pk": "PRODUCT#Nikon#Z 7II",
+        }, None)
+
+        self.assertEqual(response["statusCode"], 200)
+        self.assertEqual(response["body"], '{"status": "COMPLETED"}')
+
     @patch("auction_analyzer.execute_workflow", return_value={"status": "COMPLETED"})
     def test_lambda_handler_normalizes_source_model_aliases(self, execute_workflow):
         response = lambda_handler({

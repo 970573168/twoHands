@@ -871,6 +871,10 @@ Resources:
                   - !GetAtt YahooAuctionActiveTable.Arn
                   - !GetAtt YahooAuctionBuyCandidateTable.Arn
                   - !Sub "${YahooAuctionBuyCandidateTable.Arn}/index/*"
+              - Sid: UpdateProductCatalog
+                Effect: Allow
+                Action: dynamodb:UpdateItem
+                Resource: !GetAtt ProductCatalogTable.Arn
               - Sid: ReadAllApiSecrets
                 Effect: Allow
                 Action: secretsmanager:GetSecretValue
@@ -1128,6 +1132,7 @@ Resources:
         Variables:
           TABLE_NAME_ACTIVE: !Sub "YahooAuctionActiveItems-${Environment}"
           TABLE_NAME_CLOSED: !Sub "YahooAuctionItems-${Environment}"
+          TABLE_NAME: !Ref ProductCatalogTable
           BUY_CANDIDATE_TABLE: !Ref YahooAuctionBuyCandidateTable
           FINAL_CHECK_BEFORE_MINUTES: !Ref FinalCheckBeforeMinutes
           ENVIRONMENT: !Ref Environment

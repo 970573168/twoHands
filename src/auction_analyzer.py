@@ -76,6 +76,7 @@ def _env(key, default, cast=str):
 
 TABLE_ACTIVE = _env("TABLE_NAME_ACTIVE", "YahooAuctionActiveItems")
 TABLE_CLOSED = _env("TABLE_NAME_CLOSED", "YahooAuctionItems")
+PRODUCT_TABLE_NAME = os.environ.get("TABLE_NAME", "ProductCatalog-dev")
 BUY_CANDIDATE_TABLE = os.environ.get(
     "BUY_CANDIDATE_TABLE", "YahooAuctionBuyCandidates-dev"
 )
@@ -164,6 +165,7 @@ LOG_AI_RESPONSE_JSON = _env("LOG_AI_RESPONSE_JSON", False, lambda x: x.lower() i
 dynamodb = boto3.resource("dynamodb")
 active_db = dynamodb.Table(TABLE_ACTIVE)
 closed_db = dynamodb.Table(TABLE_CLOSED)
+product_catalog_db = dynamodb.Table(PRODUCT_TABLE_NAME)
 buy_candidate_db = dynamodb.Table(BUY_CANDIDATE_TABLE)
 secrets = boto3.client("secretsmanager")
 _total_tokens = 0
@@ -2528,6 +2530,29 @@ def lambda_handler(event, context):
             # 仍保留空 sourceModel，由 Closed AI 返回空 models。
             source_model = {}
         result = execute_workflow(kw, ac, cc_val, force, source_model)
+
+        product_pk = event.get("product_pk")
+        if event.get("source") == "catalog_scanner" and isinstance(product_pk, str) and product_pk.strip():
+            final_status = "COMPLETED" if result.get("status") == "COMPLETED" else "FAILED"
+            try:
+                product_catalog_db.update_item(
+                    Key={"PK": product_pk.strip(), "SK": "META"},
+                    UpdateExpression="SET last_analysis_status = :status",
+                    ExpressionAttributeValues={":status": final_status},
+                )
+                logger.info(
+                    "Updated ProductCatalog analysis status: product_pk=%s status=%s",
+                    product_pk.strip(),
+                    final_status,
+                )
+            except Exception as e:
+                logger.error(
+                    "Failed to update ProductCatalog analysis status: product_pk=%s status=%s error=%s",
+                    product_pk.strip(),
+                    final_status,
+                    e,
+                    exc_info=True,
+                )
         
         return {
             "statusCode": 200,
