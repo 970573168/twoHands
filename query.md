@@ -121,49 +121,98 @@ for i in sorted(items, key=lambda x: x['occurred_at']['S'], reverse=True)[:50]:
 
 数据库下载
 
-
-###### 目录表
-
-aws dynamodb scan \
-    --table-name "ProductCatalog-dev" \
-    --output json > product_catalog_all.json
-
-echo "导出完成，$(cat product_catalog_all.json | jq '.Items | length') 条"
-
-pip install openpyxl
+# 安装依赖
+pip install boto3 openpyxl
 
 python3 << 'EOF'
-import json
+import boto3
 from openpyxl import Workbook
 
-with open('product_catalog_all.json') as f:
-    data = json.load(f)
+TABLES = [
+    "AiTokenUsage-dev",
+    "ProductCatalog-dev",
+    "YahooAuctionActiveItems-dev",
+    "YahooAuctionBuyCandidates-dev",
+    "YahooAuctionItems-dev"
+]
+
+dynamodb = boto3.client("dynamodb")
+
+def convert_value(attr):
+    if not attr:
+        return ""
+
+    if "S" in attr:
+        return attr["S"]
+    if "N" in attr:
+        return attr["N"]
+    if "BOOL" in attr:
+        return str(attr["BOOL"])
+    if "SS" in attr:
+        return ",".join(attr["SS"])
+    if "NS" in attr:
+        return ",".join(attr["NS"])
+    if "L" in attr:
+        return str(attr["L"])
+    if "M" in attr:
+        return str(attr["M"])
+    if "NULL" in attr:
+        return ""
+
+    return str(attr)
 
 wb = Workbook()
-ws = wb.active
-ws.title = 'ProductCatalog'
-headers = ['PK', 'SK', 'category', 'brand', 'model', 'entity_type', 'status', 
-           'last_scanned_date', 'last_analysis_status', 'modified_at',
-           'GSI1PK', 'GSI1SK', 'modified_index_pk']
-ws.append(headers)
+wb.remove(wb.active)
 
-for item in data['Items']:
-    row = [item.get(h, {}).get('S', item.get(h, {}).get('N', '')) for h in headers]
-    ws.append(row)
+for table_name in TABLES:
+    print(f"\n开始导出 {table_name}")
 
-ws.auto_filter.ref = ws.dimensions
-wb.save('product_catalog.xlsx')
-print(f'完成！{len(data["Items"])} 条 → product_catalog.xlsx')
+    items = []
+    scan_kwargs = {
+        "TableName": table_name
+    }
+
+    while True:
+        response = dynamodb.scan(**scan_kwargs)
+        items.extend(response.get("Items", []))
+
+        if "LastEvaluatedKey" not in response:
+            break
+
+        scan_kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+
+    print(f"获取 {len(items)} 条记录")
+
+    columns = set()
+    for item in items:
+        columns.update(item.keys())
+
+    columns = sorted(list(columns))
+
+    ws = wb.create_sheet(title=table_name[:31])
+    ws.append(columns)
+
+    for item in items:
+        row = [convert_value(item.get(col)) for col in columns]
+        ws.append(row)
+
+    ws.auto_filter.ref = ws.dimensions
+
+    print(f"{table_name} 导出完成")
+
+output_file = "dynamodb_all_tables.xlsx"
+wb.save(output_file)
+
+print(f"\n全部完成！")
+print(f"生成文件：{output_file}")
 EOF
 
 
-product_catalog.xlsx
 
 
 
 
-
-
+dynamodb_all_tables.xlsx
 
 
 
