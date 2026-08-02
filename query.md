@@ -120,12 +120,11 @@ for i in sorted(items, key=lambda x: x['occurred_at']['S'], reverse=True)[:50]:
 
 
 数据库下载
-
-# 安装依赖
 pip install boto3 openpyxl
 
 python3 << 'EOF'
 import boto3
+from datetime import datetime, timezone, timedelta
 from openpyxl import Workbook
 
 TABLES = [
@@ -136,26 +135,63 @@ TABLES = [
     "YahooAuctionItems-dev"
 ]
 
+JST = timezone(timedelta(hours=9))
+
 dynamodb = boto3.client("dynamodb")
+
+def format_time(value):
+    try:
+        # 13位毫秒时间戳
+        if value.isdigit() and len(value) == 13:
+            return datetime.fromtimestamp(
+                int(value) / 1000,
+                JST
+            ).strftime("%Y-%m-%d %H:%M:%S")
+
+        # 10位秒时间戳
+        if value.isdigit() and len(value) == 10:
+            return datetime.fromtimestamp(
+                int(value),
+                JST
+            ).strftime("%Y-%m-%d %H:%M:%S")
+
+        # ISO 时间格式
+        if "T" in value and ("Z" in value or "+" in value):
+            dt = datetime.fromisoformat(
+                value.replace("Z", "+00:00")
+            )
+            return dt.astimezone(JST).strftime("%Y-%m-%d %H:%M:%S")
+
+    except Exception:
+        pass
+
+    return value
 
 def convert_value(attr):
     if not attr:
         return ""
 
     if "S" in attr:
-        return attr["S"]
+        return format_time(attr["S"])
+
     if "N" in attr:
-        return attr["N"]
+        return format_time(attr["N"])
+
     if "BOOL" in attr:
         return str(attr["BOOL"])
+
     if "SS" in attr:
         return ",".join(attr["SS"])
+
     if "NS" in attr:
         return ",".join(attr["NS"])
+
     if "L" in attr:
         return str(attr["L"])
+
     if "M" in attr:
         return str(attr["M"])
+
     if "NULL" in attr:
         return ""
 
@@ -184,16 +220,21 @@ for table_name in TABLES:
     print(f"获取 {len(items)} 条记录")
 
     columns = set()
+
     for item in items:
         columns.update(item.keys())
 
     columns = sorted(list(columns))
 
     ws = wb.create_sheet(title=table_name[:31])
+
     ws.append(columns)
 
     for item in items:
-        row = [convert_value(item.get(col)) for col in columns]
+        row = [
+            convert_value(item.get(col))
+            for col in columns
+        ]
         ws.append(row)
 
     ws.auto_filter.ref = ws.dimensions
@@ -201,16 +242,12 @@ for table_name in TABLES:
     print(f"{table_name} 导出完成")
 
 output_file = "dynamodb_all_tables.xlsx"
+
 wb.save(output_file)
 
-print(f"\n全部完成！")
+print("\n全部完成！")
 print(f"生成文件：{output_file}")
-
 EOF
-
-
-
-
 
 
 dynamodb_all_tables.xlsx
