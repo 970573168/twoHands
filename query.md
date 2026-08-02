@@ -130,6 +130,7 @@ aws dynamodb scan \
 
 echo "导出完成，$(cat product_catalog_all.json | jq '.Items | length') 条"
 
+pip install openpyxl
 
 python3 << 'EOF'
 import json
