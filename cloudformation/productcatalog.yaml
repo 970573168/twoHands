@@ -4,6 +4,7 @@ Description: >
   电子产品目录采集器 + AI API Secret + Yahoo Auction 抓取器 + 分析工作流 + 目录定期扫描器
   支持多 AI 模式切换（Gemini / 豆包 / OpenAI）
   包含递归链接爬虫
+  所有定时器默认关闭，需手动启用
 
 Parameters:
   # ============ 通用参数 ============
@@ -130,6 +131,9 @@ Parameters:
   LogRetentionDays:
     Type: Number
     Default: 14
+  ProductCatalogDiscoveryIntervalMinutes:
+    Type: Number
+    Default: 5
 
   # ============ Yahoo Auction 抓取器参数 ============
   DeployScraper:
@@ -294,9 +298,6 @@ Parameters:
     Type: String
     Default: "true"
     AllowedValues: ["true", "false"]
-  ProductCatalogDiscoveryIntervalMinutes:
-    Type: Number
-    Default: 5
   CatalogScannerMaxModels:
     Type: Number
     Default: 10
@@ -943,14 +944,15 @@ Resources:
         - Key: Environment
           Value: !Ref Environment
 
+  # 定时器：Product Catalog Discovery - 默认关闭
   ProductCatalogDiscoveryScheduleRule:
     Type: AWS::Events::Rule
     Condition: DeployMainAppCondition
     Properties:
       Name: !Sub "ProductCatalog-Discovery-Schedule-${Environment}"
-      Description: 每 5 分钟触发产品目录 AI 发现
+      Description: 每 5 分钟触发产品目录 AI 发现 (默认关闭)
       ScheduleExpression: !Sub "rate(${ProductCatalogDiscoveryIntervalMinutes} minutes)"
-      State: ENABLED
+      State: DISABLED
       Targets:
         - Arn: !GetAtt ProductCatalogDiscovery.Arn
           Id: ProductCatalogDiscoveryTarget
@@ -1043,14 +1045,15 @@ Resources:
         - Key: Environment
           Value: !Ref Environment
 
+  # 定时器：Yahoo Auction Link Crawler - 默认关闭
   YahooAuctionLinkCrawlerScheduleRule:
     Type: AWS::Events::Rule
     Condition: DeployLinkCrawlerCondition
     Properties:
       Name: !Sub "YahooAuctionLinkCrawler-Schedule-${Environment}"
-      Description: 定时触发 Yahoo 拍卖递归链接采集器
+      Description: 定时触发 Yahoo 拍卖递归链接采集器 (默认关闭)
       ScheduleExpression: !Sub "rate(${LinkCrawlerScheduleMinutes} minutes)"
-      State: ENABLED
+      State: DISABLED
       Targets:
         - Arn: !GetAtt YahooAuctionLinkCrawler.Arn
           Id: YahooAuctionLinkCrawlerTarget
@@ -1065,7 +1068,7 @@ Resources:
       SourceArn: !GetAtt YahooAuctionLinkCrawlerScheduleRule.Arn
 
   # ============================================================
-  # 其他 Lambda 函数 (保持不变)
+  # Yahoo Auction Final Check
   # ============================================================
 
   YahooAuctionFinalCheckFunction:
@@ -1105,14 +1108,15 @@ Resources:
         - Key: Environment
           Value: !Ref Environment
 
+  # 定时器：Yahoo Auction Final Check - 默认关闭
   YahooAuctionFinalCheckScheduleRule:
     Type: AWS::Events::Rule
     Condition: DeployScraperCondition
     Properties:
       Name: !Sub "YahooAuctionFinalCheck-Schedule-${Environment}"
-      Description: 每分钟复核即将结束的 BUY_CANDIDATE
+      Description: 每分钟复核即将结束的 BUY_CANDIDATE (默认关闭)
       ScheduleExpression: rate(1 minute)
-      State: ENABLED
+      State: DISABLED
       Targets:
         - Arn: !GetAtt YahooAuctionFinalCheckFunction.Arn
           Id: YahooAuctionFinalCheckTarget
@@ -1257,14 +1261,15 @@ Resources:
         - Key: Environment
           Value: !Ref Environment
 
+  # 定时器：Catalog Scanner - 默认关闭
   CatalogScannerScheduleRule:
     Type: AWS::Events::Rule
     Condition: DeployCatalogScannerCondition
     Properties:
       Name: !Sub "CatalogScanner-Schedule-${Environment}"
-      Description: 定期触发目录扫描器
+      Description: 定期触发目录扫描器 (默认关闭)
       ScheduleExpression: rate(3 minutes)
-      State: ENABLED
+      State: DISABLED
       Targets:
         - Arn: !GetAtt CatalogScannerFunction.Arn
           Id: "CatalogScannerTarget"
