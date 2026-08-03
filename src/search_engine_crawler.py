@@ -1,8 +1,8 @@
 """
 Yahoo! 拍卖链接递归采集 Lambda。
 
-由 EventBridge 定时触发，从起始页开始广度优先递归爬取所有商品列表页，
-提取商品链接和目录链接，写入 DynamoDB。
+由 EventBridge 定时触发，从 /list3/* 起始页开始广度优先递归爬取所有商品列表页，
+提取商品链接，写入 DynamoDB。
 """
 
 import hashlib
@@ -26,7 +26,8 @@ logger.setLevel(logging.INFO)
 # ============================================================
 
 ALLOWED_HOST = "auctions.yahoo.co.jp"
-DEFAULT_START_URL = "https://auctions.yahoo.co.jp/"
+ALLOWED_LIST3_PREFIX = "/list3/"
+DEFAULT_START_URL = "https://auctions.yahoo.co.jp/list3/23632-category.html"
 
 # 禁止爬取的路径（robots.txt 规则）
 DISALLOW = (
@@ -96,32 +97,29 @@ def normalize_url(href: str, source_url: str) -> str | None:
 
 def is_listing_page(url: str) -> bool:
     """
-    判断是否为商品列表页（需要继续递归）。
+    判断是否为允许递归爬取的商品列表页。
     
-    Yahoo 拍卖列表页格式：
-    - /list3/数字-xxx.html   (大分类列表，如 /list3/23632-category.html)
-    - /list/数字-xxx.html    (子分类列表)
-    - /category/数字/        (分类页)
-    - /category/数字?p=页码  (带分页)
+    当前仅允许：
+    - https://auctions.yahoo.co.jp/list3/*
     """
     if not url:
         return False
-    parsed = urlsplit(url)
-    path = parsed.path
     
-    # /list3/ 或 /list/ 开头，后面跟数字
-    if re.search(r'/list3?/\d+', path):
-        return True
+    try:
+        parsed = urlsplit(url)
+    except (TypeError, ValueError):
+        return False
     
-    # /category/ 开头
-    if path.startswith('/category/'):
-        return True
+    if parsed.scheme not in {"http", "https"}:
+        return False
     
-    # 首页也算作列表页（作为起点）
-    if path in ("/", ""):
-        return True
+    if parsed.hostname != ALLOWED_HOST:
+        return False
     
-    return False
+    path = parsed.path or "/"
+    
+    # 只允许 /list3/ 开头的页面
+    return path.startswith(ALLOWED_LIST3_PREFIX)
 
 
 def is_item_page(url: str) -> bool:
@@ -134,13 +132,11 @@ def is_item_page(url: str) -> bool:
 
 
 def should_crawl(url: str) -> bool:
-    """判断一个 URL 是否应该被爬取（是列表页且不是商品详情页）。"""
+    """判断一个 URL 是否应该被爬取：仅允许 /list3/* 页面。"""
     if not url:
         return False
-    # 商品详情页不爬
-    if is_item_page(url):
+    if not is_allowed_url(url):
         return False
-    # 列表页才爬
     return is_listing_page(url)
 
 
@@ -154,7 +150,7 @@ def extract_links_from_page(html: str, source_url: str, depth: int) -> tuple[lis
     
     返回:
         - item_links: 商品详情页链接 (需要保存)
-        - listing_urls: 子列表页链接 (需要继续递归)
+        - listing_urls: /list3/* 子列表页链接 (需要继续递归)
         - other_links: 其他链接 (可选保存)
     """
     item_links = []
@@ -184,7 +180,7 @@ def extract_links_from_page(html: str, source_url: str, depth: int) -> tuple[lis
         if is_item_page(url):
             item_links.append(link_data)
         elif is_listing_page(url):
-            # 只保存 URL 用于递归，不保存完整数据（避免重复）
+            # 只保存 /list3/* URL 用于递归
             listing_urls.append(url)
         else:
             other_links.append(link_data)
@@ -198,12 +194,12 @@ def extract_links_from_page(html: str, source_url: str, depth: int) -> tuple[lis
 
 def crawl_recursive(start_url: str) -> dict:
     """
-    广度优先递归爬取所有商品列表页。
+    广度优先递归爬取 /list3/* 商品列表页。
     
     返回:
         - all_items: 所有商品链接列表
         - pages_crawled: 实际爬取的页面数
-        - listing_urls_found: 发现的列表页总数
+        - listing_urls_found: 发现的 /list3/* 列表页总数
         - errors: 错误列表
     """
     all_items = []
@@ -211,18 +207,15 @@ def crawl_recursive(start_url: str) -> dict:
     visited_pages = set()
     errors = []
     
-    # 初始化队列
     queue = deque()
+    
     if should_crawl(start_url):
         queue.append((start_url, 0))
     else:
-        # 如果起始页不是列表页，尝试从首页开始
-        logger.warning(f"起始页不是列表页: {start_url}，回退到首页")
-        queue.append((DEFAULT_START_URL, 0))
+        raise ValueError(f"起始页不是允许的 /list3/* 页面: {start_url}")
     
     pages_crawled = 0
     
-    # 创建 Session 复用连接
     session = requests.Session()
     session.headers.update({
         "User-Agent": USER_AGENT,
@@ -230,21 +223,23 @@ def crawl_recursive(start_url: str) -> dict:
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     })
     
-    logger.info(f"开始递归爬取，起始页: {queue[0][0]}，最大页面数: {MAX_PAGES}，最大深度: {MAX_DEPTH}")
+    logger.info(
+        f"开始递归爬取 /list3/*，起始页: {queue[0][0]}，"
+        f"最大页面数: {MAX_PAGES}，最大深度: {MAX_DEPTH}"
+    )
     
     while queue and pages_crawled < MAX_PAGES and len(all_items) < MAX_LINKS_PER_RUN:
         current_url, depth = queue.popleft()
         
-        # 跳过已访问或超出深度
         if current_url in visited_pages:
             continue
+        
         if depth > MAX_DEPTH:
             logger.debug(f"跳过深度 {depth} > {MAX_DEPTH}: {current_url}")
             continue
         
-        # 再次确认是否应该爬取
         if not should_crawl(current_url):
-            logger.debug(f"跳过非列表页: {current_url}")
+            logger.debug(f"跳过非 /list3/* 页面: {current_url}")
             continue
         
         visited_pages.add(current_url)
@@ -257,27 +252,30 @@ def crawl_recursive(start_url: str) -> dict:
             response.raise_for_status()
             pages_crawled += 1
             
-            # 提取链接
             item_links, new_listing_urls, other_links = extract_links_from_page(
                 response.text, current_url, depth
             )
             
-            # 保存商品链接
             all_items.extend(item_links)
             
-            # 将新发现的列表页加入队列（去重）
+            queued_urls = {q[0] for q in queue}
             new_urls_count = 0
+            
             for new_url in new_listing_urls:
-                if new_url not in visited_pages and new_url not in [q[0] for q in queue]:
+                if not should_crawl(new_url):
+                    continue
+                
+                if new_url not in visited_pages and new_url not in queued_urls:
                     queue.append((new_url, depth + 1))
+                    queued_urls.add(new_url)
                     new_urls_count += 1
             
             logger.info(
-                f"  发现: {len(item_links)} 个商品, {new_urls_count} 个新列表页, "
+                f"  发现: {len(item_links)} 个商品, "
+                f"{new_urls_count} 个新的 /list3/* 列表页, "
                 f"队列: {len(queue)}, 总计商品: {len(all_items)}"
             )
             
-            # 礼貌性延迟
             time.sleep(REQUEST_INTERVAL)
             
         except requests.exceptions.RequestException as e:
@@ -293,7 +291,7 @@ def crawl_recursive(start_url: str) -> dict:
     
     logger.info(
         f"递归完成: 爬取 {pages_crawled} 页, "
-        f"发现 {len(all_listing_urls)} 个列表页, "
+        f"发现 {len(all_listing_urls)} 个 /list3/* 列表页, "
         f"收集 {len(all_items)} 个商品链接, "
         f"错误 {len(errors)} 个"
     )
@@ -389,7 +387,7 @@ def lambda_handler(event, context):
     EventBridge 入口。
     
     支持事件参数:
-        - source_url: 起始 URL
+        - source_url: 起始 URL (必须是 /list3/* 页面)
         - enable_recursive: 是否启用递归
         - max_pages: 最大爬取页数
         - max_depth: 最大深度
