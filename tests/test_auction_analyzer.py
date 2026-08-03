@@ -22,6 +22,7 @@ from auction_analyzer import (
     build_closed_reference_samples,
     calc_market_price,
     calc_decision,
+    execute_countdown_workflow,
     execute_workflow,
     lambda_handler,
     normalize_pricing_key,
@@ -68,6 +69,58 @@ class NormalizePricingKeyTest(unittest.TestCase):
 
 
 class LeanAiWorkflowTest(unittest.TestCase):
+    @patch("auction_analyzer.execute_countdown_workflow", return_value={"status": "COMPLETED"})
+    def test_lambda_handler_routes_countdown_mode_by_category(self, workflow):
+        response = lambda_handler({
+            "mode": "countdown",
+            "keyword": "",
+            "category_id": "2084317598",
+            "active_count": 13,
+            "closed_count": 17,
+        }, None)
+
+        self.assertEqual(response["statusCode"], 200)
+        workflow.assert_called_once_with("2084317598", 13, 17, False)
+
+    def test_lambda_handler_requires_category_for_countdown_mode(self):
+        response = lambda_handler({"mode": "countdown", "keyword": ""}, None)
+
+        self.assertEqual(response["statusCode"], 400)
+        self.assertIn("category_id", response["body"])
+
+    @patch("auction_analyzer.price_active_item", return_value=None)
+    @patch("auction_analyzer.build_index", return_value={"MODEL": []})
+    @patch("auction_analyzer.batch_parse")
+    @patch("auction_analyzer.scrape_closed", return_value=["c1"])
+    @patch("auction_analyzer.scrape_active", return_value=["a1"])
+    @patch("auction_analyzer.check_limits")
+    @patch("auction_analyzer.get_record")
+    def test_countdown_workflow_starts_active_then_searches_closed_by_ai_model(
+        self, get_record, _limits, scrape_active_mock, scrape_closed_mock,
+        batch_parse_mock, _build_index, _price
+    ):
+        active_pending = {"itemID": "a1", "modelStatus": Status.PENDING}
+        active_identified = {
+            "itemID": "a1", "modelStatus": Status.COMPLETED,
+            "pricingStatus": Status.PENDING,
+            "listingType": ListingType.MAIN_PRODUCT,
+            "models": [{"brand": "Nikon", "model": "Z 7II"}],
+        }
+        closed_pending = {"itemID": "c1", "modelStatus": Status.PENDING}
+        get_record.side_effect = [
+            active_pending, active_identified, closed_pending, active_identified,
+        ]
+
+        result = execute_countdown_workflow("2084317598", 10, 20, False)
+
+        self.assertEqual(result["status"], "COMPLETED")
+        scrape_active_mock.assert_called_once_with(
+            "", 10, 0, False, {"category_id": "2084317598"}
+        )
+        scrape_closed_mock.assert_called_once()
+        self.assertEqual(scrape_closed_mock.call_args.args[0], "Nikon Z 7II")
+        self.assertEqual(batch_parse_mock.call_count, 2)
+
     @patch("auction_analyzer.product_catalog_db.update_item")
     @patch("auction_analyzer.execute_workflow", return_value={"status": "COMPLETED"})
     def test_lambda_handler_marks_catalog_product_completed(self, execute_workflow, update_item):
