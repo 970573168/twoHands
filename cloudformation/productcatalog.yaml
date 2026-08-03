@@ -227,6 +227,29 @@ Parameters:
     MinValue: 10
     MaxValue: 100
 
+  # ============ 链接搜索爬虫参数 ============
+  DeployLinkCrawler:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: 是否部署 Yahoo 拍卖链接采集器
+
+  LinkCrawlerScheduleMinutes:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 1440
+    Description: EventBridge 定时采集间隔（分钟）
+
+  LinkCrawlerMaxLinks:
+    Type: Number
+    Default: 500
+    MinValue: 1
+    MaxValue: 5000
+    Description: 每次最多保存的链接数量
+
   # ============ Yahoo Auction Analyzer 参数 ============
   ModelParseBatchSize:
     Type: Number
@@ -430,6 +453,7 @@ Conditions:
   CreateOpenaiSecret: !Not [!Equals [!Ref OpenaiApiKey, ""]]
   DeployMainAppCondition: !Equals [!Ref DeployMainApp, "true"]
   DeployScraperCondition: !Equals [!Ref DeployScraper, "true"]
+  DeployLinkCrawlerCondition: !Equals [!Ref DeployLinkCrawler, "true"]
   DeployCatalogScannerCondition: !And
     - !Equals [!Ref DeployCatalogScanner, "true"]
     - !Condition DeployMainAppCondition
@@ -558,6 +582,28 @@ Resources:
       Tags:
         - Key: Application
           Value: AiTokenUsage
+        - Key: Environment
+          Value: !Ref Environment
+
+  YahooAuctionLinksTable:
+    Type: AWS::DynamoDB::Table
+    Condition: DeployLinkCrawlerCondition
+    Properties:
+      TableName: !Sub "YahooAuctionLinks-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: crawl_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: crawl_id
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Application
+          Value: YahooAuctionLinkCrawler
         - Key: Environment
           Value: !Ref Environment
 
@@ -691,6 +737,13 @@ Resources:
       LogGroupName: !Sub "/aws/lambda/YahooAuctionScraper-${Environment}"
       RetentionInDays: !Ref LogRetentionDays
 
+  YahooAuctionLinkCrawlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: DeployLinkCrawlerCondition
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/YahooAuctionLinkCrawler-${Environment}"
+      RetentionInDays: !Ref LogRetentionDays
+
   YahooAuctionAnalyzerLogGroup:
     Type: AWS::Logs::LogGroup
     Condition: DeployScraperCondition
@@ -800,6 +853,36 @@ Resources:
                 Resource:
                   - !Sub "${YahooAuctionScraperLogGroup.Arn}:*"
                   - !Sub "${YahooAuctionAnalyzerLogGroup.Arn}:*"
+
+  YahooAuctionLinkCrawlerRole:
+    Type: AWS::IAM::Role
+    Condition: DeployLinkCrawlerCondition
+    Properties:
+      RoleName: !Sub "YahooAuctionLinkCrawler-Role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: YahooAuctionLinkCrawlerPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: WriteLinks
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:BatchWriteItem
+                Resource: !GetAtt YahooAuctionLinksTable.Arn
+              - Sid: WriteLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${YahooAuctionLinkCrawlerLogGroup.Arn}:*"
 
   YahooAuctionFinalCheckRole:
     Type: AWS::IAM::Role
@@ -1051,6 +1134,57 @@ Resources:
         - Key: Environment
           Value: !Ref Environment
 
+  YahooAuctionLinkCrawler:
+    Type: AWS::Lambda::Function
+    Condition: DeployLinkCrawlerCondition
+    DependsOn:
+      - YahooAuctionLinkCrawlerLogGroup
+      - YahooAuctionLinkCrawlerRole
+    Properties:
+      FunctionName: !Sub "YahooAuctionLinkCrawler-${Environment}"
+      Description: Yahoo 拍卖链接与锚文本定时采集器
+      Runtime: python3.12
+      Architectures:
+        - arm64
+      Handler: search_engine_crawler.lambda_handler
+      Timeout: 60
+      MemorySize: 256
+      Role: !GetAtt YahooAuctionLinkCrawlerRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: !Ref LambdaCodeS3Key
+      Environment:
+        Variables:
+          LINK_CRAWLER_TABLE_NAME: !Ref YahooAuctionLinksTable
+          LINK_CRAWLER_START_URL: "https://auctions.yahoo.co.jp/"
+          LINK_CRAWLER_MAX_LINKS: !Ref LinkCrawlerMaxLinks
+      Tags:
+        - Key: Application
+          Value: YahooAuctionLinkCrawler
+        - Key: Environment
+          Value: !Ref Environment
+
+  YahooAuctionLinkCrawlerScheduleRule:
+    Type: AWS::Events::Rule
+    Condition: DeployLinkCrawlerCondition
+    Properties:
+      Name: !Sub "YahooAuctionLinkCrawler-Schedule-${Environment}"
+      Description: 定时触发 Yahoo 拍卖链接采集器
+      ScheduleExpression: !Sub "rate(${LinkCrawlerScheduleMinutes} minutes)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt YahooAuctionLinkCrawler.Arn
+          Id: YahooAuctionLinkCrawlerTarget
+
+  YahooAuctionLinkCrawlerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: DeployLinkCrawlerCondition
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref YahooAuctionLinkCrawler
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt YahooAuctionLinkCrawlerScheduleRule.Arn
+
   YahooAuctionFinalCheckFunction:
     Type: AWS::Lambda::Function
     Condition: DeployScraperCondition
@@ -1263,6 +1397,16 @@ Resources:
       SourceArn: !GetAtt CatalogScannerScheduleRule.Arn
 
 Outputs:
+  YahooAuctionLinksTableName:
+    Condition: DeployLinkCrawlerCondition
+    Description: Yahoo 拍卖链接采集表
+    Value: !Ref YahooAuctionLinksTable
+
+  YahooAuctionLinkCrawlerFunctionName:
+    Condition: DeployLinkCrawlerCondition
+    Description: Yahoo 拍卖链接采集 Lambda
+    Value: !Ref YahooAuctionLinkCrawler
+
   AiTokenUsageTableName:
     Value: !Ref AiTokenUsageTable
 
