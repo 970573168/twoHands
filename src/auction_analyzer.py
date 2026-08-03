@@ -81,6 +81,7 @@ BUY_CANDIDATE_TABLE = os.environ.get(
     "BUY_CANDIDATE_TABLE", "YahooAuctionBuyCandidates-dev"
 )
 FINAL_CHECK_BEFORE_MINUTES = _env("FINAL_CHECK_BEFORE_MINUTES", 15, int)
+SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN", "")
 AI_MODE = _env("AI_MODE", "doubao")
 
 _gemini_model = _env("GEMINI_MODEL", "gemini-2.0-flash")
@@ -168,6 +169,7 @@ closed_db = dynamodb.Table(TABLE_CLOSED)
 product_catalog_db = dynamodb.Table(PRODUCT_TABLE_NAME)
 buy_candidate_db = dynamodb.Table(BUY_CANDIDATE_TABLE)
 secrets = boto3.client("secretsmanager")
+sns = boto3.client("sns")
 _total_tokens = 0
 _start_time = None
 
@@ -1804,8 +1806,42 @@ def build_closed_reference_samples(pricing: Dict, limit: int = 10) -> List[Dict]
     return samples
 
 
-def upsert_buy_candidate(item_id: str, item: Dict, pricing: Dict):
-    """保存 BUY_CANDIDATE；首次入库只排期，不发送通知。"""
+def send_countdown_candidate_email(candidate: Dict):
+    """向至少有一个已确认订阅者的 SNS Topic 发布入库通知。"""
+    subscriptions = sns.list_subscriptions_by_topic(TopicArn=SNS_TOPIC_ARN)
+    confirmed = [
+        subscription for subscription in subscriptions.get("Subscriptions", [])
+        if subscription.get("SubscriptionArn") not in (None, "PendingConfirmation")
+    ]
+    if not confirmed:
+        raise RuntimeError("SNS_NO_CONFIRMED_SUBSCRIPTION")
+    subject = "【倒计时入库】{} {}".format(
+        candidate.get("brand", ""), candidate.get("model", "")
+    ).strip()
+    message = f"""倒计时模式发现新的 BUY_CANDIDATE，已写入候选库。
+
+商品：{candidate.get('title', '')}
+当前价：{candidate.get('currentBidPrice', 0)}円
+市场价：{candidate.get('marketPrice', 0)}円
+预计利润：{candidate.get('netProfitAtCurrentBid', 0)}円
+利润率：{candidate.get('profitMarginAtCurrentBid', '')}
+ROI：{candidate.get('roiAtCurrentBid', '')}
+风险等级：{candidate.get('riskLevel', '')}
+置信度：{candidate.get('pricingConfidence', '')}
+
+结束时间：{candidate.get('endTime', '')}
+商品链接：
+{candidate.get('url', '')}
+
+系统仍会在拍卖结束前进行最终复核。"""
+    return sns.publish(
+        TopicArn=SNS_TOPIC_ARN, Subject=subject[:100], Message=message
+    ).get("MessageId", "")
+
+
+def upsert_buy_candidate(item_id: str, item: Dict, pricing: Dict,
+                         countdown_mode: bool = False):
+    """保存 BUY_CANDIDATE；倒计时模式首次入库后立即发送一次邮件。"""
     market_price = si(pricing.get("estimatedMarketPrice", 0))
     if market_price <= 0:
         review_status = "NO_MARKET_PRICE"
@@ -1884,6 +1920,9 @@ def upsert_buy_candidate(item_id: str, item: Dict, pricing: Dict):
         fields["finalCheckAtEpoch"] = final_check_at
     if reminder_error:
         fields["reminderError"] = reminder_error
+    should_send_countdown_email = countdown_mode and not existing
+    if should_send_countdown_email:
+        fields["countdownNotificationStatus"] = "PENDING"
 
     expression_names = {}
     values = {":first_detected": now}
@@ -1909,6 +1948,28 @@ def upsert_buy_candidate(item_id: str, item: Dict, pricing: Dict):
         "Buy candidate reference samples saved: itemID=%s sampleCount=%s",
         item_id, len(reference_samples),
     )
+    if should_send_countdown_email:
+        notification_fields = {"countdownNotificationAt": now}
+        try:
+            if not SNS_TOPIC_ARN:
+                raise RuntimeError("SNS_TOPIC_ARN_MISSING")
+            message_id = send_countdown_candidate_email(fields)
+            notification_fields.update({
+                # SNS Publish 成功仅表示消息已被 Topic 接受，不能代表邮件已投递。
+                "countdownNotificationStatus": "PUBLISHED",
+                "countdownNotificationMessageId": message_id,
+            })
+            logger.info(
+                "倒计时入库通知已发布到 SNS: itemID=%s messageId=%s",
+                item_id, message_id,
+            )
+        except Exception as exc:
+            notification_fields.update({
+                "countdownNotificationStatus": "FAILED",
+                "countdownNotificationError": str(exc)[:500],
+            })
+            logger.exception("倒计时入库邮件发送失败: itemID=%s", item_id)
+        update_record(buy_candidate_db, str(item_id), notification_fields)
 
 
 def deactivate_buy_candidate(item_id: str, reason: str):
@@ -1948,7 +2009,8 @@ def has_usable_model(item: Dict) -> bool:
 
 
 def price_active_item(item_id: str, idx: Dict[str,List[Dict]],
-                      sync_candidate: bool = True) -> Optional[Dict]:
+                      sync_candidate: bool = True,
+                      countdown_mode: bool = False) -> Optional[Dict]:
     """计算并保存单个 active 商品利润；返回定价结果。"""
     item = get_record(active_db, item_id)
     if not item or not has_usable_model(item):
@@ -1969,7 +2031,9 @@ def price_active_item(item_id: str, idx: Dict[str,List[Dict]],
     if sync_candidate:
         try:
             if recommendation == Recommendation.BUY_CANDIDATE:
-                upsert_buy_candidate(item_id, item, pricing)
+                upsert_buy_candidate(
+                    item_id, item, pricing, countdown_mode=countdown_mode
+                )
             else:
                 deactivate_buy_candidate(item_id, "REPRICED_NOT_BUY_CANDIDATE")
         except Exception as exc:
@@ -2272,7 +2336,9 @@ def execute_countdown_workflow(category_id: str, ac: int, cc: int, force: bool) 
         for item in recheck_items:
             aid = str(item.get("itemID", ""))
             current = get_record(active_db, aid) if aid else None
-            if current and has_usable_model(current) and price_active_item(aid, idx, sync_candidate=True):
+            if current and has_usable_model(current) and price_active_item(
+                aid, idx, sync_candidate=True, countdown_mode=True
+            ):
                 repriced += 1
 
         result.update({

@@ -35,6 +35,7 @@ from auction_analyzer import (
     save_closed_model,
     save_model,
     scrape_active,
+    send_countdown_candidate_email,
     should_reanalyze_description,
     upsert_buy_candidate,
     update_record,
@@ -433,6 +434,49 @@ class LeanAiWorkflowTest(unittest.TestCase):
         self.assertIn("WAITING_FINAL_CHECK", values.values())
         self.assertIn("NOT_SENT", values.values())
         self.assertIn(1100, values.values())
+
+    @patch("auction_analyzer.update_record")
+    @patch("auction_analyzer.send_countdown_candidate_email")
+    @patch("auction_analyzer.SNS_TOPIC_ARN", "arn:aws:sns:test:topic")
+    @patch("auction_analyzer.buy_candidate_db")
+    def test_countdown_candidate_sends_email_once_when_first_inserted(
+        self, candidate_db, send_email, update_record
+    ):
+        candidate_db.get_item.side_effect = [{}, {"Item": {"itemID": "item-1"}}]
+        item = {
+            "title": "Nikon lens", "url": "https://example.test/item",
+            "models": [{"brand": "Nikon", "model": "Z lens"}],
+            "price": 62000, "endTime": "2099-01-01T00:00:00+00:00",
+        }
+        pricing = {
+            "estimatedMarketPrice": 77000, "currentBidPrice": 62000,
+            "netProfitAtCurrentBid": 11000,
+        }
+        send_email.return_value = "message-1"
+
+        upsert_buy_candidate("item-1", item, pricing, countdown_mode=True)
+        upsert_buy_candidate("item-1", item, pricing, countdown_mode=True)
+
+        send_email.assert_called_once()
+        self.assertEqual(
+            update_record.call_args.args[2]["countdownNotificationStatus"], "PUBLISHED"
+        )
+        self.assertEqual(
+            update_record.call_args.args[2]["countdownNotificationMessageId"],
+            "message-1",
+        )
+
+    @patch("auction_analyzer.sns")
+    @patch("auction_analyzer.SNS_TOPIC_ARN", "arn:aws:sns:test:topic")
+    def test_countdown_email_requires_confirmed_sns_subscription(self, sns):
+        sns.list_subscriptions_by_topic.return_value = {
+            "Subscriptions": [{"SubscriptionArn": "PendingConfirmation"}],
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "SNS_NO_CONFIRMED_SUBSCRIPTION"):
+            send_countdown_candidate_email({"title": "candidate"})
+
+        sns.publish.assert_not_called()
 
     @patch("auction_analyzer.buy_candidate_db")
     def test_buy_candidate_with_invalid_end_time_is_not_scheduled(self, candidate_db):
