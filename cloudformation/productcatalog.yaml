@@ -888,6 +888,10 @@ Resources:
                 Effect: Allow
                 Action: dynamodb:PutItem
                 Resource: !GetAtt AiTokenUsageTable.Arn
+              - Sid: PublishCountdownCandidateEmail
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref YahooAuctionBuyCandidateReminderTopic
               - Sid: WriteLogs
                 Effect: Allow
                 Action:
@@ -1204,6 +1208,7 @@ Resources:
           TABLE_NAME_CLOSED: !Sub "YahooAuctionItems-${Environment}"
           TABLE_NAME: !Ref ProductCatalogTable
           BUY_CANDIDATE_TABLE: !Ref YahooAuctionBuyCandidateTable
+          SNS_TOPIC_ARN: !Ref YahooAuctionBuyCandidateReminderTopic
           FINAL_CHECK_BEFORE_MINUTES: !Ref FinalCheckBeforeMinutes
           ENVIRONMENT: !Ref Environment
           TOKEN_USAGE_TABLE: !Ref AiTokenUsageTable
