@@ -154,7 +154,8 @@ TABLES = [
     "ProductCatalog-dev",
     "YahooAuctionActiveItems-dev",
     "YahooAuctionBuyCandidates-dev",
-    "YahooAuctionItems-dev"
+    "YahooAuctionItems-dev",
+    "YahooAuctionLinks-dev"  # 新增
 ]
 
 JST = timezone(timedelta(hours=9))
@@ -230,38 +231,45 @@ for table_name in TABLES:
         "TableName": table_name
     }
 
-    while True:
-        response = dynamodb.scan(**scan_kwargs)
-        items.extend(response.get("Items", []))
+    try:
+        while True:
+            response = dynamodb.scan(**scan_kwargs)
+            items.extend(response.get("Items", []))
 
-        if "LastEvaluatedKey" not in response:
-            break
+            if "LastEvaluatedKey" not in response:
+                break
 
-        scan_kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
+            scan_kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
 
-    print(f"获取 {len(items)} 条记录")
+        print(f"获取 {len(items)} 条记录")
 
-    columns = set()
+        columns = set()
 
-    for item in items:
-        columns.update(item.keys())
+        for item in items:
+            columns.update(item.keys())
 
-    columns = sorted(list(columns))
+        columns = sorted(list(columns))
 
-    ws = wb.create_sheet(title=table_name[:31])
+        ws = wb.create_sheet(title=table_name[:31])
 
-    ws.append(columns)
+        ws.append(columns)
 
-    for item in items:
-        row = [
-            convert_value(item.get(col))
-            for col in columns
-        ]
-        ws.append(row)
+        for item in items:
+            row = [
+                convert_value(item.get(col))
+                for col in columns
+            ]
+            ws.append(row)
 
-    ws.auto_filter.ref = ws.dimensions
+        ws.auto_filter.ref = ws.dimensions
 
-    print(f"{table_name} 导出完成")
+        print(f"{table_name} 导出完成")
+
+    except Exception as e:
+        print(f"导出 {table_name} 失败: {e}")
+        # 创建一个空表标记失败
+        ws = wb.create_sheet(title=table_name[:31])
+        ws.append(["导出失败", str(e)])
 
 output_file = "dynamodb_all_tables.xlsx"
 
