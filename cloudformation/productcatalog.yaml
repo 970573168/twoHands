@@ -288,6 +288,11 @@ Parameters:
     Default: "false"
     AllowedValues: ["true", "false"]
 
+  CountdownScanEventJson:
+    Type: String
+    Default: '{"mode":"countdown","keyword":"","category_id":"2084317598","active_count":100,"closed_count":100}'
+    Description: 倒计时扫描定时器传给 YahooAuctionAnalyzer 的 JSON 参数
+
   # ============ Yahoo Auction 详情抓取参数 ============
   EnableDetailScrape:
     Type: String
@@ -1264,6 +1269,29 @@ Resources:
           Value: YahooAuctionAnalyzer
         - Key: Environment
           Value: !Ref Environment
+
+  # 定时器：Yahoo Auction Analyzer 倒计时扫描 - 每 5 分钟，默认关闭
+  YahooAuctionCountdownScanScheduleRule:
+    Type: AWS::Events::Rule
+    Condition: DeployScraperCondition
+    Properties:
+      Name: !Sub "YahooAuctionAnalyzer-Countdown-Schedule-${Environment}"
+      Description: 每 5 分钟触发 Yahoo Auction Analyzer 倒计时扫描（默认关闭）
+      ScheduleExpression: rate(5 minutes)
+      State: DISABLED
+      Targets:
+        - Arn: !GetAtt AuctionAnalyzerFunction.Arn
+          Id: YahooAuctionCountdownScanTarget
+          Input: !Ref CountdownScanEventJson
+
+  YahooAuctionCountdownScanInvokePermission:
+    Type: AWS::Lambda::Permission
+    Condition: DeployScraperCondition
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AuctionAnalyzerFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt YahooAuctionCountdownScanScheduleRule.Arn
 
   CatalogScannerFunction:
     Type: AWS::Lambda::Function
