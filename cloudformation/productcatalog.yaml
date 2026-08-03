@@ -722,39 +722,41 @@ Resources:
                   - !Sub "${YahooAuctionScraperLogGroup.Arn}:*"
                   - !Sub "${YahooAuctionAnalyzerLogGroup.Arn}:*"
 
-  YahooAuctionLinkCrawlerRole:
-    Type: AWS::IAM::Role
-    Condition: DeployLinkCrawlerCondition
-    Properties:
-      RoleName: !Sub "YahooAuctionLinkCrawler-Role-${Environment}"
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: YahooAuctionLinkCrawlerPolicy
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Sid: WriteLinks
-                Effect: Allow
-                Action:
-                  - dynamodb:PutItem
-                  - dynamodb:BatchWriteItem
-                  - dynamodb:Query
-                Resource:
-                  - !GetAtt YahooAuctionLinksTable.Arn
-                  - !Sub "${YahooAuctionLinksTable.Arn}/index/*"
-              - Sid: WriteLogs
-                Effect: Allow
-                Action:
-                  - logs:CreateLogStream
-                  - logs:PutLogEvents
-                Resource: !Sub "${YahooAuctionLinkCrawlerLogGroup.Arn}:*"
-
+    YahooAuctionLinkCrawlerRole:
+      Type: AWS::IAM::Role
+      Condition: DeployLinkCrawlerCondition
+      Properties:
+        RoleName: !Sub "YahooAuctionLinkCrawler-Role-${Environment}"
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: lambda.amazonaws.com
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: YahooAuctionLinkCrawlerPolicy
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Sid: DynamoDBAccess
+                  Effect: Allow
+                  Action:
+                    - dynamodb:PutItem
+                    - dynamodb:BatchWriteItem
+                    - dynamodb:GetItem
+                    - dynamodb:UpdateItem
+                    - dynamodb:Query
+                    - dynamodb:Scan
+                  Resource:
+                    - !GetAtt YahooAuctionLinksTable.Arn
+                    - !Sub "${YahooAuctionLinksTable.Arn}/index/*"
+                - Sid: WriteLogs
+                  Effect: Allow
+                  Action:
+                    - logs:CreateLogStream
+                    - logs:PutLogEvents
+                  Resource: !Sub "${YahooAuctionLinkCrawlerLogGroup.Arn}:*"
   YahooAuctionFinalCheckRole:
     Type: AWS::IAM::Role
     Condition: DeployScraperCondition
