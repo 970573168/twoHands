@@ -285,3 +285,92 @@ dynamodb_all_tables.xlsx
 
 
 
+
+
+
+
+
+删除搜索记录
+\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+
+python3 -c "
+import boto3
+
+dynamodb = boto3.resource('dynamodb')
+
+# 要清空的表列表
+tables_to_clear = [
+    'YahooAuctionLinks-dev',
+    'YahooAuctionItems-dev',
+    'YahooAuctionActiveItems-dev',
+    'YahooAuctionBuyCandidates-dev',
+    'ProductCatalog-dev',
+    'AiTokenUsage-dev',
+]
+
+for table_name in tables_to_clear:
+    try:
+        table = dynamodb.Table(table_name)
+        
+        # 统计总数
+        total = 0
+        scan_kwargs = {}
+        while True:
+            response = table.scan(Select='COUNT', **scan_kwargs)
+            total += response['Count']
+            if 'LastEvaluatedKey' not in response:
+                break
+            scan_kwargs['ExclusiveStartKey'] = response['LastEvaluatedKey']
+        
+        print(f'\n📋 {table_name}: {total} 条记录')
+        
+    except Exception as e:
+        print(f'\n⚠️ {table_name}: 不存在或无权限访问 ({e})')
+
+print()
+confirm = input('确认删除以上所有表的数据？(yes/no): ')
+if confirm.lower() != 'yes':
+    print('取消删除')
+    exit()
+
+print('\n开始删除...\n')
+
+for table_name in tables_to_clear:
+    try:
+        table = dynamodb.Table(table_name)
+        
+        deleted = 0
+        scan_kwargs = {}
+        
+        # 获取表的键名
+        key_schema = table.key_schema
+        key_names = [k['AttributeName'] for k in key_schema]
+        
+        with table.batch_writer() as batch:
+            while True:
+                response = table.scan(**scan_kwargs)
+                items = response.get('Items', [])
+                
+                for item in items:
+                    # 构建键字典
+                    key = {k: item[k] for k in key_names}
+                    batch.delete_item(Key=key)
+                    deleted += 1
+                
+                if 'LastEvaluatedKey' not in response:
+                    break
+                scan_kwargs['ExclusiveStartKey'] = response['LastEvaluatedKey']
+        
+        print(f'✅ {table_name}: 删除 {deleted} 条')
+        
+    except Exception as e:
+        print(f'❌ {table_name}: 删除失败 ({e})')
+
+print('\n清空完成！')
+"
+
+\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\
+
+
