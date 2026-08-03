@@ -1,3 +1,25 @@
+# 设置表名变量
+TABLE_NAME="YahooAuctionLinks-dev"
+
+# 扫描所有记录并保存到文件
+aws dynamodb scan --table-name $TABLE_NAME --output json > /tmp/items.json
+
+# 提取所有主键并删除
+aws dynamodb scan --table-name $TABLE_NAME \
+  --projection-expression "crawl_id" \
+  --output json | \
+  jq -r '.Items[] | {crawl_id: .crawl_id.S} | 
+    "{\"crawl_id\": {\"S\": \"" + .crawl_id + "\"}}"' | \
+  while read -r key; do
+    echo "Deleting: $key"
+    aws dynamodb delete-item \
+      --table-name $TABLE_NAME \
+      --key "$key"
+  done
+
+
+
+
 aws dynamodb scan \
     --table-name "AiTokenUsage-dev" \
     --projection-expression "total_tokens" \
