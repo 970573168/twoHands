@@ -1964,6 +1964,7 @@ def scrape_closed(kw: str, cnt: int, force: bool = False, source_model: Optional
             kw, "closed", False, scrape_details=False,
             brand=(source_model or {}).get("brand", ""),
             model=(source_model or {}).get("model", ""),
+            category_id=(source_model or {}).get("category_id", ""),
             aliases=(source_model or {}).get("aliases") or (source_model or {}).get("alias") or [],
         )[:cnt]
         new_count = 0
@@ -2016,6 +2017,7 @@ def scrape_active(kw: str, cnt: int, max_p: int = 0, force: bool = False,
             scrape_details=False,
             brand=(source_model or {}).get("brand", ""),
             model=(source_model or {}).get("model", ""),
+            category_id=(source_model or {}).get("category_id", ""),
             aliases=(source_model or {}).get("aliases") or (source_model or {}).get("alias") or [],
         )
         if max_p > 0:
@@ -2525,6 +2527,10 @@ def lambda_handler(event, context):
             "model": norm(event.get("model", "")),
             "aliases": [norm(alias) for alias in aliases if norm(alias)],
         }
+        if norm(event.get("category", "")):
+            source_model["category"] = norm(event.get("category", ""))
+        if norm(event.get("category_id", "")):
+            source_model["category_id"] = norm(event.get("category_id", ""))
         if not source_model["brand"] or not source_model["model"]:
             # 兼容直接调用：keyword 通常就是 "brand model"，但无法可靠拆分时
             # 仍保留空 sourceModel，由 Closed AI 返回空 models。

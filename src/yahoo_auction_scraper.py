@@ -520,7 +520,7 @@ def get_filter_keywords(event):
     return exclude_keywords, include_keywords
 
 
-def build_url(keyword, page, search_type, exclude_keywords="", include_keywords="", min_price=None):
+def build_url(keyword, page, search_type, exclude_keywords="", include_keywords="", min_price=None, category_id=""):
     """构建请求 URL"""
     params = {}
     
@@ -538,6 +538,8 @@ def build_url(keyword, page, search_type, exclude_keywords="", include_keywords=
     # Yahoo 的普通搜索框使用 p。此前改成高级搜索参数 va 后，部分关键词
     # （尤其是型号、英文编号）会得到不同或空的结果集。
     params["p"] = sanitize_search_keyword(keyword)
+    if str(category_id or "").isdigit():
+        params["auccat"] = str(category_id)
     params["abatch"] = AUCTION_ABATCH
     
     if include_keywords:
@@ -1194,7 +1196,7 @@ def lambda_handler(event, context):
 
 def scrape_auctions(keyword, search_type, include_paypay=True,
                     exclude_keywords="", include_keywords="", min_price=None,
-                    scrape_details=None, category="", brand="", model="", aliases=None,
+                    scrape_details=None, category="", brand="", model="", aliases=None, category_id="",
                     enable_local_title_filter=None,
                     local_title_filter_strict=None):
     """抓取列表页；scrape_details 可显式控制是否同步抓取详情。"""
@@ -1211,7 +1213,7 @@ def scrape_auctions(keyword, search_type, include_paypay=True,
     all_items = []
 
     for page in range(1, MAX_PAGES + 1):
-        url = build_url(keyword, page, search_type, exclude_keywords, include_keywords, min_price)
+        url = build_url(keyword, page, search_type, exclude_keywords, include_keywords, min_price, category_id)
         logger.info(f"Fetching page {page}: {url}")
 
         try:
@@ -1223,7 +1225,7 @@ def scrape_auctions(keyword, search_type, include_paypay=True,
                 if simplified:
                     retry_url = build_url(
                         simplified, page, search_type, exclude_keywords,
-                        include_keywords, min_price,
+                        include_keywords, min_price, category_id,
                     )
                     logger.warning(
                         "Search returned 404; retrying once: original=%s simplified=%s",
