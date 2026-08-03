@@ -94,6 +94,7 @@ RETRYABLE_CODES = {408, 409, 429, 500, 502, 503, 504}
 
 # 数据来源标识
 DATA_SOURCE = os.environ.get("DATA_SOURCE", "AI_DISCOVERY")
+LINK_CRAWLER_TABLE_NAME = os.environ.get("LINK_CRAWLER_TABLE_NAME", "")
 
 # GSI 查询回退配置
 ENABLE_GSI_QUERY = os.environ.get("ENABLE_GSI_QUERY", "true").lower() == "true"
@@ -1000,7 +1001,7 @@ def call_openai_compatible_api(config: dict, task: dict) -> tuple:
 # 数据库操作
 # ============================================
 
-def upsert_category(category):
+def upsert_category(category, category_id=""):
     global _tracker
     category = normalize(category)
     if not category: return
@@ -1008,9 +1009,9 @@ def upsert_category(category):
         now = int(time.time())
         table.update_item(
             Key={"PK": f"CATEGORY#{key_part(category)}", "SK": "META"},
-            UpdateExpression="SET entity_type = :type, #name = :name, #status = :status, first_seen_at = if_not_exists(first_seen_at, :now), last_seen_at = :now, modified_index_pk = :all, modified_at = :modified_at, #source = :source",
+            UpdateExpression="SET entity_type = :type, #name = :name, category_id = :category_id, #status = :status, first_seen_at = if_not_exists(first_seen_at, :now), last_seen_at = :now, modified_index_pk = :all, modified_at = :modified_at, #source = :source",
             ExpressionAttributeNames={"#name": "name", "#status": "status", "#source": "source"},
-            ExpressionAttributeValues={":type": "CATEGORY", ":name": category, ":status": "ACTIVE", ":now": now, ":all": "ALL", ":modified_at": datetime.now(timezone.utc).isoformat(), ":source": DATA_SOURCE}
+            ExpressionAttributeValues={":type": "CATEGORY", ":name": category, ":category_id": str(category_id or ""), ":status": "ACTIVE", ":now": now, ":all": "ALL", ":modified_at": datetime.now(timezone.utc).isoformat(), ":source": "YAHOO_DIRECTORY"}
         )
         if _tracker: _tracker.record_db_operation("upsert_category", 1)
     except Exception as e:
@@ -1018,7 +1019,7 @@ def upsert_category(category):
         raise
 
 
-def upsert_brand(category, brand):
+def upsert_brand(category, brand, category_id=""):
     global _tracker
     category, brand = normalize(category), normalize(brand)
     if not category or not brand: return
@@ -1026,9 +1027,9 @@ def upsert_brand(category, brand):
         now = int(time.time())
         table.update_item(
             Key={"PK": f"CATEGORY#{key_part(category)}", "SK": f"BRAND#{key_part(brand)}"},
-            UpdateExpression="SET entity_type = :type, category = :category, brand = :brand, #status = :status, first_seen_at = if_not_exists(first_seen_at, :now), last_seen_at = :now, modified_index_pk = :all, modified_at = :modified_at, #source = :source",
+            UpdateExpression="SET entity_type = :type, category = :category, category_id = :category_id, brand = :brand, #status = :status, first_seen_at = if_not_exists(first_seen_at, :now), last_seen_at = :now, modified_index_pk = :all, modified_at = :modified_at, #source = :source",
             ExpressionAttributeNames={"#status": "status", "#source": "source"},
-            ExpressionAttributeValues={":type": "BRAND", ":category": category, ":brand": brand, ":status": "ACTIVE", ":now": now, ":all": "ALL", ":modified_at": datetime.now(timezone.utc).isoformat(), ":source": DATA_SOURCE}
+            ExpressionAttributeValues={":type": "BRAND", ":category": category, ":category_id": str(category_id or ""), ":brand": brand, ":status": "ACTIVE", ":now": now, ":all": "ALL", ":modified_at": datetime.now(timezone.utc).isoformat(), ":source": DATA_SOURCE}
         )
         if _tracker: _tracker.record_db_operation("upsert_brand", 1)
     except Exception as e:
@@ -1036,7 +1037,7 @@ def upsert_brand(category, brand):
         raise
 
 
-def upsert_product(category, brand, model, confidence=None, release_date=None, official_price_jpy=None):
+def upsert_product(category, brand, model, confidence=None, release_date=None, official_price_jpy=None, category_id=""):
     """
     保存产品型号到 DynamoDB。
     包含：官方售价过滤 + 拍卖适合度检查
@@ -1074,14 +1075,14 @@ def upsert_product(category, brand, model, confidence=None, release_date=None, o
         product_pk = f"PRODUCT#{product_id}"
 
         expression = (
-            "SET entity_type = :type, category = :category, brand = :brand, "
+            "SET entity_type = :type, category = :category, category_id = :category_id, brand = :brand, "
             "model = :model, normalized_model = :normalized_model, "
             "#status = :status, verification_status = if_not_exists(verification_status, :unverified), "
             "first_seen_at = if_not_exists(first_seen_at, :now), last_seen_at = :now, "
             "modified_index_pk = :all, modified_at = :modified_at, #source = :source"
         )
         values = {
-            ":type": "PRODUCT", ":category": category, ":brand": brand,
+            ":type": "PRODUCT", ":category": category, ":category_id": str(category_id or ""), ":brand": brand,
             ":model": model, ":normalized_model": normalize(model).casefold(),
             ":status": "ACTIVE", ":unverified": "UNVERIFIED", ":now": now,
             ":all": "ALL", ":modified_at": datetime.now(timezone.utc).isoformat(), ":source": DATA_SOURCE
@@ -1129,7 +1130,7 @@ def upsert_product(category, brand, model, confidence=None, release_date=None, o
             "GSI1PK": f"BRAND#{key_part(brand)}",
             "GSI1SK": release_date if release_date else "0000-00-00",
             "entity_type": "BRAND_MODEL",
-            "category": category, "brand": brand, "model": model,
+            "category": category, "category_id": str(category_id or ""), "brand": brand, "model": model,
             "product_pk": product_pk, "last_seen_at": now,
             "modified_index_pk": "ALL",
             "modified_at": datetime.now(timezone.utc).isoformat(),
@@ -1156,6 +1157,41 @@ def upsert_product(category, brand, model, confidence=None, release_date=None, o
 # ============================================
 # 主处理逻辑
 # ============================================
+
+def get_crawled_categories(limit=MAX_CATEGORIES):
+    """读取目录爬虫产生的真实 Yahoo 品类，不再让 AI 猜测品类。"""
+    if not LINK_CRAWLER_TABLE_NAME:
+        raise RuntimeError("缺少 LINK_CRAWLER_TABLE_NAME，无法读取爬取品类")
+    crawler_table = dynamodb.Table(LINK_CRAWLER_TABLE_NAME)
+    categories = []
+    seen_ids = set()
+    scan_kwargs = {
+        "FilterExpression": (
+            "attribute_exists(category_id) AND category_id <> :empty "
+            "AND is_terminal = :true AND child_count = :zero"
+        ),
+        "ExpressionAttributeValues": {":empty": "", ":true": True, ":zero": 0},
+        "ProjectionExpression": (
+            "category_id, category_name, anchor_text, #url, "
+            "is_terminal, child_count"
+        ),
+        "ExpressionAttributeNames": {"#url": "url"},
+    }
+    while len(categories) < limit:
+        response = crawler_table.scan(**scan_kwargs)
+        for item in response.get("Items", []):
+            category_id = normalize(item.get("category_id"))
+            category = normalize(item.get("category_name") or item.get("anchor_text"))
+            if category_id and category and category_id not in seen_ids:
+                seen_ids.add(category_id)
+                categories.append({"category": category, "category_id": category_id})
+                if len(categories) >= limit:
+                    break
+        last_key = response.get("LastEvaluatedKey")
+        if not last_key or len(categories) >= limit:
+            break
+        scan_kwargs["ExclusiveStartKey"] = last_key
+    return categories
 
 def process_discovery(event):
     global _total_tokens_used, _lambda_start_time, _tracker
@@ -1185,27 +1221,33 @@ def process_discovery(event):
             target_categories = event.get("target_categories", None)
             
             if target_categories:
-                categories = target_categories
-                for category in categories:
-                    category = normalize(category)
-                    if category: upsert_category(category)
-                log("INFO", "使用指定品类", categories=categories)
-            else:
-                _tracker.start_phase("discover_categories")
-                task = {"task_type": "DISCOVER_CATEGORIES", "max_items": MAX_CATEGORIES}
-                items = call_api(task)
-                
+                crawled_leaves = get_crawled_categories(MAX_CATEGORIES)
+                leaves_by_id = {item["category_id"]: item for item in crawled_leaves}
+                leaves_by_name = {item["category"]: item for item in crawled_leaves}
                 categories = []
-                for item in items:
-                    if isinstance(item, dict) and "category" in item:
-                        category = normalize(item["category"])
-                        if category: upsert_category(category); categories.append(category)
-                
-                _tracker.end_phase()
-                log("INFO", "品类发现完成", count=len(categories))
+                for item in target_categories:
+                    if isinstance(item, dict):
+                        category = normalize(item.get("category"))
+                        category_id = normalize(item.get("category_id"))
+                    else:
+                        category, category_id = normalize(item), ""
+                    leaf = leaves_by_id.get(category_id) or leaves_by_name.get(category)
+                    if leaf:
+                        upsert_category(leaf["category"], leaf["category_id"])
+                        categories.append(leaf)
+                    else:
+                        log("WARNING", "跳过非叶子目录", category=category, category_id=category_id)
+                log("INFO", "使用指定的叶子品类", categories=categories)
+            else:
+                categories = get_crawled_categories(MAX_CATEGORIES)
+                for item in categories:
+                    upsert_category(item["category"], item["category_id"])
+                log("INFO", "已加载爬取品类", count=len(categories))
             
             category_count = 0
-            for category in categories[:CATEGORY_LIMIT]:
+            for category_item in categories[:CATEGORY_LIMIT]:
+                category = category_item["category"]
+                category_id = category_item["category_id"]
                 if _total_tokens_used >= MAX_TOTAL_TOKENS or get_remaining_seconds() < 60:
                     log("WARN", "停止: Token或时间不足")
                     break
@@ -1213,19 +1255,19 @@ def process_discovery(event):
                 _tracker.start_phase(f"discover_brands_{category}")
                 time.sleep(API_CALL_DELAY)
                 
-                brand_task = {"task_type": "DISCOVER_BRANDS", "category": category, "max_items": MAX_BRANDS}
+                brand_task = {"task_type": "DISCOVER_BRANDS", "category": category, "category_id": category_id, "max_items": MAX_BRANDS}
                 brand_items = call_api(brand_task)
                 
                 brands = []
                 for item in brand_items:
                     if isinstance(item, dict) and "brand" in item:
                         brand = normalize(item["brand"])
-                        if brand and category: upsert_brand(category, brand); brands.append((category, brand))
+                        if brand and category: upsert_brand(category, brand, category_id); brands.append((category, category_id, brand))
                 
                 _tracker.end_phase()
                 
                 brand_count = 0
-                for cat, brand in brands[:BRAND_LIMIT]:
+                for cat, cat_id, brand in brands[:BRAND_LIMIT]:
                     if _total_tokens_used >= MAX_TOTAL_TOKENS or get_remaining_seconds() < 60: break
                     
                     _tracker.start_phase(f"discover_models_{brand}")
@@ -1233,7 +1275,7 @@ def process_discovery(event):
                     
                     latest_date = get_latest_model_date(brand)
                     model_task = {
-                        "task_type": "DISCOVER_MODELS", "category": cat, "brand": brand,
+                        "task_type": "DISCOVER_MODELS", "category": cat, "category_id": cat_id, "brand": brand,
                         "max_items": MAX_MODELS, "search_date": latest_date,
                         "min_official_price_jpy": MIN_OFFICIAL_PRICE_JPY
                     }
@@ -1243,7 +1285,7 @@ def process_discovery(event):
                         if isinstance(item, dict) and "model" in item:
                             upsert_product(cat, brand, item.get("model"),
                                            item.get("confidence"), item.get("release_date"),
-                                           item.get("official_price_jpy"))
+                                           item.get("official_price_jpy"), cat_id)
                     
                     _tracker.end_phase()
                     brand_count += 1
@@ -1265,13 +1307,14 @@ def process_discovery(event):
         
         elif task_type == "DISCOVER_MODELS":
             category = event.get("category", "")
+            category_id = event.get("category_id", "")
             brand = event.get("brand", "")
             if not category or not brand:
                 return {"statusCode": 400, "body": json.dumps({"error": "需要提供 category 和 brand 参数"}, ensure_ascii=False)}
             
             _tracker.start_phase(f"discover_models_{brand}")
             latest_date = get_latest_model_date(brand)
-            task = {"task_type": "DISCOVER_MODELS", "category": category, "brand": brand,
+            task = {"task_type": "DISCOVER_MODELS", "category": category, "category_id": category_id, "brand": brand,
                     "max_items": MAX_MODELS, "search_date": latest_date,
                     "min_official_price_jpy": MIN_OFFICIAL_PRICE_JPY}
             items = call_api(task)
@@ -1280,7 +1323,7 @@ def process_discovery(event):
                 if isinstance(item, dict) and "model" in item:
                     upsert_product(category, brand, item.get("model"),
                                    item.get("confidence"), item.get("release_date"),
-                                   item.get("official_price_jpy"))
+                                   item.get("official_price_jpy"), category_id)
             
             _tracker.end_phase()
             summary = _tracker.get_summary()

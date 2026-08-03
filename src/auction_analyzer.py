@@ -797,7 +797,8 @@ condition: NEW/USED/BROKEN/UNKNOWN
 18. 入力の currentPrice、marketPrice、estimatedProfit、profitMargin、pricingConfidence は shortSummary と buyReason の参考情報です。最終 BUY/AVOID 判定はシステム側で行うため、購入推奨を断定しすぎないでください
 19. shortSummary は100字以内で、sourceModelとの一致、商品状態、付属品、価格面の概要を簡潔に含めてください
 20. riskSummary は説明文から読み取れる注意点だけを書き、推測しないでください
-21. conditionRisk は LOW/MEDIUM/HIGH のいずれかです。LOW=明確な不具合なし・動作確認済み、MEDIUM=傷・使用感・限定的確認・返品不可、HIGH=故障・動作未確認・ジャンク・部品取り・重要機能不良"""
+21. conditionRisk は LOW/MEDIUM/HIGH のいずれかです。LOW=明確な不具合なし・動作確認済み、MEDIUM=傷・使用感・限定的確認・返品不可、HIGH=故障・動作未確認・ジャンク・部品取り・重要機能不良
+22. closedReferences は同一モデルとして採用された終了オークションの title と落札 price です。商品同一性、付属品差、状態差、現在価格の妥当性を判断する参考にしてください。ただし、Active商品の title/description と矛盾する仕様を転記しないでください"""
 
 
 def build_active_parse_prompt(items: List[Dict]) -> str:
@@ -843,11 +844,14 @@ def build_closed_parse_prompt(items: List[Dict]) -> str:
 
 
 def build_description_parse_prompt(items: List[Dict]) -> str:
-    """仅对有利润且缺少关键参数的 active 商品发送 title 和 description。"""
+    """发送 Active 详情，并附带定价采用的 Closed 成交标题和价格。"""
     source_model = (items[0].get("sourceModel", {}) or {}) if items else {}
     items_data = []
     for item in items:
         pricing_result = item.get("pricingResult") or {}
+        reference_samples = item.get("closedReferenceSamples")
+        if reference_samples is None:
+            reference_samples = build_closed_reference_samples(pricing_result, limit=10)
         items_data.append({
             "itemId": str(item.get("itemID", "")),
             "title": item.get("title", ""),
@@ -858,6 +862,14 @@ def build_description_parse_prompt(items: List[Dict]) -> str:
             "estimatedProfit": si(pricing_result.get("netProfitAtCurrentBid", 0)),
             "profitMargin": str(pricing_result.get("profitMarginAtCurrentBid", "")),
             "pricingConfidence": str(pricing_result.get("pricingConfidence", "")),
+            "closedReferences": [
+                {
+                    "title": str(sample.get("title", ""))[:160],
+                    "price": si(sample.get("price", 0)),
+                }
+                for sample in reference_samples
+                if sample.get("title") and si(sample.get("price", 0)) > 0
+            ],
         })
     payload = {
         "sourceModel": {
@@ -1964,6 +1976,7 @@ def scrape_closed(kw: str, cnt: int, force: bool = False, source_model: Optional
             kw, "closed", False, scrape_details=False,
             brand=(source_model or {}).get("brand", ""),
             model=(source_model or {}).get("model", ""),
+            category_id=(source_model or {}).get("category_id", ""),
             aliases=(source_model or {}).get("aliases") or (source_model or {}).get("alias") or [],
         )[:cnt]
         new_count = 0
@@ -2016,6 +2029,7 @@ def scrape_active(kw: str, cnt: int, max_p: int = 0, force: bool = False,
             scrape_details=False,
             brand=(source_model or {}).get("brand", ""),
             model=(source_model or {}).get("model", ""),
+            category_id=(source_model or {}).get("category_id", ""),
             aliases=(source_model or {}).get("aliases") or (source_model or {}).get("alias") or [],
         )
         if max_p > 0:
@@ -2432,6 +2446,10 @@ def execute_workflow(kw: str, ac: int, cc: int, force: bool, source_model: Optio
                     if detail_item and str(detail_item.get("detailDescription", "")).strip():
                         detail_scraped += 1
                 if detail_item and str(detail_item.get("detailDescription", "")).strip():
+                    pricing_result = detail_item.get("pricingResult") or {}
+                    detail_item["closedReferenceSamples"] = build_closed_reference_samples(
+                        pricing_result, limit=10
+                    )
                     recheck_items.append(detail_item)
                 if index < len(description_recheck_ids) - 1:
                     time.sleep(_env("DETAIL_REQUEST_INTERVAL", 0.3, float))
@@ -2525,6 +2543,10 @@ def lambda_handler(event, context):
             "model": norm(event.get("model", "")),
             "aliases": [norm(alias) for alias in aliases if norm(alias)],
         }
+        if norm(event.get("category", "")):
+            source_model["category"] = norm(event.get("category", ""))
+        if norm(event.get("category_id", "")):
+            source_model["category_id"] = norm(event.get("category_id", ""))
         if not source_model["brand"] or not source_model["model"]:
             # 兼容直接调用：keyword 通常就是 "brand model"，但无法可靠拆分时
             # 仍保留空 sourceModel，由 Closed AI 返回空 models。

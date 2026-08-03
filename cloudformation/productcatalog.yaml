@@ -681,6 +681,11 @@ Resources:
                 Resource:
                   - !GetAtt ProductCatalogTable.Arn
                   - !Sub "${ProductCatalogTable.Arn}/index/*"
+              - Sid: ReadYahooAuctionCategories
+                Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/YahooAuctionLinks-${Environment}"
               - Sid: WriteTokenUsage
                 Effect: Allow
                 Action: dynamodb:PutItem
@@ -918,7 +923,7 @@ Resources:
       - LambdaExecutionRole
     Properties:
       FunctionName: !Sub "ProductCatalog-Discovery-${Environment}"
-      Description: 通过 AI 发现电子产品品类、品牌和型号
+      Description: 使用 Yahoo 爬取品类，并通过 AI 发现品牌和型号
       Runtime: python3.12
       Architectures:
         - arm64
@@ -932,6 +937,7 @@ Resources:
       Environment:
         Variables:
           TABLE_NAME: !Ref ProductCatalogTable
+          LINK_CRAWLER_TABLE_NAME: !Sub "YahooAuctionLinks-${Environment}"
           TOKEN_USAGE_TABLE: !Ref AiTokenUsageTable
           ENVIRONMENT: !Ref Environment
           AI_MODE: !Ref AiMode

@@ -231,6 +231,25 @@ class LeanAiWorkflowTest(unittest.TestCase):
         self.assertIn("本体は含まれません", prompt)
         self.assertIn("listingType は BOX_ONLY または ACCESSORY", prompt)
 
+    def test_detail_prompt_includes_closed_reference_titles_and_prices(self):
+        prompt = build_description_parse_prompt([{
+            "itemID": "active-1",
+            "title": "iPhone 15 Pro 本体",
+            "detailDescription": "動作確認済みです。",
+            "sourceModel": {"brand": "Apple", "model": "iPhone 15 Pro"},
+            "pricingResult": {"estimatedMarketPrice": 120000},
+            "closedReferenceSamples": [
+                {"title": "iPhone 15 Pro 256GB 落札品", "price": 118000},
+                {"title": "価格なし", "price": 0},
+            ],
+        }])
+
+        self.assertIn(
+            '"closedReferences":[{"title":"iPhone 15 Pro 256GB 落札品","price":118000}]',
+            prompt,
+        )
+        self.assertNotIn("価格なし", prompt)
+
     @patch("auction_analyzer.update_record")
     def test_detail_source_model_mismatch_is_excluded(self, update_record):
         status = save_model(Mock(), "a1", {

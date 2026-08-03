@@ -126,7 +126,7 @@ def scan_unanalyzed_products(today: str, max_models: int = MAX_MODELS_PER_RUN) -
                 ":status": "ACTIVE"
             },
             "ProjectionExpression": (
-                "PK, category, brand, model, "
+                "PK, category, category_id, brand, model, "
                 "last_scanned_date, last_analysis_status, modified_at"
             ),
             "Limit": 100
@@ -174,6 +174,7 @@ def scan_unanalyzed_products(today: str, max_models: int = MAX_MODELS_PER_RUN) -
             
             unscanned_products.append({
                 "category": category,
+                "category_id": str(item.get("category_id", "")),
                 "brand": brand,
                 "model": model,
                 "product_pk": product_pk,
@@ -268,6 +269,7 @@ def dispatch_to_analyzer(
     brand: str,
     model: str,
     product_pk: str,
+    category_id: str = "",
     max_active: int = 20,
     max_closed: int = 50
 ) -> bool:
@@ -280,6 +282,7 @@ def dispatch_to_analyzer(
     payload = {
         "keyword": keyword,
         "category": category,
+        "category_id": category_id,
         "brand": brand,
         "model": model,
         "product_pk": product_pk,  # 传给 Analyzer，让它自己更新状态
@@ -368,6 +371,7 @@ def scan_and_dispatch(event: Dict) -> Dict:
 
     for index, product in enumerate(products):
         category = product["category"]
+        category_id = product.get("category_id", "")
         brand = product["brand"]
         model = product["model"]
         product_pk = product["product_pk"]
@@ -407,6 +411,7 @@ def scan_and_dispatch(event: Dict) -> Dict:
             brand=brand,
             model=model,
             product_pk=product_pk,
+            category_id=category_id,
             max_active=max_active,
             max_closed=max_closed
         )
