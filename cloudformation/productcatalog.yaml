@@ -440,7 +440,7 @@ Resources:
         - Key: Environment
           Value: !Ref Environment
 
-  YahooAuctionLinksTable:
+    YahooAuctionLinksTable:
     Type: AWS::DynamoDB::Table
     Condition: DeployLinkCrawlerCondition
     Properties:
@@ -453,6 +453,10 @@ Resources:
           AttributeType: S
         - AttributeName: crawled_at
           AttributeType: S
+        - AttributeName: link_type           # 新增
+          AttributeType: S                   # 新增
+        - AttributeName: first_seen_at       # 新增
+          AttributeType: S                   # 新增
       KeySchema:
         - AttributeName: crawl_id
           KeyType: HASH
@@ -465,6 +469,18 @@ Resources:
               KeyType: RANGE
           Projection:
             ProjectionType: ALL
+        - IndexName: link_type-first_seen_at-index    # 新增 GSI
+          KeySchema:                                  # 新增
+            - AttributeName: link_type                # 新增
+              KeyType: HASH                           # 新增
+            - AttributeName: first_seen_at            # 新增
+              KeyType: RANGE                          # 新增
+          Projection:                                 # 新增
+            ProjectionType: INCLUDE                   # 新增
+            NonKeyAttributes:                         # 新增
+              - url                                   # 新增
+              - is_crawled                            # 新增
+              - crawl_status                          # 新增
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
       SSESpecification:
