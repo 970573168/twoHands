@@ -223,6 +223,62 @@ jobs:
             --template-body file://cloudformation/productcatalog.yaml
           echo "✅ 模板验证通过"
 
+      - name: 从 Secrets Manager 获取提醒邮箱
+        if: steps.check.outputs.deploy_all == 'true'
+        id: reminder-email
+        shell: bash
+        run: |
+          set -euo pipefail
+          REMINDER_EMAIL="$(python - <<'PY'
+          import json
+          import re
+          import subprocess
+
+          email_pattern = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+          def aws(*args):
+              result = subprocess.run(
+                  ["aws", *args], text=True, capture_output=True, check=False
+              )
+              return result.stdout.strip() if result.returncode == 0 else ""
+
+          names_text = aws(
+              "secretsmanager", "list-secrets",
+              "--query", "SecretList[].Name", "--output", "text",
+          )
+          matches = set()
+          for name in names_text.split():
+              secret = aws(
+                  "secretsmanager", "get-secret-value", "--secret-id", name,
+                  "--query", "SecretString", "--output", "text",
+              )
+              if not secret:
+                  continue
+              try:
+                  parsed = json.loads(secret)
+              except json.JSONDecodeError:
+                  parsed = secret
+              values = (
+                  [value for key, value in parsed.items() if "email" in key.lower()]
+                  if isinstance(parsed, dict) else [parsed]
+              )
+              for value in values:
+                  candidate = str(value).strip()
+                  if email_pattern.fullmatch(candidate):
+                      matches.add(candidate)
+
+          if len(matches) != 1:
+              raise SystemExit(
+                  "Secrets Manager 中必须且只能有一个可访问的邮箱地址；"
+                  f"当前找到 {len(matches)} 个"
+              )
+          print(matches.pop())
+          PY
+          )"
+          echo "::add-mask::$REMINDER_EMAIL"
+          echo "email=$REMINDER_EMAIL" >> "$GITHUB_OUTPUT"
+          echo "✅ 已从 Secrets Manager 获取提醒邮箱（内容已隐藏）"
+
       - name: 完整部署 CloudFormation 堆栈
         if: steps.check.outputs.deploy_all == 'true'
         id: deploy
@@ -240,6 +296,7 @@ jobs:
               "Environment=${{ env.environment }}" \
               "LambdaCodeS3Bucket=${{ env.s3_bucket }}" \
               "LambdaCodeS3Key=${{ env.s3_key }}" \
+              "BuyCandidateReminderEmail=${{ steps.reminder-email.outputs.email }}" \
             --capabilities CAPABILITY_NAMED_IAM \
             --no-fail-on-empty-changeset \
             2>&1 | tee deploy.log

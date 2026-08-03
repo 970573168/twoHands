@@ -261,6 +261,9 @@ Parameters:
   FinalCheckBatchSize:
     Type: Number
     Default: 20
+  BuyCandidateReminderEmail:
+    Type: String
+    Description: 接收 BUY_CANDIDATE 提醒的邮箱地址；部署后必须在该邮箱中确认 AWS SNS 订阅
   BuyMarginThreshold:
     Type: Number
     Default: 0.20
@@ -627,6 +630,14 @@ Resources:
       TopicName: !Sub "YahooAuctionBuyCandidateReminder-${Environment}"
       DisplayName: Yahoo Auction BUY 候选提醒
 
+  YahooAuctionBuyCandidateEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: DeployScraperCondition
+    Properties:
+      TopicArn: !Ref YahooAuctionBuyCandidateReminderTopic
+      Protocol: email
+      Endpoint: !Ref BuyCandidateReminderEmail
+
   # ============================================
   # Log Groups
   # ============================================
@@ -888,6 +899,12 @@ Resources:
                 Effect: Allow
                 Action: dynamodb:PutItem
                 Resource: !GetAtt AiTokenUsageTable.Arn
+              - Sid: PublishCountdownCandidateEmail
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                  - sns:ListSubscriptionsByTopic
+                Resource: !Ref YahooAuctionBuyCandidateReminderTopic
               - Sid: WriteLogs
                 Effect: Allow
                 Action:
@@ -1204,6 +1221,7 @@ Resources:
           TABLE_NAME_CLOSED: !Sub "YahooAuctionItems-${Environment}"
           TABLE_NAME: !Ref ProductCatalogTable
           BUY_CANDIDATE_TABLE: !Ref YahooAuctionBuyCandidateTable
+          SNS_TOPIC_ARN: !Ref YahooAuctionBuyCandidateReminderTopic
           FINAL_CHECK_BEFORE_MINUTES: !Ref FinalCheckBeforeMinutes
           ENVIRONMENT: !Ref Environment
           TOKEN_USAGE_TABLE: !Ref AiTokenUsageTable
