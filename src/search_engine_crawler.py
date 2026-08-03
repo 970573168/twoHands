@@ -17,6 +17,7 @@ Yahoo! 拍卖 /list3/* 目录链接增量采集 Lambda。
 import hashlib
 import logging
 import os
+import re
 import time
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlsplit, urlunsplit
@@ -36,6 +37,7 @@ logger.setLevel(logging.INFO)
 ALLOWED_HOST = "auctions.yahoo.co.jp"
 ALLOWED_LIST3_PREFIX = "/list3/"
 DEFAULT_START_URL = "https://auctions.yahoo.co.jp/"
+CATEGORY_ID_PATTERN = re.compile(r"/(\d+)-category(?:\.html)?/?$")
 
 # 禁止爬取的路径（robots.txt 规则）
 DISALLOW = (
@@ -128,6 +130,14 @@ def is_list3_page(url: str) -> bool:
     return path.startswith(ALLOWED_LIST3_PREFIX)
 
 
+def extract_category_id(url: str) -> str | None:
+    """从 Yahoo ``/list3/.../<数字>-category.html`` URL 提取品类 ID。"""
+    if not is_list3_page(url):
+        return None
+    match = CATEGORY_ID_PATTERN.search(urlsplit(url).path)
+    return match.group(1) if match else None
+
+
 def should_crawl(url: str) -> bool:
     """判断一个 URL 是否应该被递归爬取：仅允许 /list3/*。"""
     if not url:
@@ -173,6 +183,8 @@ def extract_links_from_page(html: str, source_url: str, depth: int) -> list[dict
         
         list3_links.append({
             "url": url,
+            "category_id": extract_category_id(url) or "",
+            "category_name": anchor_text[:500],
             "anchor_text": anchor_text[:500],
             "source_url": source_url,
             "depth": depth,
@@ -180,6 +192,25 @@ def extract_links_from_page(html: str, source_url: str, depth: int) -> list[dict
         })
     
     return list3_links
+
+
+def extract_links(html: str, source_url: str, limit: int | None = None) -> list[dict]:
+    """兼容通用链接提取；目录采集主流程仍只使用 ``extract_links_from_page``。"""
+    links, seen = [], set()
+    soup = BeautifulSoup(html or "", "html.parser")
+    for anchor in soup.select("a[href]"):
+        url = normalize_url(anchor.get("href"), source_url)
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        links.append({
+            "url": url,
+            "anchor_text": " ".join(anchor.get_text(" ", strip=True).split())[:500],
+            "source_url": source_url,
+        })
+        if limit is not None and len(links) >= limit:
+            break
+    return links
 
 
 # ============================================================
@@ -296,6 +327,8 @@ def save_discovered_link(table, link: dict) -> None:
             UpdateExpression="""
                 SET
                     #url = :url,
+                    category_id = :category_id,
+                    category_name = :category_name,
                     anchor_text = if_not_exists(anchor_text, :anchor_text),
                     source_url = if_not_exists(source_url, :source_url),
                     #depth = if_not_exists(#depth, :depth),
@@ -315,6 +348,8 @@ def save_discovered_link(table, link: dict) -> None:
             },
             ExpressionAttributeValues={
                 ":url": url,
+                ":category_id": link.get("category_id") or extract_category_id(url) or "",
+                ":category_name": link.get("category_name") or link.get("anchor_text", ""),
                 ":anchor_text": link.get("anchor_text", ""),
                 ":source_url": link.get("source_url", ""),
                 ":depth": link.get("depth", 0),

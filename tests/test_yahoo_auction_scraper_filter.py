@@ -1,6 +1,7 @@
 import os
 import sys
 import unittest
+from urllib.parse import parse_qs, urlsplit
 
 
 os.environ.setdefault("AWS_DEFAULT_REGION", "ap-northeast-1")
@@ -13,6 +14,7 @@ from yahoo_auction_scraper import (
     _search_context_kwargs,
     LocalListingType,
     build_contextual_exclude_keywords,
+    build_url,
     classify_listing_type_by_title,
     detect_target_context,
     get_filter_keywords,
@@ -25,6 +27,12 @@ from yahoo_auction_scraper import (
 
 
 class LocalTitleFilterTest(unittest.TestCase):
+    def test_search_url_includes_crawled_category_id(self):
+        url = build_url("iphone", 1, "active", category_id="2084317598")
+        params = parse_qs(urlsplit(url).query)
+        self.assertEqual(params["auccat"], ["2084317598"])
+        self.assertEqual(params["p"], ["iphone"])
+
     def test_clear_main_products_remain_main_products(self):
         titles = (
             "Panasonic LUMIX H-X025 LEICA DG SUMMILUX 25mm F1.4 ASPH レンズ",
