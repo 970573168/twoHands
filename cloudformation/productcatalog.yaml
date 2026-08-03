@@ -3,7 +3,7 @@ AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   电子产品目录采集器 + AI API Secret + Yahoo Auction 抓取器 + 分析工作流 + 目录定期扫描器
   支持多 AI 模式切换（Gemini / 豆包 / OpenAI）
-  包含递归链接爬虫
+  包含递归链接爬虫（增量版）
   所有定时器默认关闭，需手动启用
 
 Parameters:
@@ -154,12 +154,12 @@ Parameters:
     Type: Number
     Default: 100
 
-  # ============ 链接搜索爬虫参数 (递归版) ============
+  # ============ 链接搜索爬虫参数 (增量递归版) ============
   DeployLinkCrawler:
     Type: String
     Default: "true"
     AllowedValues: ["true", "false"]
-    Description: 是否部署 Yahoo 拍卖链接采集器
+    Description: 是否部署 Yahoo 拍卖链接采集器（增量版）
 
   LinkCrawlerScheduleMinutes:
     Type: Number
@@ -722,41 +722,42 @@ Resources:
                   - !Sub "${YahooAuctionScraperLogGroup.Arn}:*"
                   - !Sub "${YahooAuctionAnalyzerLogGroup.Arn}:*"
 
-    YahooAuctionLinkCrawlerRole:
-      Type: AWS::IAM::Role
-      Condition: DeployLinkCrawlerCondition
-      Properties:
-        RoleName: !Sub "YahooAuctionLinkCrawler-Role-${Environment}"
-        AssumeRolePolicyDocument:
-          Version: "2012-10-17"
-          Statement:
-            - Effect: Allow
-              Principal:
-                Service: lambda.amazonaws.com
-              Action: sts:AssumeRole
-        Policies:
-          - PolicyName: YahooAuctionLinkCrawlerPolicy
-            PolicyDocument:
-              Version: "2012-10-17"
-              Statement:
-                - Sid: DynamoDBAccess
-                  Effect: Allow
-                  Action:
-                    - dynamodb:PutItem
-                    - dynamodb:BatchWriteItem
-                    - dynamodb:GetItem
-                    - dynamodb:UpdateItem
-                    - dynamodb:Query
-                    - dynamodb:Scan
-                  Resource:
-                    - !GetAtt YahooAuctionLinksTable.Arn
-                    - !Sub "${YahooAuctionLinksTable.Arn}/index/*"
-                - Sid: WriteLogs
-                  Effect: Allow
-                  Action:
-                    - logs:CreateLogStream
-                    - logs:PutLogEvents
-                  Resource: !Sub "${YahooAuctionLinkCrawlerLogGroup.Arn}:*"
+  YahooAuctionLinkCrawlerRole:
+    Type: AWS::IAM::Role
+    Condition: DeployLinkCrawlerCondition
+    Properties:
+      RoleName: !Sub "YahooAuctionLinkCrawler-Role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: YahooAuctionLinkCrawlerPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: DynamoDBAccess
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt YahooAuctionLinksTable.Arn
+                  - !Sub "${YahooAuctionLinksTable.Arn}/index/*"
+              - Sid: WriteLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${YahooAuctionLinkCrawlerLogGroup.Arn}:*"
+
   YahooAuctionFinalCheckRole:
     Type: AWS::IAM::Role
     Condition: DeployScraperCondition
@@ -1009,7 +1010,7 @@ Resources:
           Value: !Ref Environment
 
   # ============================================================
-  # YahooAuctionLinkCrawler - 递归链接采集器
+  # YahooAuctionLinkCrawler - 增量递归链接采集器
   # ============================================================
 
   YahooAuctionLinkCrawler:
@@ -1020,7 +1021,7 @@ Resources:
       - YahooAuctionLinkCrawlerRole
     Properties:
       FunctionName: !Sub "YahooAuctionLinkCrawler-${Environment}"
-      Description: Yahoo 拍卖递归链接采集器 (广度优先爬取所有列表页)
+      Description: Yahoo 拍卖递归链接采集器 (增量版，广度优先爬取所有列表页)
       Runtime: python3.12
       Architectures:
         - arm64
@@ -1294,7 +1295,7 @@ Outputs:
 
   YahooAuctionLinkCrawlerFunctionName:
     Condition: DeployLinkCrawlerCondition
-    Description: Yahoo 拍卖递归链接采集 Lambda
+    Description: Yahoo 拍卖增量递归链接采集 Lambda
     Value: !Ref YahooAuctionLinkCrawler
 
   AiTokenUsageTableName:
