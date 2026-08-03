@@ -64,6 +64,7 @@ MAX_PAGES = int(os.getenv("LINK_CRAWLER_MAX_PAGES", "100"))
 MAX_DEPTH = int(os.getenv("LINK_CRAWLER_MAX_DEPTH", "5"))
 REQUEST_INTERVAL = float(os.getenv("LINK_CRAWLER_REQUEST_INTERVAL", "0.5"))
 MAX_LINKS_PER_RUN = int(os.getenv("LINK_CRAWLER_MAX_LINKS_PER_RUN", "5000"))
+GSI_QUERY_PAGE_SIZE = int(os.getenv("LINK_CRAWLER_GSI_PAGE_SIZE", "100"))
 
 
 # ============================================================
@@ -256,25 +257,32 @@ def get_next_unvisited_url(table) -> str | None:
     使用 GSI: link_type-first_seen_at-index
     """
     try:
-        # 查询未爬取的 /list3/* 链接，按入库时间升序
-        response = table.query(
-            IndexName="link_type-first_seen_at-index",
-            KeyConditionExpression="link_type = :link_type",
-            FilterExpression="is_crawled = :false_val OR crawl_status = :status",
-            ExpressionAttributeValues={
-                ":link_type": "list3_directory",
-                ":false_val": False,
-                ":status": "DISCOVERED",
-            },
-            ScanIndexForward=True,  # 升序，最旧的在前
-            Limit=1,
-        )
-        
-        items = response.get("Items", [])
-        if items:
-            return items[0].get("url")
-        
-        return None
+        exclusive_start_key = None
+        while True:
+            query_kwargs = {
+                "IndexName": "link_type-first_seen_at-index",
+                "KeyConditionExpression": "link_type = :link_type",
+                "FilterExpression": "is_crawled = :false_val OR crawl_status = :status",
+                "ExpressionAttributeValues": {
+                    ":link_type": "list3_directory",
+                    ":false_val": False,
+                    ":status": "DISCOVERED",
+                },
+                "ScanIndexForward": True,  # 升序，最旧的在前
+                # Limit 在 FilterExpression 之前生效，因此按批读取并继续翻页。
+                "Limit": GSI_QUERY_PAGE_SIZE,
+            }
+            if exclusive_start_key:
+                query_kwargs["ExclusiveStartKey"] = exclusive_start_key
+
+            response = table.query(**query_kwargs)
+            items = response.get("Items", [])
+            if items:
+                return items[0].get("url")
+
+            exclusive_start_key = response.get("LastEvaluatedKey")
+            if not exclusive_start_key:
+                return None
         
     except Exception as e:
         logger.warning(f"查询 GSI 失败，可能索引不存在: {e}")
@@ -309,7 +317,7 @@ def is_table_empty(table) -> bool:
             return True
 
 
-def save_discovered_link(table, link: dict) -> None:
+def save_discovered_link(table, link: dict) -> dict:
     """
     保存发现的 /list3/* 目录链接。
 
@@ -323,7 +331,7 @@ def save_discovered_link(table, link: dict) -> None:
     crawl_id = make_crawl_id(url)
 
     try:
-        table.update_item(
+        response = table.update_item(
             Key={"crawl_id": crawl_id},
             UpdateExpression="""
                 SET
@@ -360,9 +368,43 @@ def save_discovered_link(table, link: dict) -> None:
                 ":now": now,
                 ":one": 1,
             },
+            ReturnValues="ALL_OLD",
         )
+        previous_record = response.get("Attributes")
+        return {
+            "is_new": not bool(previous_record),
+            "previous_record": previous_record,
+        }
     except Exception as e:
         logger.error(f"保存链接失败 {url}: {e}")
+        return {"is_new": False, "previous_record": None, "save_failed": True}
+
+
+def count_remaining_unvisited(table) -> int:
+    """分页统计 GSI 中全部尚未爬取的目录。"""
+    remaining = 0
+    exclusive_start_key = None
+
+    while True:
+        query_kwargs = {
+            "IndexName": "link_type-first_seen_at-index",
+            "KeyConditionExpression": "link_type = :link_type",
+            "FilterExpression": "is_crawled = :false_val OR crawl_status = :status",
+            "ExpressionAttributeValues": {
+                ":link_type": "list3_directory",
+                ":false_val": False,
+                ":status": "DISCOVERED",
+            },
+            "Select": "COUNT",
+        }
+        if exclusive_start_key:
+            query_kwargs["ExclusiveStartKey"] = exclusive_start_key
+
+        response = table.query(**query_kwargs)
+        remaining += response.get("Count", 0)
+        exclusive_start_key = response.get("LastEvaluatedKey")
+        if not exclusive_start_key:
+            return remaining
 
 
 def mark_link_crawled(
@@ -453,6 +495,8 @@ def crawl_recursive(start_url: str, table, is_cold_start: bool = False) -> dict:
     pages_crawled = 0
     skipped_crawled_count = 0
     terminal_count = 0
+    newly_discovered = 0
+    existing_updated = 0
 
     session = requests.Session()
     session.headers.update({
@@ -485,8 +529,11 @@ def crawl_recursive(start_url: str, table, is_cold_start: bool = False) -> dict:
 
         # 如果是 /list3/*，并且之前已经递归检索过且已穷尽，跳过
         # 已爬过但未穷尽的目录会重新爬取以发现新子目录
-        if is_list3_page(current_url) and is_url_already_crawled(table, current_url):
+        if is_list3_page(current_url):
             record = get_link_record(table, current_url)
+        else:
+            record = None
+        if record and record.get("is_crawled"):
             if record and (record.get("is_exhausted") or record.get("is_terminal")):
                 skipped_crawled_count += 1
                 logger.info(f"跳过已检索且已穷尽目录: {current_url}")
@@ -512,12 +559,16 @@ def crawl_recursive(start_url: str, table, is_cold_start: bool = False) -> dict:
             )
 
             child_urls = set()
-            newly_saved_count = 0
+            page_newly_discovered = 0
+            page_existing_updated = 0
             newly_queued_count = 0
             already_crawled_child_count = 0
+            all_children_exhausted = True
+            link_limit_reached = False
 
             for directory in new_directories:
                 if len(all_directories) >= MAX_LINKS_PER_RUN:
+                    link_limit_reached = True
                     break
 
                 directory_url = directory["url"]
@@ -529,12 +580,27 @@ def crawl_recursive(start_url: str, table, is_cold_start: bool = False) -> dict:
                 child_urls.add(directory_url)
 
                 # 先保存发现状态，状态为 DISCOVERED
-                save_discovered_link(table, directory)
+                save_result = save_discovered_link(table, directory)
+                if save_result.get("save_failed"):
+                    all_children_exhausted = False
+                    continue
                 all_directories.append(directory)
-                newly_saved_count += 1
+                child_record = save_result.get("previous_record")
+                if save_result["is_new"]:
+                    newly_discovered += 1
+                    page_newly_discovered += 1
+                else:
+                    existing_updated += 1
+                    page_existing_updated += 1
 
-                # 检查子目录是否已爬过
-                already_crawled = is_url_already_crawled(table, directory_url)
+                # 复用 UpdateItem 返回的旧记录，避免再次 GetItem。
+                already_crawled = bool(child_record and child_record.get("is_crawled"))
+                child_exhausted = bool(
+                    child_record
+                    and (child_record.get("is_exhausted") or child_record.get("is_terminal"))
+                )
+                if not child_exhausted:
+                    all_children_exhausted = False
 
                 if already_crawled:
                     already_crawled_child_count += 1
@@ -551,8 +617,7 @@ def crawl_recursive(start_url: str, table, is_cold_start: bool = False) -> dict:
                 ):
                     if already_crawled:
                         # 已爬过的目录：检查是否已穷尽
-                        record = get_link_record(table, directory_url)
-                        if record and (record.get("is_exhausted") or record.get("is_terminal")):
+                        if child_exhausted:
                             logger.debug(f"  跳过已穷尽子目录: {directory_url}")
                             continue
                         else:
@@ -565,10 +630,11 @@ def crawl_recursive(start_url: str, table, is_cold_start: bool = False) -> dict:
             child_count = len(child_urls)
 
             # 真正到底部：页面里没有任何其他 /list3/* 子目录
-            is_terminal = child_count == 0
+            is_terminal = child_count == 0 and not link_limit_reached
 
-            # 本轮已经没有新的可递归目录
-            is_exhausted = newly_queued_count == 0
+            # 父目录只有在没有被截断，且所有直接子目录均已到底/穷尽时才算穷尽。
+            # “本次没有新入队”并不代表已存在但尚未爬取的子目录已经处理完。
+            is_exhausted = not link_limit_reached and (is_terminal or all_children_exhausted)
 
             if is_terminal:
                 terminal_count += 1
@@ -587,7 +653,8 @@ def crawl_recursive(start_url: str, table, is_cold_start: bool = False) -> dict:
             logger.info(
                 f"  发现 /list3/*: {len(new_directories)} 个, "
                 f"子目录: {child_count} 个, "
-                f"新增保存: {newly_saved_count} 个, "
+                f"真正新增: {page_newly_discovered} 个, "
+                f"已有更新: {page_existing_updated} 个, "
                 f"已检索子目录: {already_crawled_child_count} 个, "
                 f"新增递归队列: {newly_queued_count} 个, "
                 f"是否到底: {is_terminal}, "
@@ -632,6 +699,8 @@ def crawl_recursive(start_url: str, table, is_cold_start: bool = False) -> dict:
         "directories_found": len(all_directories),
         "skipped_crawled": skipped_crawled_count,
         "terminal_count": terminal_count,
+        "newly_discovered": newly_discovered,
+        "existing_updated": existing_updated,
         "errors": errors,
     }
 
@@ -711,31 +780,19 @@ def lambda_handler(event, context):
         if link["url"] not in unique_links:
             unique_links[link["url"]] = link
     
-    saved = len(unique_links)
-    
     # 统计剩余未爬取数量
     remaining = 0
     try:
-        response = table.query(
-            IndexName="link_type-first_seen_at-index",
-            KeyConditionExpression="link_type = :link_type",
-            FilterExpression="is_crawled = :false_val OR crawl_status = :status",
-            ExpressionAttributeValues={
-                ":link_type": "list3_directory",
-                ":false_val": False,
-                ":status": "DISCOVERED",
-            },
-            Select="COUNT",
-        )
-        remaining = response.get("Count", 0)
-    except Exception:
-        pass
+        remaining = count_remaining_unvisited(table)
+    except Exception as e:
+        logger.warning(f"统计剩余未爬取目录失败: {e}")
     
     logger.info(
         f"采集完成: 本次发现 /list3/* 目录 {len(links)} 个, "
         f"去重后 {len(unique_links)} 个, "
-        f"已写入或更新 DynamoDB {saved} 个, "
-        f"剩余未爬取约 {remaining} 个"
+        f"真正新增 {result['newly_discovered']} 个, "
+        f"已有更新 {result['existing_updated']} 个, "
+        f"剩余未爬取 {remaining} 个"
     )
     
     return {
@@ -744,8 +801,9 @@ def lambda_handler(event, context):
         "start_url": start_url,
         "is_cold_start": is_cold_start,
         "extracted": len(links),
-        "unique": len(unique_links),
-        "saved_or_updated": saved,
+        "unique_links_seen_this_run": len(unique_links),
+        "newly_discovered": result["newly_discovered"],
+        "existing_updated": result["existing_updated"],
         "remaining_unvisited": remaining,
         "metrics": {
             "pages_crawled": result["pages_crawled"],
