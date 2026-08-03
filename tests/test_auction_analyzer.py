@@ -434,6 +434,32 @@ class LeanAiWorkflowTest(unittest.TestCase):
         self.assertIn("NOT_SENT", values.values())
         self.assertIn(1100, values.values())
 
+    @patch("auction_analyzer.update_record")
+    @patch("auction_analyzer.send_countdown_candidate_email")
+    @patch("auction_analyzer.SNS_TOPIC_ARN", "arn:aws:sns:test:topic")
+    @patch("auction_analyzer.buy_candidate_db")
+    def test_countdown_candidate_sends_email_once_when_first_inserted(
+        self, candidate_db, send_email, update_record
+    ):
+        candidate_db.get_item.side_effect = [{}, {"Item": {"itemID": "item-1"}}]
+        item = {
+            "title": "Nikon lens", "url": "https://example.test/item",
+            "models": [{"brand": "Nikon", "model": "Z lens"}],
+            "price": 62000, "endTime": "2099-01-01T00:00:00+00:00",
+        }
+        pricing = {
+            "estimatedMarketPrice": 77000, "currentBidPrice": 62000,
+            "netProfitAtCurrentBid": 11000,
+        }
+
+        upsert_buy_candidate("item-1", item, pricing, countdown_mode=True)
+        upsert_buy_candidate("item-1", item, pricing, countdown_mode=True)
+
+        send_email.assert_called_once()
+        self.assertEqual(
+            update_record.call_args.args[2]["countdownNotificationStatus"], "SENT"
+        )
+
     @patch("auction_analyzer.buy_candidate_db")
     def test_buy_candidate_with_invalid_end_time_is_not_scheduled(self, candidate_db):
         candidate_db.get_item.return_value = {}
