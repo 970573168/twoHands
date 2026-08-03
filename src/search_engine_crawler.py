@@ -1,12 +1,15 @@
 """
 Yahoo! 拍卖 /list3/* 目录链接增量采集 Lambda。
 
-由 EventBridge 定时触发，从起始页开始广度优先递归爬取，
+由 EventBridge 定时触发，智能选择起始点：
+- 表为空时：从雅虎首页开始
+- 表不为空时：从最久未爬取的 /list3/* 链接开始
+
 只保存和递归进入 /list3/* 目录页面。
 
 增量特性：
-- 每个目录链接维护状态字段（is_crawled, is_terminal, crawl_status）
-- 下次运行时自动跳过已爬取的目录
+- 每个目录链接维护状态字段（is_crawled, crawl_status）
+- 优先爬取最久入库的未爬取链接
 - 精确标记已到底部的目录
 - 支持错误重试
 """
@@ -57,7 +60,6 @@ REQUEST_TIMEOUT = float(os.getenv("LINK_CRAWLER_TIMEOUT", "30"))
 MAX_PAGES = int(os.getenv("LINK_CRAWLER_MAX_PAGES", "100"))
 MAX_DEPTH = int(os.getenv("LINK_CRAWLER_MAX_DEPTH", "5"))
 REQUEST_INTERVAL = float(os.getenv("LINK_CRAWLER_REQUEST_INTERVAL", "0.5"))
-ENABLE_RECURSIVE = os.getenv("LINK_CRAWLER_ENABLE_RECURSIVE", "true").lower() == "true"
 MAX_LINKS_PER_RUN = int(os.getenv("LINK_CRAWLER_MAX_LINKS_PER_RUN", "5000"))
 
 
@@ -210,6 +212,71 @@ def is_url_already_crawled(table, url: str) -> bool:
     return bool(item.get("is_crawled"))
 
 
+def get_next_unvisited_url(table) -> str | None:
+    """
+    从 DynamoDB 中获取最久未爬取的 /list3/* 链接。
+    
+    查询条件：
+    - link_type = 'list3_directory'
+    - is_crawled = False 或 crawl_status = 'DISCOVERED'
+    - 按 first_seen_at 升序排列（最久远的优先）
+    
+    使用 GSI: link_type-first_seen_at-index
+    """
+    try:
+        # 查询未爬取的 /list3/* 链接，按入库时间升序
+        response = table.query(
+            IndexName="link_type-first_seen_at-index",
+            KeyConditionExpression="link_type = :link_type",
+            FilterExpression="is_crawled = :false_val OR crawl_status = :status",
+            ExpressionAttributeValues={
+                ":link_type": "list3_directory",
+                ":false_val": False,
+                ":status": "DISCOVERED",
+            },
+            ScanIndexForward=True,  # 升序，最旧的在前
+            Limit=1,
+        )
+        
+        items = response.get("Items", [])
+        if items:
+            return items[0].get("url")
+        
+        return None
+        
+    except Exception as e:
+        logger.warning(f"查询 GSI 失败，可能索引不存在: {e}")
+        return None
+
+
+def is_table_empty(table) -> bool:
+    """
+    检查表是否为空（没有任何 /list3/* 记录）。
+    """
+    try:
+        response = table.query(
+            IndexName="link_type-first_seen_at-index",
+            KeyConditionExpression="link_type = :link_type",
+            ExpressionAttributeValues={
+                ":link_type": "list3_directory",
+            },
+            Limit=1,
+        )
+        
+        items = response.get("Items", [])
+        return len(items) == 0
+        
+    except Exception as e:
+        logger.warning(f"检查表是否为空失败: {e}")
+        # 如果 GSI 不存在或查询失败，回退到扫描
+        try:
+            response = table.scan(Limit=1)
+            items = response.get("Items", [])
+            return len(items) == 0
+        except Exception:
+            return True
+
+
 def save_discovered_link(table, link: dict) -> None:
     """
     保存发现的 /list3/* 目录链接。
@@ -260,7 +327,8 @@ def save_discovered_link(table, link: dict) -> None:
         )
     except Exception as e:
         logger.error(f"保存链接失败 {url}: {e}")
-        # 不抛出异常，避免中断整个爬取流程
+
+
 def mark_link_crawled(
     table,
     url: str,
@@ -326,14 +394,13 @@ def mark_link_error(table, url: str, error_message: str) -> None:
 # 递归爬取核心（增量版）
 # ============================================================
 
-def crawl_recursive(start_url: str, table) -> dict:
+def crawl_recursive(start_url: str, table, is_cold_start: bool = False) -> dict:
     """
     广度优先递归爬取 /list3/* 目录页。
 
     增量特点：
-    - 起始页可以不是 /list3/*
-    - 只保存 /list3/* 目录链接
-    - 只递归进入 /list3/*
+    - 冷启动时从雅虎首页开始
+    - 热启动时从最久未爬取的 /list3/* 链接开始
     - 已经 is_crawled=True 的链接，下次不再递归
     - 没有发现子 /list3/* 的链接，标记为 is_terminal=True
     """
@@ -357,8 +424,9 @@ def crawl_recursive(start_url: str, table) -> dict:
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     })
 
+    start_type = "冷启动（从首页开始）" if is_cold_start else f"热启动（从 {start_url} 开始）"
     logger.info(
-        f"开始增量递归采集 /list3/* 目录，起始页: {start_url}，"
+        f"{start_type}，"
         f"最大页面数: {MAX_PAGES}，最大深度: {MAX_DEPTH}"
     )
 
@@ -372,14 +440,13 @@ def crawl_recursive(start_url: str, table) -> dict:
             logger.debug(f"跳过深度 {depth} > {MAX_DEPTH}: {current_url}")
             continue
 
-        # depth=0 是起始页，允许爬取。
-        # depth>0 以后，只允许 /list3/*。
+        # 首页（非 /list3/*）在冷启动时允许爬取
+        # 热启动时起始点已经是 /list3/*，深度从 0 开始，所以 depth>0 过滤仍然有效
         if depth > 0 and not should_crawl(current_url):
             logger.debug(f"跳过非 /list3/* 页面: {current_url}")
             continue
 
-        # 如果是 /list3/*，并且之前已经递归检索过，本次跳过。
-        # 起始页如果不是 /list3/*，例如首页，仍然允许每次爬一次作为入口。
+        # 如果是 /list3/*，并且之前已经递归检索过，本次跳过
         if is_list3_page(current_url) and is_url_already_crawled(table, current_url):
             skipped_crawled_count += 1
             logger.info(f"跳过已检索目录: {current_url}")
@@ -418,7 +485,7 @@ def crawl_recursive(start_url: str, table) -> dict:
 
                 child_urls.add(directory_url)
 
-                # 先保存发现状态，状态为 DISCOVERED。
+                # 先保存发现状态，状态为 DISCOVERED
                 save_discovered_link(table, directory)
                 all_directories.append(directory)
                 newly_saved_count += 1
@@ -449,8 +516,7 @@ def crawl_recursive(start_url: str, table) -> dict:
             if is_terminal:
                 terminal_count += 1
 
-            # 只有 /list3/* 页面本身才标记为已爬。
-            # 如果 current_url 是首页，不写成目录记录。
+            # 只有 /list3/* 页面本身才标记为已爬
             if is_list3_page(current_url):
                 mark_link_crawled(
                     table=table,
@@ -513,34 +579,6 @@ def crawl_recursive(start_url: str, table) -> dict:
 
 
 # ============================================================
-# 单页爬取（兼容模式）
-# ============================================================
-
-def crawl_single_page(source_url: str) -> list[dict]:
-    """单页模式：只提取 /list3/* 目录链接。"""
-    try:
-        response = requests.get(
-            source_url,
-            headers={
-                "User-Agent": USER_AGENT,
-                "Accept-Language": "ja,en;q=0.8",
-            },
-            timeout=REQUEST_TIMEOUT,
-        )
-        response.raise_for_status()
-    except Exception as e:
-        logger.error(f"请求失败: {source_url}, {e}")
-        raise
-    
-    links = extract_links_from_page(response.text, source_url, 0)
-    
-    if len(links) > MAX_LINKS_PER_RUN:
-        links = links[:MAX_LINKS_PER_RUN]
-    
-    return links
-
-
-# ============================================================
 # Lambda Handler
 # ============================================================
 
@@ -548,17 +586,17 @@ def lambda_handler(event, context):
     """
     EventBridge 入口。
     
+    智能起始点选择：
+    - 表为空（首次运行）：从雅虎拍卖首页开始
+    - 表不为空（后续运行）：从最久未爬取的 /list3/* 链接开始
+    
     支持事件参数:
-        - source_url: 起始 URL (可以是任何允许的 Yahoo 拍卖页面)
-        - enable_recursive: 是否启用递归
-        - max_pages: 最大爬取页数
-        - max_depth: 最大深度
+        - max_pages: 最大爬取页数（可选）
+        - max_depth: 最大深度（可选）
     """
     event = event if isinstance(event, dict) else {}
     
-    # 读取参数
-    source_url = event.get("source_url") or os.getenv("LINK_CRAWLER_START_URL", DEFAULT_START_URL)
-    enable_recursive = event.get("enable_recursive", ENABLE_RECURSIVE)
+    # 读取参数（不再需要 source_url）
     max_pages_override = event.get("max_pages")
     max_depth_override = event.get("max_depth")
     
@@ -569,35 +607,45 @@ def lambda_handler(event, context):
     if max_depth_override:
         MAX_DEPTH = int(max_depth_override)
     
-    logger.info(f"启动 /list3/* 目录增量采集: source_url={source_url}, recursive={enable_recursive}, max_pages={MAX_PAGES}, max_depth={MAX_DEPTH}")
-    
-    # 验证 URL
-    if not is_allowed_url(source_url):
-        raise ValueError(f"source_url 不是允许的页面: {source_url}")
-    
-    # 获取 DynamoDB table（提前创建，因为 crawl_recursive 需要）
+    # 获取 DynamoDB table
     table_name = os.environ["LINK_CRAWLER_TABLE_NAME"]
     table = boto3.resource("dynamodb").Table(table_name)
     
-    # 执行爬取
-    if enable_recursive:
-        result = crawl_recursive(source_url, table)
-        links = result["all_directories"]
-        extra_metrics = {
-            "pages_crawled": result["pages_crawled"],
-            "directories_found": result["directories_found"],
-            "skipped_crawled": result["skipped_crawled"],
-            "terminal_count": result["terminal_count"],
-            "errors": result["errors"],
-        }
+    # 智能选择起始 URL
+    is_cold_start = False
+    start_url = DEFAULT_START_URL
+    
+    # 检查表是否为空
+    if is_table_empty(table):
+        is_cold_start = True
+        logger.info("表为空，冷启动：从雅虎首页开始采集")
     else:
-        links = crawl_single_page(source_url)
-        
-        # 单页模式也使用增量保存
-        for link in links:
-            save_discovered_link(table, link)
-        
-        extra_metrics = {"pages_crawled": 1}
+        # 从表中获取最久未爬取的 /list3/* 链接
+        next_url = get_next_unvisited_url(table)
+        if next_url:
+            start_url = next_url
+            logger.info(f"热启动：从最久未爬取链接开始 - {start_url}")
+        else:
+            # 所有链接都已爬取完毕
+            logger.info("所有 /list3/* 链接已爬取完毕，检查首页是否有新链接")
+            is_cold_start = True
+            start_url = DEFAULT_START_URL
+    
+    logger.info(
+        f"启动 /list3/* 目录增量采集: "
+        f"start_url={start_url}, "
+        f"max_pages={MAX_PAGES}, "
+        f"max_depth={MAX_DEPTH}, "
+        f"is_cold_start={is_cold_start}"
+    )
+    
+    # 验证 URL
+    if not is_allowed_url(start_url):
+        raise ValueError(f"start_url 不是允许的页面: {start_url}")
+    
+    # 执行爬取
+    result = crawl_recursive(start_url, table, is_cold_start)
+    links = result["all_directories"]
     
     # 去重，仅用于返回统计
     unique_links = {}
@@ -607,19 +655,45 @@ def lambda_handler(event, context):
     
     saved = len(unique_links)
     
+    # 统计剩余未爬取数量
+    remaining = 0
+    try:
+        response = table.query(
+            IndexName="link_type-first_seen_at-index",
+            KeyConditionExpression="link_type = :link_type",
+            FilterExpression="is_crawled = :false_val OR crawl_status = :status",
+            ExpressionAttributeValues={
+                ":link_type": "list3_directory",
+                ":false_val": False,
+                ":status": "DISCOVERED",
+            },
+            Select="COUNT",
+        )
+        remaining = response.get("Count", 0)
+    except Exception:
+        pass
+    
     logger.info(
         f"采集完成: 本次发现 /list3/* 目录 {len(links)} 个, "
         f"去重后 {len(unique_links)} 个, "
-        f"已写入或更新 DynamoDB {saved} 个"
+        f"已写入或更新 DynamoDB {saved} 个, "
+        f"剩余未爬取约 {remaining} 个"
     )
     
     return {
         "statusCode": 200,
         "message": "/list3/* 目录增量采集完成",
-        "source_url": source_url,
-        "enable_recursive": enable_recursive,
+        "start_url": start_url,
+        "is_cold_start": is_cold_start,
         "extracted": len(links),
         "unique": len(unique_links),
         "saved_or_updated": saved,
-        "metrics": extra_metrics,
+        "remaining_unvisited": remaining,
+        "metrics": {
+            "pages_crawled": result["pages_crawled"],
+            "directories_found": result["directories_found"],
+            "skipped_crawled": result["skipped_crawled"],
+            "terminal_count": result["terminal_count"],
+            "errors": result["errors"],
+        },
     }
