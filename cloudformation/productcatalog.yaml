@@ -189,6 +189,13 @@ Parameters:
     MaxValue: 20000
     Description: 单次运行最大保存链接数
 
+  LinkCrawlerMaxAttempts:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 20
+    Description: 目录队列任务最大尝试次数
+
   LinkCrawlerRequestInterval:
     Type: Number
     Default: 0.5
@@ -457,6 +464,10 @@ Resources:
           AttributeType: S
         - AttributeName: first_seen_at
           AttributeType: S
+        - AttributeName: queue_status
+          AttributeType: S
+        - AttributeName: queue_priority
+          AttributeType: S
       KeySchema:
         - AttributeName: crawl_id
           KeyType: HASH
@@ -481,6 +492,14 @@ Resources:
               - url
               - is_crawled
               - crawl_status
+        - IndexName: queue_status-queue_priority-index
+          KeySchema:
+            - AttributeName: queue_status
+              KeyType: HASH
+            - AttributeName: queue_priority
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
       SSESpecification:
@@ -1060,6 +1079,7 @@ Resources:
           LINK_CRAWLER_MAX_PAGES: !Ref LinkCrawlerMaxPages
           LINK_CRAWLER_MAX_DEPTH: !Ref LinkCrawlerMaxDepth
           LINK_CRAWLER_MAX_LINKS_PER_RUN: !Ref LinkCrawlerMaxLinksPerRun
+          LINK_CRAWLER_MAX_ATTEMPTS: !Ref LinkCrawlerMaxAttempts
           LINK_CRAWLER_REQUEST_INTERVAL: !Ref LinkCrawlerRequestInterval
           LINK_CRAWLER_ENABLE_RECURSIVE: !Ref LinkCrawlerEnableRecursive
           LINK_CRAWLER_TIMEOUT: !Ref YahooAuctionRequestTimeout

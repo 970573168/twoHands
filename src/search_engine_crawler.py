@@ -1,18 +1,8 @@
 """
-Yahoo! 拍卖 /list3/* 目录链接增量采集 Lambda。
+Yahoo! 拍卖 /list3/* 目录链接持久化队列采集 Lambda。
 
-由 EventBridge 定时触发，智能选择起始点：
-- 表为空时：从雅虎首页开始
-- 表不为空时：从最久未爬取的 /list3/* 链接开始
-
-只保存和递归进入 /list3/* 目录页面。
-
-增量特性：
-- 每个目录链接维护状态字段（is_crawled, crawl_status）
-- 优先爬取最久入库的未爬取链接
-- 已爬过但未穷尽的目录会重新访问以发现新子目录
-- 精确标记已到底部的目录
-- 支持错误重试
+每个目录都是 DynamoDB 队列项。Lambda 通过 GSI 按深度和发现时间消费任务，
+并用条件更新完成 QUEUED -> PROCESSING -> DONE/QUEUED/ERROR 状态流转。
 """
 
 import hashlib
@@ -22,10 +12,10 @@ import re
 import time
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlsplit, urlunsplit
-from collections import deque
 
 import boto3
 import requests
+from botocore.exceptions import ClientError
 from bs4 import BeautifulSoup
 
 logger = logging.getLogger()
@@ -65,6 +55,8 @@ MAX_DEPTH = int(os.getenv("LINK_CRAWLER_MAX_DEPTH", "5"))
 REQUEST_INTERVAL = float(os.getenv("LINK_CRAWLER_REQUEST_INTERVAL", "0.5"))
 MAX_LINKS_PER_RUN = int(os.getenv("LINK_CRAWLER_MAX_LINKS_PER_RUN", "5000"))
 GSI_QUERY_PAGE_SIZE = int(os.getenv("LINK_CRAWLER_GSI_PAGE_SIZE", "100"))
+MAX_ATTEMPTS = int(os.getenv("LINK_CRAWLER_MAX_ATTEMPTS", "3"))
+QUEUE_INDEX_NAME = "queue_status-queue_priority-index"
 
 
 # ============================================================
@@ -407,409 +399,324 @@ def count_remaining_unvisited(table) -> int:
             return remaining
 
 
-def mark_link_crawled(
-    table,
-    url: str,
-    child_count: int,
-    new_child_count: int,
-    is_terminal: bool,
-    is_exhausted: bool,
-) -> None:
-    """标记某个 /list3/* 目录已经被递归检索过。"""
-    now = datetime.now(timezone.utc).isoformat()
+def utc_now() -> str:
+    """返回固定格式的 UTC 时间，避免 ``+00:00`` 与 ``Z`` 混用。"""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def make_queue_priority(depth: int, created_at: str, crawl_id: str) -> str:
+    """生成先按深度、再按发现时间排序的持久化队列优先级。"""
+    return f"{int(depth):05d}#{created_at}#{crawl_id}"
+
+
+def enqueue_discovered_link(table, link: dict, root_url: str) -> dict:
+    """将发现的目录幂等写入 DynamoDB 队列；已有状态不会被重置。"""
+    url = link["url"]
     crawl_id = make_crawl_id(url)
-
-    crawl_status = "TERMINAL" if is_terminal else "CRAWLED"
-
-    table.update_item(
+    now = utc_now()
+    depth = int(link.get("depth", 0))
+    response = table.update_item(
         Key={"crawl_id": crawl_id},
         UpdateExpression="""
-            SET
-                is_crawled = :true_value,
-                is_terminal = :is_terminal,
-                is_exhausted = :is_exhausted,
-                crawl_status = :crawl_status,
-                child_count = :child_count,
-                new_child_count = :new_child_count,
-                crawled_at = :now,
-                updated_at = :now
-            REMOVE last_error
+            SET #url = :url,
+                link_type = :link_type,
+                queue_status = if_not_exists(queue_status, :queued),
+                queue_priority = if_not_exists(queue_priority, :priority),
+                #depth = if_not_exists(#depth, :depth),
+                parent_url = if_not_exists(parent_url, :parent_url),
+                root_url = if_not_exists(root_url, :root_url),
+                created_at = if_not_exists(created_at, :now),
+                first_seen_at = if_not_exists(first_seen_at, :now),
+                last_seen_at = :now,
+                updated_at = :now,
+                attempt_count = if_not_exists(attempt_count, :zero),
+                category_id = :category_id,
+                category_name = :category_name,
+                anchor_text = :anchor_text,
+                source_url = :source_url
         """,
+        ExpressionAttributeNames={"#url": "url", "#depth": "depth"},
         ExpressionAttributeValues={
-            ":true_value": True,
-            ":is_terminal": is_terminal,
-            ":is_exhausted": is_exhausted,
-            ":crawl_status": crawl_status,
-            ":child_count": child_count,
-            ":new_child_count": new_child_count,
-            ":now": now,
+            ":url": url, ":link_type": "list3_directory", ":queued": "QUEUED",
+            ":priority": make_queue_priority(depth, now, crawl_id), ":depth": depth,
+            ":parent_url": link.get("source_url", ""), ":root_url": root_url,
+            ":now": now, ":zero": 0,
+            ":category_id": link.get("category_id") or extract_category_id(url) or "",
+            ":category_name": link.get("category_name") or link.get("anchor_text", ""),
+            ":anchor_text": link.get("anchor_text", ""),
+            ":source_url": link.get("source_url", ""),
         },
+        ReturnValues="ALL_OLD",
     )
+    old = response.get("Attributes")
+    return {
+        "crawl_id": crawl_id,
+        "url": url,
+        "is_new": not bool(old),
+        "previous_status": old.get("queue_status") if old else None,
+    }
 
 
-def mark_link_error(table, url: str, error_message: str) -> None:
-    """标记某个目录爬取失败。"""
-    now = datetime.now(timezone.utc).isoformat()
-    crawl_id = make_crawl_id(url)
+def get_queued_items(table, limit: int) -> list[dict]:
+    """按 BFS 优先级分页读取最多 ``limit`` 个待处理目录。"""
+    if limit <= 0:
+        return []
+    items, exclusive_start_key = [], None
+    while len(items) < limit:
+        kwargs = {
+            "IndexName": QUEUE_INDEX_NAME,
+            "KeyConditionExpression": "queue_status = :queued",
+            "ExpressionAttributeValues": {":queued": "QUEUED"},
+            "ScanIndexForward": True,
+            "Limit": limit - len(items),
+        }
+        if exclusive_start_key:
+            kwargs["ExclusiveStartKey"] = exclusive_start_key
+        response = table.query(**kwargs)
+        items.extend(response.get("Items", []))
+        exclusive_start_key = response.get("LastEvaluatedKey")
+        if not exclusive_start_key:
+            break
+    return items[:limit]
 
-    table.update_item(
+
+def claim_queue_item(table, crawl_id: str) -> dict | None:
+    """以条件更新原子抢占一个 QUEUED 任务。"""
+    now = utc_now()
+    try:
+        response = table.update_item(
+            Key={"crawl_id": crawl_id},
+            UpdateExpression=("SET queue_status = :processing, claimed_at = :now, "
+                              "updated_at = :now ADD attempt_count :one"),
+            ConditionExpression="queue_status = :queued",
+            ExpressionAttributeValues={
+                ":queued": "QUEUED", ":processing": "PROCESSING", ":now": now, ":one": 1,
+            },
+            ReturnValues="ALL_NEW",
+        )
+        return response.get("Attributes")
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException":
+            return None
+        raise
+
+
+def mark_queue_done(table, crawl_id: str, child_count: int,
+                    new_child_count: int, is_terminal: bool) -> dict | None:
+    """仅将当前 PROCESSING 任务标记为 DONE。"""
+    now = utc_now()
+    response = table.update_item(
         Key={"crawl_id": crawl_id},
-        UpdateExpression="""
-            SET
-                crawl_status = :status,
-                last_error = :error,
-                updated_at = :now
-        """,
+        UpdateExpression=("SET queue_status = :done, child_count = :child_count, "
+                          "new_child_count = :new_child_count, is_terminal = :is_terminal, "
+                          "done_at = :now, updated_at = :now REMOVE last_error"),
+        ConditionExpression="queue_status = :processing",
         ExpressionAttributeValues={
-            ":status": "ERROR",
-            ":error": error_message[:1000],
-            ":now": now,
+            ":processing": "PROCESSING", ":done": "DONE", ":child_count": child_count,
+            ":new_child_count": new_child_count, ":is_terminal": is_terminal, ":now": now,
         },
+        ReturnValues="ALL_NEW",
     )
+    return response.get("Attributes")
 
 
-# ============================================================
-# 递归爬取核心（增量版）
-# ============================================================
+def mark_queue_failed(table, item: dict, error_message: str) -> dict | None:
+    """按已 claim 的尝试次数将失败任务重新排队或转为 ERROR。"""
+    now = utc_now()
+    status = "QUEUED" if int(item.get("attempt_count", 0)) < MAX_ATTEMPTS else "ERROR"
+    response = table.update_item(
+        Key={"crawl_id": item["crawl_id"]},
+        UpdateExpression=("SET queue_status = :status, last_error = :error, "
+                          "last_error_at = :now, updated_at = :now"),
+        ConditionExpression="queue_status = :processing",
+        ExpressionAttributeValues={
+            ":processing": "PROCESSING", ":status": status,
+            ":error": str(error_message)[:1000], ":now": now,
+        },
+        ReturnValues="ALL_NEW",
+    )
+    return response.get("Attributes")
 
-def crawl_recursive(start_url: str, table, is_cold_start: bool = False) -> dict:
-    """
-    广度优先递归爬取 /list3/* 目录页。
 
-    增量特点：
-    - 冷启动时从雅虎首页开始
-    - 热启动时从最久未爬取的 /list3/* 链接开始
-    - 已爬过但未穷尽的目录会重新访问以发现新子目录
-    - 已经 is_crawled=True 且 is_exhausted=True 的链接，下次不再递归
-    - 没有发现子 /list3/* 的链接，标记为 is_terminal=True
-    """
-    all_directories = []
-    visited_pages = set()
-    queued_urls = set()
-    errors = []
+def has_queued_items(table) -> bool:
+    """使用队列 GSI 判断是否至少存在一个 QUEUED 项。"""
+    response = table.query(
+        IndexName=QUEUE_INDEX_NAME,
+        KeyConditionExpression="queue_status = :queued",
+        ExpressionAttributeValues={":queued": "QUEUED"},
+        Limit=1,
+    )
+    return bool(response.get("Items"))
 
-    queue = deque()
-    queue.append((start_url, 0))
-    queued_urls.add(start_url)
 
-    pages_crawled = 0
-    skipped_crawled_count = 0
-    terminal_count = 0
-    newly_discovered = 0
-    existing_updated = 0
+def count_queue_status(table, status: str) -> int:
+    """分页统计指定队列状态的全部记录。"""
+    total, exclusive_start_key = 0, None
+    while True:
+        kwargs = {
+            "IndexName": QUEUE_INDEX_NAME,
+            "KeyConditionExpression": "queue_status = :status",
+            "ExpressionAttributeValues": {":status": status},
+            "Select": "COUNT",
+        }
+        if exclusive_start_key:
+            kwargs["ExclusiveStartKey"] = exclusive_start_key
+        response = table.query(**kwargs)
+        total += int(response.get("Count", 0))
+        exclusive_start_key = response.get("LastEvaluatedKey")
+        if not exclusive_start_key:
+            return total
 
+
+def _http_session():
     session = requests.Session()
     session.headers.update({
         "User-Agent": USER_AGENT,
         "Accept-Language": "ja,en;q=0.8",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     })
+    return session
 
-    start_type = "冷启动（从首页开始）" if is_cold_start else f"热启动（从 {start_url} 开始）"
-    logger.info(
-        f"{start_type}，"
-        f"最大页面数: {MAX_PAGES}，最大深度: {MAX_DEPTH}"
+
+def seed_from_homepage(table) -> int:
+    """队列为空时从 Yahoo 首页发现并持久化第一层目录。"""
+    response = _http_session().get(DEFAULT_START_URL, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+    added = 0
+    for link in extract_links_from_page(response.text, DEFAULT_START_URL, depth=0):
+        result = enqueue_discovered_link(table, link, root_url=link["url"])
+        added += int(result["is_new"])
+    return added
+
+
+def recover_stale_processing_items(table, stale_seconds: int = 900) -> int:
+    """简易扫描恢复超时任务；生产环境建议使用 queue_status-claimed_at-index。"""
+    cutoff = datetime.fromtimestamp(time.time() - stale_seconds, timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%S.%fZ"
     )
+    recovered, exclusive_start_key = 0, None
+    while True:
+        kwargs = {
+            "FilterExpression": "queue_status = :processing AND claimed_at < :cutoff",
+            "ExpressionAttributeValues": {":processing": "PROCESSING", ":cutoff": cutoff},
+            "ProjectionExpression": "crawl_id",
+        }
+        if exclusive_start_key:
+            kwargs["ExclusiveStartKey"] = exclusive_start_key
+        response = table.scan(**kwargs)
+        for item in response.get("Items", []):
+            try:
+                table.update_item(
+                    Key={"crawl_id": item["crawl_id"]},
+                    UpdateExpression="SET queue_status = :queued, updated_at = :now",
+                    ConditionExpression="queue_status = :processing AND claimed_at < :cutoff",
+                    ExpressionAttributeValues={
+                        ":queued": "QUEUED", ":processing": "PROCESSING",
+                        ":cutoff": cutoff, ":now": utc_now(),
+                    },
+                )
+                recovered += 1
+            except ClientError as exc:
+                if exc.response.get("Error", {}).get("Code") != "ConditionalCheckFailedException":
+                    raise
+        exclusive_start_key = response.get("LastEvaluatedKey")
+        if not exclusive_start_key:
+            return recovered
 
-    while queue and pages_crawled < MAX_PAGES and len(all_directories) < MAX_LINKS_PER_RUN:
-        current_url, depth = queue.popleft()
 
-        if current_url in visited_pages:
-            continue
+def crawl_queue(table, max_pages: int | None = None, max_depth: int | None = None,
+                max_links_per_run: int | None = None) -> dict:
+    """消费 DynamoDB 持久化队列，不依赖进程内存恢复进度。"""
+    page_limit = MAX_PAGES if max_pages is None else int(max_pages)
+    depth_limit = MAX_DEPTH if max_depth is None else int(max_depth)
+    link_limit = MAX_LINKS_PER_RUN if max_links_per_run is None else int(max_links_per_run)
+    pages_crawled = directories_found = newly_enqueued = 0
+    errors = []
+    session = _http_session()
 
-        if depth > MAX_DEPTH:
-            logger.debug(f"跳过深度 {depth} > {MAX_DEPTH}: {current_url}")
-            continue
-
-        # 首页（非 /list3/*）在冷启动时允许爬取
-        # 热启动时起始点已经是 /list3/*，深度从 0 开始，所以 depth>0 过滤仍然有效
-        if depth > 0 and not should_crawl(current_url):
-            logger.debug(f"跳过非 /list3/* 页面: {current_url}")
-            continue
-
-        # 如果是 /list3/*，并且之前已经递归检索过且已穷尽，跳过
-        # 已爬过但未穷尽的目录会重新爬取以发现新子目录
-        if is_list3_page(current_url):
-            record = get_link_record(table, current_url)
-        else:
-            record = None
-        if record and record.get("is_crawled"):
-            if record and (record.get("is_exhausted") or record.get("is_terminal")):
-                skipped_crawled_count += 1
-                logger.info(f"跳过已检索且已穷尽目录: {current_url}")
+    while pages_crawled < page_limit and directories_found < link_limit:
+        queued_items = get_queued_items(table, limit=25)
+        if not queued_items:
+            break
+        claimed_any = False
+        for queued_item in queued_items:
+            if pages_crawled >= page_limit or directories_found >= link_limit:
+                break
+            claimed = claim_queue_item(table, queued_item["crawl_id"])
+            if claimed is None:
                 continue
-            else:
-                # 已爬过但未穷尽，重新爬取以发现新子目录
-                logger.info(f"重新爬取未穷尽目录: {current_url}")
-
-        visited_pages.add(current_url)
-
-        logger.info(f"[{pages_crawled + 1}/{MAX_PAGES}] 深度 {depth}: {current_url}")
-
-        try:
-            response = session.get(current_url, timeout=REQUEST_TIMEOUT)
-            response.raise_for_status()
-            pages_crawled += 1
-
-            # 被发现的链接深度应该是当前页面 depth + 1
-            new_directories = extract_links_from_page(
-                response.text,
-                current_url,
-                depth + 1
-            )
-
-            child_urls = set()
-            page_newly_discovered = 0
-            page_existing_updated = 0
-            newly_queued_count = 0
-            already_crawled_child_count = 0
-            all_children_exhausted = True
-            link_limit_reached = False
-
-            for directory in new_directories:
-                if len(all_directories) >= MAX_LINKS_PER_RUN:
-                    link_limit_reached = True
-                    break
-
-                directory_url = directory["url"]
-
-                # 避免把当前页面自己当成子目录
-                if directory_url == current_url:
-                    continue
-
-                child_urls.add(directory_url)
-
-                # 先保存发现状态，状态为 DISCOVERED
-                save_result = save_discovered_link(table, directory)
-                if save_result.get("save_failed"):
-                    all_children_exhausted = False
-                    continue
-                all_directories.append(directory)
-                child_record = save_result.get("previous_record")
-                if save_result["is_new"]:
-                    newly_discovered += 1
-                    page_newly_discovered += 1
-                else:
-                    existing_updated += 1
-                    page_existing_updated += 1
-
-                # 复用 UpdateItem 返回的旧记录，避免再次 GetItem。
-                already_crawled = bool(child_record and child_record.get("is_crawled"))
-                child_exhausted = bool(
-                    child_record
-                    and (child_record.get("is_exhausted") or child_record.get("is_terminal"))
+            claimed_any = True
+            current_url = claimed["url"]
+            depth = int(claimed.get("depth", 0))
+            root_url = claimed.get("root_url") or current_url
+            if depth > depth_limit or not should_crawl(current_url):
+                mark_queue_done(table, claimed["crawl_id"], 0, 0, False)
+                continue
+            try:
+                response = session.get(current_url, timeout=REQUEST_TIMEOUT)
+                response.raise_for_status()
+                pages_crawled += 1
+                discovered = extract_links_from_page(response.text, current_url, depth + 1)
+                unique_children = {}
+                for directory in discovered:
+                    if directory["url"] != current_url:
+                        unique_children.setdefault(directory["url"], directory)
+                page_new = 0
+                for directory in unique_children.values():
+                    result = enqueue_discovered_link(table, directory, root_url)
+                    directories_found += 1
+                    if result["is_new"]:
+                        page_new += 1
+                        newly_enqueued += 1
+                child_count = len(unique_children)
+                mark_queue_done(
+                    table, claimed["crawl_id"], child_count, page_new,
+                    is_terminal=child_count == 0,
                 )
-                if not child_exhausted:
-                    all_children_exhausted = False
-
-                if already_crawled:
-                    already_crawled_child_count += 1
-
-                # 进入递归队列的条件：
-                # 1. 是 /list3/* 页面
-                # 2. 未被访问过
-                # 3. 未在队列中
-                # 4. 如果已爬过，需要检查是否还有未爬取的子孙目录
-                if (
-                    should_crawl(directory_url)
-                    and directory_url not in visited_pages
-                    and directory_url not in queued_urls
-                ):
-                    if already_crawled:
-                        # 已爬过的目录：检查是否已穷尽
-                        if child_exhausted:
-                            logger.debug(f"  跳过已穷尽子目录: {directory_url}")
-                            continue
-                        else:
-                            logger.debug(f"  重新入队未穷尽子目录: {directory_url}")
-
-                    queue.append((directory_url, depth + 1))
-                    queued_urls.add(directory_url)
-                    newly_queued_count += 1
-
-            child_count = len(child_urls)
-
-            # 真正到底部：页面里没有任何其他 /list3/* 子目录
-            is_terminal = child_count == 0 and not link_limit_reached
-
-            # 父目录只有在没有被截断，且所有直接子目录均已到底/穷尽时才算穷尽。
-            # “本次没有新入队”并不代表已存在但尚未爬取的子目录已经处理完。
-            is_exhausted = not link_limit_reached and (is_terminal or all_children_exhausted)
-
-            if is_terminal:
-                terminal_count += 1
-
-            # 只有 /list3/* 页面本身才标记为已爬
-            if is_list3_page(current_url):
-                mark_link_crawled(
-                    table=table,
-                    url=current_url,
-                    child_count=child_count,
-                    new_child_count=newly_queued_count,
-                    is_terminal=is_terminal,
-                    is_exhausted=is_exhausted,
-                )
-
-            logger.info(
-                f"  发现 /list3/*: {len(new_directories)} 个, "
-                f"子目录: {child_count} 个, "
-                f"真正新增: {page_newly_discovered} 个, "
-                f"已有更新: {page_existing_updated} 个, "
-                f"已检索子目录: {already_crawled_child_count} 个, "
-                f"新增递归队列: {newly_queued_count} 个, "
-                f"是否到底: {is_terminal}, "
-                f"是否穷尽: {is_exhausted}, "
-                f"队列: {len(queue)}, "
-                f"累计发现: {len(all_directories)}"
-            )
-
-            time.sleep(REQUEST_INTERVAL)
-
-        except requests.exceptions.RequestException as e:
-            error_msg = f"请求失败 {current_url}: {e}"
-            logger.error(error_msg)
-            errors.append(error_msg)
-
-            if is_list3_page(current_url):
-                mark_link_error(table, current_url, error_msg)
-
-            continue
-
-        except Exception as e:
-            error_msg = f"处理失败 {current_url}: {e}"
-            logger.error(error_msg)
-            errors.append(error_msg)
-
-            if is_list3_page(current_url):
-                mark_link_error(table, current_url, error_msg)
-
-            continue
-
-    logger.info(
-        f"递归完成: 爬取 {pages_crawled} 页, "
-        f"本次发现 {len(all_directories)} 个 /list3/* 目录链接, "
-        f"跳过已穷尽 {skipped_crawled_count} 个, "
-        f"到底目录 {terminal_count} 个, "
-        f"错误 {len(errors)} 个"
-    )
-
+                if REQUEST_INTERVAL:
+                    time.sleep(REQUEST_INTERVAL)
+            except Exception as exc:
+                message = f"处理失败 {current_url}: {exc}"
+                logger.exception(message)
+                errors.append(message)
+                try:
+                    mark_queue_failed(table, claimed, message)
+                except Exception:
+                    logger.exception("更新失败队列状态失败: %s", current_url)
+        if not claimed_any:
+            break
     return {
-        "all_directories": all_directories,
         "pages_crawled": pages_crawled,
-        "directories_found": len(all_directories),
-        "skipped_crawled": skipped_crawled_count,
-        "terminal_count": terminal_count,
-        "newly_discovered": newly_discovered,
-        "existing_updated": existing_updated,
+        "directories_found": directories_found,
+        "newly_enqueued": newly_enqueued,
         "errors": errors,
     }
 
 
-# ============================================================
-# Lambda Handler
-# ============================================================
-
 def lambda_handler(event, context):
-    """
-    EventBridge 入口。
-    
-    智能起始点选择：
-    - 表为空（首次运行）：从雅虎拍卖首页开始
-    - 表不为空（后续运行）：从最久未爬取的 /list3/* 链接开始
-    
-    支持事件参数:
-        - max_pages: 最大爬取页数（可选）
-        - max_depth: 最大深度（可选）
-    """
+    """EventBridge 入口：恢复、播种并消费 DynamoDB 持久化目录队列。"""
     event = event if isinstance(event, dict) else {}
-    
-    # 读取参数（不再需要 source_url）
-    max_pages_override = event.get("max_pages")
-    max_depth_override = event.get("max_depth")
-    
-    # 全局覆盖（用于单次调用）
-    global MAX_PAGES, MAX_DEPTH
-    if max_pages_override:
-        MAX_PAGES = int(max_pages_override)
-    if max_depth_override:
-        MAX_DEPTH = int(max_depth_override)
-    
-    # 获取 DynamoDB table
-    table_name = os.environ["LINK_CRAWLER_TABLE_NAME"]
-    table = boto3.resource("dynamodb").Table(table_name)
-    
-    # 智能选择起始 URL
-    is_cold_start = False
-    start_url = DEFAULT_START_URL
-    
-    # 检查表是否为空
-    if is_table_empty(table):
-        is_cold_start = True
-        logger.info("表为空，冷启动：从雅虎首页开始采集")
-    else:
-        # 从表中获取最久未爬取的 /list3/* 链接
-        next_url = get_next_unvisited_url(table)
-        if next_url:
-            start_url = next_url
-            logger.info(f"热启动：从最久未爬取链接开始 - {start_url}")
-        else:
-            # 所有链接都已爬取完毕
-            logger.info("所有 /list3/* 链接已爬取完毕，检查首页是否有新链接")
-            is_cold_start = True
-            start_url = DEFAULT_START_URL
-    
-    logger.info(
-        f"启动 /list3/* 目录增量采集: "
-        f"start_url={start_url}, "
-        f"max_pages={MAX_PAGES}, "
-        f"max_depth={MAX_DEPTH}, "
-        f"is_cold_start={is_cold_start}"
+    table = boto3.resource("dynamodb").Table(os.environ["LINK_CRAWLER_TABLE_NAME"])
+    recover_stale_processing_items(table)
+    seeded = 0
+    if not has_queued_items(table):
+        seeded = seed_from_homepage(table)
+    result = crawl_queue(
+        table,
+        max_pages=event.get("max_pages"),
+        max_depth=event.get("max_depth"),
+        max_links_per_run=event.get("max_links_per_run"),
     )
-    
-    # 验证 URL
-    if not is_allowed_url(start_url):
-        raise ValueError(f"start_url 不是允许的页面: {start_url}")
-    
-    # 执行爬取
-    result = crawl_recursive(start_url, table, is_cold_start)
-    links = result["all_directories"]
-    
-    # 去重，仅用于返回统计
-    unique_links = {}
-    for link in links:
-        if link["url"] not in unique_links:
-            unique_links[link["url"]] = link
-    
-    # 统计剩余未爬取数量
-    remaining = 0
-    try:
-        remaining = count_remaining_unvisited(table)
-    except Exception as e:
-        logger.warning(f"统计剩余未爬取目录失败: {e}")
-    
-    logger.info(
-        f"采集完成: 本次发现 /list3/* 目录 {len(links)} 个, "
-        f"去重后 {len(unique_links)} 个, "
-        f"真正新增 {result['newly_discovered']} 个, "
-        f"已有更新 {result['existing_updated']} 个, "
-        f"剩余未爬取 {remaining} 个"
-    )
-    
+    queue = {
+        "queued": count_queue_status(table, "QUEUED"),
+        "processing": count_queue_status(table, "PROCESSING"),
+        "done": count_queue_status(table, "DONE"),
+        "error": count_queue_status(table, "ERROR"),
+    }
     return {
         "statusCode": 200,
-        "message": "/list3/* 目录增量采集完成",
-        "start_url": start_url,
-        "is_cold_start": is_cold_start,
-        "extracted": len(links),
-        "unique_links_seen_this_run": len(unique_links),
-        "newly_discovered": result["newly_discovered"],
-        "existing_updated": result["existing_updated"],
-        "remaining_unvisited": remaining,
-        "metrics": {
-            "pages_crawled": result["pages_crawled"],
-            "directories_found": result["directories_found"],
-            "skipped_crawled": result["skipped_crawled"],
-            "terminal_count": result["terminal_count"],
-            "errors": result["errors"],
-        },
+        "message": "队列式 /list3/* 目录采集完成",
+        "seeded": seeded,
+        "metrics": result,
+        "queue": queue,
     }
