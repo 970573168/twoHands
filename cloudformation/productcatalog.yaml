@@ -163,7 +163,7 @@ Parameters:
 
   LinkCrawlerScheduleMinutes:
     Type: Number
-    Default: 60
+    Default: 5
     MinValue: 5
     MaxValue: 1440
     Description: EventBridge 定时采集间隔（分钟）
@@ -1069,15 +1069,15 @@ Resources:
         - Key: Environment
           Value: !Ref Environment
 
-  # 定时器：Yahoo Auction Link Crawler - 默认关闭
+  # 定时器：Yahoo Auction Link Crawler - 默认每 5 分钟运行
   YahooAuctionLinkCrawlerScheduleRule:
     Type: AWS::Events::Rule
     Condition: DeployLinkCrawlerCondition
     Properties:
       Name: !Sub "YahooAuctionLinkCrawler-Schedule-${Environment}"
-      Description: 定时触发 Yahoo 拍卖递归链接采集器 (默认关闭)
+      Description: 定时触发 Yahoo 拍卖递归链接采集器 (默认每 5 分钟运行)
       ScheduleExpression: !Sub "rate(${LinkCrawlerScheduleMinutes} minutes)"
-      State: DISABLED
+      State: ENABLED
       Targets:
         - Arn: !GetAtt YahooAuctionLinkCrawler.Arn
           Id: YahooAuctionLinkCrawlerTarget
