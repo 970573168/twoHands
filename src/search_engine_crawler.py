@@ -1,8 +1,8 @@
 """
-Yahoo! 拍卖链接递归采集 Lambda。
+Yahoo! 拍卖 /list3/* 目录链接采集 Lambda。
 
-由 EventBridge 定时触发，从 /list3/* 起始页开始广度优先递归爬取所有商品列表页，
-提取商品链接，写入 DynamoDB。
+由 EventBridge 定时触发，从起始页开始广度优先递归爬取，
+只保存和递归进入 /list3/* 目录页面。
 """
 
 import hashlib
@@ -27,7 +27,7 @@ logger.setLevel(logging.INFO)
 
 ALLOWED_HOST = "auctions.yahoo.co.jp"
 ALLOWED_LIST3_PREFIX = "/list3/"
-DEFAULT_START_URL = "https://auctions.yahoo.co.jp/list3/23632-category.html"
+DEFAULT_START_URL = "https://auctions.yahoo.co.jp/"
 
 # 禁止爬取的路径（robots.txt 规则）
 DISALLOW = (
@@ -95,9 +95,9 @@ def normalize_url(href: str, source_url: str) -> str | None:
 # 页面类型判断
 # ============================================================
 
-def is_listing_page(url: str) -> bool:
+def is_list3_page(url: str) -> bool:
     """
-    判断是否为允许递归爬取的商品列表页。
+    判断是否为 /list3/* 目录页。
     
     当前仅允许：
     - https://auctions.yahoo.co.jp/list3/*
@@ -118,74 +118,71 @@ def is_listing_page(url: str) -> bool:
     
     path = parsed.path or "/"
     
-    # 只允许 /list3/ 开头的页面
     return path.startswith(ALLOWED_LIST3_PREFIX)
 
 
-def is_item_page(url: str) -> bool:
-    """判断是否为商品详情页（只保存链接，不递归）。"""
-    if not url:
-        return False
-    parsed = urlsplit(url)
-    path = parsed.path
-    return '/auction/' in path or '/item/' in path
+def is_listing_page(url: str) -> bool:
+    """
+    判断是否为需要保存和递归进入的目录页。
+    
+    当前仅允许：
+    - https://auctions.yahoo.co.jp/list3/*
+    """
+    return is_list3_page(url)
 
 
 def should_crawl(url: str) -> bool:
-    """判断一个 URL 是否应该被爬取：仅允许 /list3/* 页面。"""
+    """判断一个 URL 是否应该被递归爬取：仅允许 /list3/*。"""
     if not url:
         return False
+    
     if not is_allowed_url(url):
         return False
-    return is_listing_page(url)
+    
+    return is_list3_page(url)
 
 
 # ============================================================
 # 链接提取
 # ============================================================
 
-def extract_links_from_page(html: str, source_url: str, depth: int) -> tuple[list[dict], list[str], list[dict]]:
+def extract_links_from_page(html: str, source_url: str, depth: int) -> list[dict]:
     """
-    从 HTML 中提取所有链接，分类返回。
+    从 HTML 中提取 /list3/* 目录链接。
     
     返回:
-        - item_links: 商品详情页链接 (需要保存)
-        - listing_urls: /list3/* 子列表页链接 (需要继续递归)
-        - other_links: 其他链接 (可选保存)
+        - list3_links: /list3/* 目录链接，既用于保存，也用于递归
     """
-    item_links = []
-    listing_urls = []
-    other_links = []
+    list3_links = []
     seen = set()
     
     if not html:
-        return item_links, listing_urls, other_links
+        return list3_links
     
     soup = BeautifulSoup(html, "html.parser")
     
     for anchor in soup.select("a[href]"):
         url = normalize_url(anchor.get("href"), source_url)
+        
         if not url or url in seen:
             continue
+        
         seen.add(url)
         
+        if not is_list3_page(url):
+            continue
+        
         anchor_text = " ".join(anchor.get_text(" ", strip=True).split())
-        link_data = {
+        
+        list3_links.append({
             "url": url,
-            "anchor_text": anchor_text[:500],  # 限制长度
+            "anchor_text": anchor_text[:500],
             "source_url": source_url,
             "depth": depth,
-        }
-        
-        if is_item_page(url):
-            item_links.append(link_data)
-        elif is_listing_page(url):
-            # 只保存 /list3/* URL 用于递归
-            listing_urls.append(url)
-        else:
-            other_links.append(link_data)
+            "link_type": "list3_directory",
+        })
     
-    return item_links, listing_urls, other_links
+    return list3_links
 
 
 # ============================================================
@@ -194,25 +191,24 @@ def extract_links_from_page(html: str, source_url: str, depth: int) -> tuple[lis
 
 def crawl_recursive(start_url: str) -> dict:
     """
-    广度优先递归爬取 /list3/* 商品列表页。
+    广度优先递归爬取 /list3/* 目录页。
+    
+    起始页可以不是 /list3/*，但只有 /list3/* 会被保存和递归进入。
     
     返回:
-        - all_items: 所有商品链接列表
+        - all_directories: 所有发现的 /list3/* 目录链接
         - pages_crawled: 实际爬取的页面数
-        - listing_urls_found: 发现的 /list3/* 列表页总数
+        - directories_found: 发现的 /list3/* 目录链接数
         - errors: 错误列表
     """
-    all_items = []
-    all_listing_urls = set()
+    all_directories = []
     visited_pages = set()
+    saved_directory_urls = set()
     errors = []
     
+    # 起始页允许是首页或其他允许页面
     queue = deque()
-    
-    if should_crawl(start_url):
-        queue.append((start_url, 0))
-    else:
-        raise ValueError(f"起始页不是允许的 /list3/* 页面: {start_url}")
+    queue.append((start_url, 0))
     
     pages_crawled = 0
     
@@ -224,11 +220,11 @@ def crawl_recursive(start_url: str) -> dict:
     })
     
     logger.info(
-        f"开始递归爬取 /list3/*，起始页: {queue[0][0]}，"
+        f"开始递归采集 /list3/* 目录，起始页: {start_url}，"
         f"最大页面数: {MAX_PAGES}，最大深度: {MAX_DEPTH}"
     )
     
-    while queue and pages_crawled < MAX_PAGES and len(all_items) < MAX_LINKS_PER_RUN:
+    while queue and pages_crawled < MAX_PAGES and len(all_directories) < MAX_LINKS_PER_RUN:
         current_url, depth = queue.popleft()
         
         if current_url in visited_pages:
@@ -238,12 +234,13 @@ def crawl_recursive(start_url: str) -> dict:
             logger.debug(f"跳过深度 {depth} > {MAX_DEPTH}: {current_url}")
             continue
         
-        if not should_crawl(current_url):
+        # depth=0 是起始页，允许爬取
+        # depth>0 时，只允许 /list3/* 页面继续爬取
+        if depth > 0 and not should_crawl(current_url):
             logger.debug(f"跳过非 /list3/* 页面: {current_url}")
             continue
         
         visited_pages.add(current_url)
-        all_listing_urls.add(current_url)
         
         logger.info(f"[{pages_crawled + 1}/{MAX_PAGES}] 深度 {depth}: {current_url}")
         
@@ -252,28 +249,40 @@ def crawl_recursive(start_url: str) -> dict:
             response.raise_for_status()
             pages_crawled += 1
             
-            item_links, new_listing_urls, other_links = extract_links_from_page(
-                response.text, current_url, depth
+            # 只提取 /list3/* 目录链接
+            new_directories = extract_links_from_page(
+                response.text,
+                current_url,
+                depth
             )
-            
-            all_items.extend(item_links)
             
             queued_urls = {q[0] for q in queue}
             new_urls_count = 0
+            saved_count = 0
             
-            for new_url in new_listing_urls:
-                if not should_crawl(new_url):
-                    continue
+            for directory in new_directories:
+                directory_url = directory["url"]
                 
-                if new_url not in visited_pages and new_url not in queued_urls:
-                    queue.append((new_url, depth + 1))
-                    queued_urls.add(new_url)
+                if directory_url not in saved_directory_urls:
+                    all_directories.append(directory)
+                    saved_directory_urls.add(directory_url)
+                    saved_count += 1
+                
+                if (
+                    should_crawl(directory_url)
+                    and directory_url not in visited_pages
+                    and directory_url not in queued_urls
+                ):
+                    queue.append((directory_url, depth + 1))
+                    queued_urls.add(directory_url)
                     new_urls_count += 1
             
             logger.info(
-                f"  发现: {len(item_links)} 个商品, "
-                f"{new_urls_count} 个新的 /list3/* 列表页, "
-                f"队列: {len(queue)}, 总计商品: {len(all_items)}"
+                f"  发现 /list3/*: {len(new_directories)} 个, "
+                f"新增保存: {saved_count} 个, "
+                f"新增递归队列: {new_urls_count} 个, "
+                f"队列: {len(queue)}, "
+                f"累计目录: {len(all_directories)}"
             )
             
             time.sleep(REQUEST_INTERVAL)
@@ -283,6 +292,7 @@ def crawl_recursive(start_url: str) -> dict:
             logger.error(error_msg)
             errors.append(error_msg)
             continue
+            
         except Exception as e:
             error_msg = f"处理失败 {current_url}: {e}"
             logger.error(error_msg)
@@ -291,16 +301,14 @@ def crawl_recursive(start_url: str) -> dict:
     
     logger.info(
         f"递归完成: 爬取 {pages_crawled} 页, "
-        f"发现 {len(all_listing_urls)} 个 /list3/* 列表页, "
-        f"收集 {len(all_items)} 个商品链接, "
+        f"收集 {len(all_directories)} 个 /list3/* 目录链接, "
         f"错误 {len(errors)} 个"
     )
     
     return {
-        "all_items": all_items,
+        "all_directories": all_directories,
         "pages_crawled": pages_crawled,
-        "listing_urls_found": len(all_listing_urls),
-        "listing_urls": list(all_listing_urls),
+        "directories_found": len(all_directories),
         "errors": errors,
     }
 
@@ -310,11 +318,14 @@ def crawl_recursive(start_url: str) -> dict:
 # ============================================================
 
 def crawl_single_page(source_url: str) -> list[dict]:
-    """单页爬取模式（原有功能，兼容）。"""
+    """单页模式：只提取 /list3/* 目录链接。"""
     try:
         response = requests.get(
             source_url,
-            headers={"User-Agent": USER_AGENT, "Accept-Language": "ja,en;q=0.8"},
+            headers={
+                "User-Agent": USER_AGENT,
+                "Accept-Language": "ja,en;q=0.8",
+            },
             timeout=REQUEST_TIMEOUT,
         )
         response.raise_for_status()
@@ -322,23 +333,10 @@ def crawl_single_page(source_url: str) -> list[dict]:
         logger.error(f"请求失败: {source_url}, {e}")
         raise
     
-    soup = BeautifulSoup(response.text, "html.parser")
-    links = []
-    seen = set()
+    links = extract_links_from_page(response.text, source_url, 0)
     
-    for anchor in soup.select("a[href]"):
-        url = normalize_url(anchor.get("href"), source_url)
-        if not url or url in seen:
-            continue
-        seen.add(url)
-        links.append({
-            "url": url,
-            "anchor_text": " ".join(anchor.get_text(" ", strip=True).split()),
-            "source_url": source_url,
-            "depth": 0,
-        })
-        if len(links) >= MAX_LINKS_PER_RUN:
-            break
+    if len(links) > MAX_LINKS_PER_RUN:
+        links = links[:MAX_LINKS_PER_RUN]
     
     return links
 
@@ -369,6 +367,7 @@ def save_links(links: list[dict], table) -> int:
                     "anchor_text": link.get("anchor_text", ""),
                     "source_url": link["source_url"],
                     "depth": link.get("depth", 0),
+                    "link_type": link.get("link_type", "list3_directory"),
                     "crawled_at": crawled_at,
                 })
                 saved_count += 1
@@ -387,7 +386,7 @@ def lambda_handler(event, context):
     EventBridge 入口。
     
     支持事件参数:
-        - source_url: 起始 URL (必须是 /list3/* 页面)
+        - source_url: 起始 URL (可以是任何允许的 Yahoo 拍卖页面)
         - enable_recursive: 是否启用递归
         - max_pages: 最大爬取页数
         - max_depth: 最大深度
@@ -407,7 +406,7 @@ def lambda_handler(event, context):
     if max_depth_override:
         MAX_DEPTH = int(max_depth_override)
     
-    logger.info(f"启动链接采集: source_url={source_url}, recursive={enable_recursive}, max_pages={MAX_PAGES}, max_depth={MAX_DEPTH}")
+    logger.info(f"启动 /list3/* 目录采集: source_url={source_url}, recursive={enable_recursive}, max_pages={MAX_PAGES}, max_depth={MAX_DEPTH}")
     
     # 验证 URL
     if not is_allowed_url(source_url):
@@ -416,10 +415,10 @@ def lambda_handler(event, context):
     # 执行爬取
     if enable_recursive:
         result = crawl_recursive(source_url)
-        links = result["all_items"]
+        links = result["all_directories"]
         extra_metrics = {
             "pages_crawled": result["pages_crawled"],
-            "listing_urls_found": result["listing_urls_found"],
+            "directories_found": result["directories_found"],
             "errors": result["errors"],
         }
     else:
@@ -437,11 +436,11 @@ def lambda_handler(event, context):
     table = boto3.resource("dynamodb").Table(table_name)
     saved = save_links(list(unique_links.values()), table)
     
-    logger.info(f"采集完成: 提取 {len(links)} 条, 去重后 {len(unique_links)} 条, 写入 {saved} 条")
+    logger.info(f"采集完成: 提取 /list3/* 目录 {len(links)} 个, 去重后 {len(unique_links)} 个, 写入 {saved} 个")
     
     return {
         "statusCode": 200,
-        "message": "链接采集完成",
+        "message": "/list3/* 目录采集完成",
         "source_url": source_url,
         "enable_recursive": enable_recursive,
         "extracted": len(links),
