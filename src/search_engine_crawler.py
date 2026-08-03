@@ -10,6 +10,7 @@ Yahoo! 拍卖 /list3/* 目录链接增量采集 Lambda。
 增量特性：
 - 每个目录链接维护状态字段（is_crawled, crawl_status）
 - 优先爬取最久入库的未爬取链接
+- 已爬过但未穷尽的目录会重新访问以发现新子目录
 - 精确标记已到底部的目录
 - 支持错误重试
 """
@@ -436,7 +437,8 @@ def crawl_recursive(start_url: str, table, is_cold_start: bool = False) -> dict:
     增量特点：
     - 冷启动时从雅虎首页开始
     - 热启动时从最久未爬取的 /list3/* 链接开始
-    - 已经 is_crawled=True 的链接，下次不再递归
+    - 已爬过但未穷尽的目录会重新访问以发现新子目录
+    - 已经 is_crawled=True 且 is_exhausted=True 的链接，下次不再递归
     - 没有发现子 /list3/* 的链接，标记为 is_terminal=True
     """
     all_directories = []
@@ -481,11 +483,17 @@ def crawl_recursive(start_url: str, table, is_cold_start: bool = False) -> dict:
             logger.debug(f"跳过非 /list3/* 页面: {current_url}")
             continue
 
-        # 如果是 /list3/*，并且之前已经递归检索过，本次跳过
+        # 如果是 /list3/*，并且之前已经递归检索过且已穷尽，跳过
+        # 已爬过但未穷尽的目录会重新爬取以发现新子目录
         if is_list3_page(current_url) and is_url_already_crawled(table, current_url):
-            skipped_crawled_count += 1
-            logger.info(f"跳过已检索目录: {current_url}")
-            continue
+            record = get_link_record(table, current_url)
+            if record and (record.get("is_exhausted") or record.get("is_terminal")):
+                skipped_crawled_count += 1
+                logger.info(f"跳过已检索且已穷尽目录: {current_url}")
+                continue
+            else:
+                # 已爬过但未穷尽，重新爬取以发现新子目录
+                logger.info(f"重新爬取未穷尽目录: {current_url}")
 
         visited_pages.add(current_url)
 
@@ -525,17 +533,31 @@ def crawl_recursive(start_url: str, table, is_cold_start: bool = False) -> dict:
                 all_directories.append(directory)
                 newly_saved_count += 1
 
-                # 如果这个目录已经爬过，下次不再入队
-                if is_url_already_crawled(table, directory_url):
-                    already_crawled_child_count += 1
-                    continue
+                # 检查子目录是否已爬过
+                already_crawled = is_url_already_crawled(table, directory_url)
 
-                # 没爬过的 /list3/* 才进入递归队列
+                if already_crawled:
+                    already_crawled_child_count += 1
+
+                # 进入递归队列的条件：
+                # 1. 是 /list3/* 页面
+                # 2. 未被访问过
+                # 3. 未在队列中
+                # 4. 如果已爬过，需要检查是否还有未爬取的子孙目录
                 if (
                     should_crawl(directory_url)
                     and directory_url not in visited_pages
                     and directory_url not in queued_urls
                 ):
+                    if already_crawled:
+                        # 已爬过的目录：检查是否已穷尽
+                        record = get_link_record(table, directory_url)
+                        if record and (record.get("is_exhausted") or record.get("is_terminal")):
+                            logger.debug(f"  跳过已穷尽子目录: {directory_url}")
+                            continue
+                        else:
+                            logger.debug(f"  重新入队未穷尽子目录: {directory_url}")
+
                     queue.append((directory_url, depth + 1))
                     queued_urls.add(directory_url)
                     newly_queued_count += 1
@@ -566,9 +588,10 @@ def crawl_recursive(start_url: str, table, is_cold_start: bool = False) -> dict:
                 f"  发现 /list3/*: {len(new_directories)} 个, "
                 f"子目录: {child_count} 个, "
                 f"新增保存: {newly_saved_count} 个, "
-                f"已检索子目录跳过: {already_crawled_child_count} 个, "
+                f"已检索子目录: {already_crawled_child_count} 个, "
                 f"新增递归队列: {newly_queued_count} 个, "
                 f"是否到底: {is_terminal}, "
+                f"是否穷尽: {is_exhausted}, "
                 f"队列: {len(queue)}, "
                 f"累计发现: {len(all_directories)}"
             )
@@ -598,7 +621,7 @@ def crawl_recursive(start_url: str, table, is_cold_start: bool = False) -> dict:
     logger.info(
         f"递归完成: 爬取 {pages_crawled} 页, "
         f"本次发现 {len(all_directories)} 个 /list3/* 目录链接, "
-        f"跳过已检索 {skipped_crawled_count} 个, "
+        f"跳过已穷尽 {skipped_crawled_count} 个, "
         f"到底目录 {terminal_count} 个, "
         f"错误 {len(errors)} 个"
     )
