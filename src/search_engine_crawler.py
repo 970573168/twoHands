@@ -3,6 +3,13 @@ Yahoo! 拍卖 /list3/* 目录链接持久化队列采集 Lambda。
 
 每个目录都是 DynamoDB 队列项。Lambda 通过 GSI 按深度和发现时间消费任务，
 并用条件更新完成 QUEUED -> PROCESSING -> DONE/QUEUED/ERROR 状态流转。
+
+优化内容：
+1. 严格 URL 过滤：仅保留 /list3/数字-category.html，拒绝 leaf/catlist/query
+2. 过滤无效 anchor：空文本、"カテゴリから探す" 等
+3. 统一队列状态：queue_status 同步更新 crawl_status/is_crawled
+4. 统计改为按需：仅 event.include_counts=true 时统计
+5. 优化默认参数：减少单次 Lambda 负载
 """
 
 import hashlib
@@ -28,7 +35,12 @@ logger.setLevel(logging.INFO)
 ALLOWED_HOST = "auctions.yahoo.co.jp"
 ALLOWED_LIST3_PREFIX = "/list3/"
 DEFAULT_START_URL = "https://auctions.yahoo.co.jp/"
-CATEGORY_ID_PATTERN = re.compile(r"/(\d+)-category(?:\.html)?/?$")
+
+# 仅匹配 /list3/.../数字-category.html 的真目录页
+CATEGORY_PAGE_PATTERN = re.compile(
+    r"^/list3/(?:jp/.+/)?(\d+)-category\.html/?$",
+    re.IGNORECASE,
+)
 
 # 禁止爬取的路径（robots.txt 规则）
 DISALLOW = (
@@ -44,20 +56,30 @@ DISALLOW = (
     "/register/",
 )
 
+# 无效的 anchor 文本
+BAD_ANCHOR_TEXTS = {
+    "",
+    "カテゴリから探す",
+    "すべて",
+    "一覧",
+    "カテゴリ一覧",
+    "もっと見る",
+    "さらに表示",
+}
+
 # 从环境变量读取配置
 USER_AGENT = os.getenv(
     "LINK_CRAWLER_USER_AGENT",
     "TwoHandsLinkCrawler/1.0 (+https://auctions.yahoo.co.jp/robots.txt)",
 )
 REQUEST_TIMEOUT = float(os.getenv("LINK_CRAWLER_TIMEOUT", "30"))
-MAX_PAGES = int(os.getenv("LINK_CRAWLER_MAX_PAGES", "100"))
+MAX_PAGES = int(os.getenv("LINK_CRAWLER_MAX_PAGES", "20"))  # 降低默认值
 MAX_DEPTH = int(os.getenv("LINK_CRAWLER_MAX_DEPTH", "5"))
-REQUEST_INTERVAL = float(os.getenv("LINK_CRAWLER_REQUEST_INTERVAL", "0.5"))
-MAX_LINKS_PER_RUN = int(os.getenv("LINK_CRAWLER_MAX_LINKS_PER_RUN", "5000"))
-GSI_QUERY_PAGE_SIZE = int(os.getenv("LINK_CRAWLER_GSI_PAGE_SIZE", "100"))
+REQUEST_INTERVAL = float(os.getenv("LINK_CRAWLER_REQUEST_INTERVAL", "0.8"))  # 提高间隔
+MAX_LINKS_PER_RUN = int(os.getenv("LINK_CRAWLER_MAX_LINKS_PER_RUN", "1000"))  # 降低默认值
+GSI_QUERY_PAGE_SIZE = int(os.getenv("LINK_CRAWLER_GSI_PAGE_SIZE", "25"))  # 降低分页大小
 MAX_ATTEMPTS = int(os.getenv("LINK_CRAWLER_MAX_ATTEMPTS", "3"))
 QUEUE_INDEX_NAME = "queue_status-queue_priority-index"
-
 
 # ============================================================
 # URL 处理函数
@@ -75,8 +97,65 @@ def is_allowed_url(url: str) -> bool:
     return not any(path == rule.rstrip("/") or path.startswith(rule) for rule in DISALLOW)
 
 
+def canonicalize_category_url(url: str) -> str | None:
+    """
+    只保留真正的 Yahoo 拍卖 list3 目录页。
+    拒绝 leaf、catlist、带 query 的筛选列表页。
+    返回归一化后的标准 URL（https://auctions.yahoo.co.jp/list3/数字-category.html）。
+    """
+    try:
+        parsed = urlsplit(url)
+    except (TypeError, ValueError):
+        return None
+
+    if parsed.scheme not in {"http", "https"}:
+        return None
+
+    if parsed.hostname != ALLOWED_HOST:
+        return None
+
+    path = parsed.path or "/"
+
+    if not path.startswith(ALLOWED_LIST3_PREFIX):
+        return None
+
+    # 明确拒绝无用页
+    if path.endswith("-catlist.html") or "-category-leaf.html" in path:
+        return None
+
+    # 拒绝筛选、排序、翻页等 query，避免同一目录产生大量重复 URL
+    if parsed.query:
+        return None
+
+    match = CATEGORY_PAGE_PATTERN.match(path)
+    if not match:
+        return None
+
+    return urlunsplit((
+        "https",
+        ALLOWED_HOST,
+        path,
+        "",
+        "",
+    ))
+
+
+def is_list3_page(url: str) -> bool:
+    """判断是否为真正的 list3 目录页（非 leaf、非 catlist、无 query）。"""
+    return canonicalize_category_url(url) is not None
+
+
+def extract_category_id(url: str) -> str | None:
+    """从 Yahoo ``/list3/.../<数字>-category.html`` URL 提取品类 ID。"""
+    canonical = canonicalize_category_url(url)
+    if not canonical:
+        return None
+    match = CATEGORY_PAGE_PATTERN.match(urlsplit(canonical).path)
+    return match.group(1) if match else None
+
+
 def normalize_url(href: str, source_url: str) -> str | None:
-    """将相对链接转成绝对链接，移除 fragment，并拒绝站外及禁抓路径。"""
+    """将相对链接转成绝对链接，移除 fragment，归一化并过滤。"""
     if not href or href.startswith(("#", "javascript:", "mailto:", "tel:", "data:")):
         return None
     absolute = urljoin(source_url, href.strip())
@@ -87,124 +166,78 @@ def normalize_url(href: str, source_url: str) -> str | None:
             parsed.netloc.lower(),
             parsed.path or "/",
             parsed.query,
-            ""
+            "",
         ))
     except ValueError:
         return None
-    return normalized if is_allowed_url(normalized) else None
-
-
-# ============================================================
-# 页面类型判断
-# ============================================================
-
-def is_list3_page(url: str) -> bool:
-    """
-    判断是否为 /list3/* 目录页。
-    
-    当前仅允许：
-    - https://auctions.yahoo.co.jp/list3/*
-    """
-    if not url:
-        return False
-    
-    try:
-        parsed = urlsplit(url)
-    except (TypeError, ValueError):
-        return False
-    
-    if parsed.scheme not in {"http", "https"}:
-        return False
-    
-    if parsed.hostname != ALLOWED_HOST:
-        return False
-    
-    path = parsed.path or "/"
-    
-    return path.startswith(ALLOWED_LIST3_PREFIX)
-
-
-def extract_category_id(url: str) -> str | None:
-    """从 Yahoo ``/list3/.../<数字>-category.html`` URL 提取品类 ID。"""
-    if not is_list3_page(url):
+    if not is_allowed_url(normalized):
         return None
-    match = CATEGORY_ID_PATTERN.search(urlsplit(url).path)
-    return match.group(1) if match else None
+    return canonicalize_category_url(normalized)
 
 
 def should_crawl(url: str) -> bool:
-    """判断一个 URL 是否应该被递归爬取：仅允许 /list3/*。"""
-    if not url:
-        return False
-    
-    if not is_allowed_url(url):
-        return False
-    
-    return is_list3_page(url)
+    """判断一个 URL 是否应该被递归爬取：仅允许 /list3/数字-category.html。"""
+    return canonicalize_category_url(url) is not None
 
 
 # ============================================================
 # 链接提取
 # ============================================================
 
+def clean_anchor_text(text: str) -> str:
+    """清洗 anchor 文本，去除多余空白。"""
+    return " ".join((text or "").split())[:500]
+
+
 def extract_links_from_page(html: str, source_url: str, depth: int) -> list[dict]:
     """
     从 HTML 中提取 /list3/* 目录链接。
     
+    过滤规则：
+    - 仅保留 /list3/数字-category.html 格式
+    - 拒绝空文本和无效 anchor
+    - 去重（基于归一化 URL）
+    
     返回:
-        - list3_links: /list3/* 目录链接，既用于保存，也用于递归
+        - list3_links: /list3/* 目录链接列表
     """
     list3_links = []
     seen = set()
-    
+
     if not html:
         return list3_links
-    
+
     soup = BeautifulSoup(html, "html.parser")
-    
+
     for anchor in soup.select("a[href]"):
         url = normalize_url(anchor.get("href"), source_url)
-        
+
         if not url or url in seen:
             continue
-        
-        seen.add(url)
-        
-        if not is_list3_page(url):
+
+        anchor_text = clean_anchor_text(anchor.get_text(" ", strip=True))
+
+        # 过滤无效 anchor
+        if anchor_text in BAD_ANCHOR_TEXTS:
             continue
-        
-        anchor_text = " ".join(anchor.get_text(" ", strip=True).split())
-        
+
+        category_id = extract_category_id(url)
+        if not category_id:
+            continue
+
+        seen.add(url)
+
         list3_links.append({
             "url": url,
-            "category_id": extract_category_id(url) or "",
-            "category_name": anchor_text[:500],
-            "anchor_text": anchor_text[:500],
+            "category_id": category_id,
+            "category_name": anchor_text,
+            "anchor_text": anchor_text,
             "source_url": source_url,
             "depth": depth,
             "link_type": "list3_directory",
         })
-    
+
     return list3_links
-
-
-def extract_links(html: str, source_url: str, limit: int | None = None) -> list[dict]:
-    """兼容通用链接提取；目录采集主流程仍只使用 ``extract_links_from_page``。"""
-    links, seen = [], set()
-    soup = BeautifulSoup(html or "", "html.parser")
-    for anchor in soup.select("a[href]"):
-        url = normalize_url(anchor.get("href"), source_url)
-        if not url or url in seen:
-            continue
-        seen.add(url)
-        links.append({
-            "url": url,
-            "anchor_text": " ".join(anchor.get_text(" ", strip=True).split())[:500],
-            "source_url": source_url,
-        })
-        if limit is not None and len(links) >= limit:
-            break
-    return links
 
 
 # ============================================================
@@ -216,191 +249,8 @@ def make_crawl_id(url: str) -> str:
     return hashlib.sha256(url.encode("utf-8")).hexdigest()
 
 
-def get_link_record(table, url: str) -> dict | None:
-    """从 DynamoDB 获取某个 URL 的记录。"""
-    crawl_id = make_crawl_id(url)
-
-    response = table.get_item(
-        Key={"crawl_id": crawl_id}
-    )
-
-    return response.get("Item")
-
-
-def is_url_already_crawled(table, url: str) -> bool:
-    """判断该 URL 是否已经被递归检索过。"""
-    item = get_link_record(table, url)
-
-    if not item:
-        return False
-
-    return bool(item.get("is_crawled"))
-
-
-def get_next_unvisited_url(table) -> str | None:
-    """
-    从 DynamoDB 中获取最久未爬取的 /list3/* 链接。
-    
-    查询条件：
-    - link_type = 'list3_directory'
-    - is_crawled = False 或 crawl_status = 'DISCOVERED'
-    - 按 first_seen_at 升序排列（最久远的优先）
-    
-    使用 GSI: link_type-first_seen_at-index
-    """
-    try:
-        exclusive_start_key = None
-        while True:
-            query_kwargs = {
-                "IndexName": "link_type-first_seen_at-index",
-                "KeyConditionExpression": "link_type = :link_type",
-                "FilterExpression": "is_crawled = :false_val OR crawl_status = :status",
-                "ExpressionAttributeValues": {
-                    ":link_type": "list3_directory",
-                    ":false_val": False,
-                    ":status": "DISCOVERED",
-                },
-                "ScanIndexForward": True,  # 升序，最旧的在前
-                # Limit 在 FilterExpression 之前生效，因此按批读取并继续翻页。
-                "Limit": GSI_QUERY_PAGE_SIZE,
-            }
-            if exclusive_start_key:
-                query_kwargs["ExclusiveStartKey"] = exclusive_start_key
-
-            response = table.query(**query_kwargs)
-            items = response.get("Items", [])
-            if items:
-                return items[0].get("url")
-
-            exclusive_start_key = response.get("LastEvaluatedKey")
-            if not exclusive_start_key:
-                return None
-        
-    except Exception as e:
-        logger.warning(f"查询 GSI 失败，可能索引不存在: {e}")
-        return None
-
-
-def is_table_empty(table) -> bool:
-    """
-    检查表是否为空（没有任何 /list3/* 记录）。
-    """
-    try:
-        response = table.query(
-            IndexName="link_type-first_seen_at-index",
-            KeyConditionExpression="link_type = :link_type",
-            ExpressionAttributeValues={
-                ":link_type": "list3_directory",
-            },
-            Limit=1,
-        )
-        
-        items = response.get("Items", [])
-        return len(items) == 0
-        
-    except Exception as e:
-        logger.warning(f"检查表是否为空失败: {e}")
-        # 如果 GSI 不存在或查询失败，回退到扫描
-        try:
-            response = table.scan(Limit=1)
-            items = response.get("Items", [])
-            return len(items) == 0
-        except Exception:
-            return True
-
-
-def save_discovered_link(table, link: dict) -> dict:
-    """
-    保存发现的 /list3/* 目录链接。
-
-    注意：
-    - 不覆盖已经爬过的状态
-    - 只在第一次发现时写入 first_seen_at
-    - 每次发现都更新 last_seen_at
-    """
-    now = datetime.now(timezone.utc).isoformat()
-    url = link["url"]
-    crawl_id = make_crawl_id(url)
-
-    try:
-        response = table.update_item(
-            Key={"crawl_id": crawl_id},
-            UpdateExpression="""
-                SET
-                    #url = :url,
-                    category_id = :category_id,
-                    category_name = :category_name,
-                    anchor_text = if_not_exists(anchor_text, :anchor_text),
-                    source_url = if_not_exists(source_url, :source_url),
-                    #depth = if_not_exists(#depth, :depth),
-                    link_type = :link_type,
-                    crawl_status = if_not_exists(crawl_status, :status),
-                    is_crawled = if_not_exists(is_crawled, :false_value),
-                    is_terminal = if_not_exists(is_terminal, :false_value),
-                    is_exhausted = if_not_exists(is_exhausted, :false_value),
-                    first_seen_at = if_not_exists(first_seen_at, :now),
-                    last_seen_at = :now,
-                    updated_at = :now
-                ADD discovered_count :one
-            """,
-            ExpressionAttributeNames={
-                "#url": "url",
-                "#depth": "depth",
-            },
-            ExpressionAttributeValues={
-                ":url": url,
-                ":category_id": link.get("category_id") or extract_category_id(url) or "",
-                ":category_name": link.get("category_name") or link.get("anchor_text", ""),
-                ":anchor_text": link.get("anchor_text", ""),
-                ":source_url": link.get("source_url", ""),
-                ":depth": link.get("depth", 0),
-                ":link_type": link.get("link_type", "list3_directory"),
-                ":status": "DISCOVERED",
-                ":false_value": False,
-                ":now": now,
-                ":one": 1,
-            },
-            ReturnValues="ALL_OLD",
-        )
-        previous_record = response.get("Attributes")
-        return {
-            "is_new": not bool(previous_record),
-            "previous_record": previous_record,
-        }
-    except Exception as e:
-        logger.error(f"保存链接失败 {url}: {e}")
-        return {"is_new": False, "previous_record": None, "save_failed": True}
-
-
-def count_remaining_unvisited(table) -> int:
-    """分页统计 GSI 中全部尚未爬取的目录。"""
-    remaining = 0
-    exclusive_start_key = None
-
-    while True:
-        query_kwargs = {
-            "IndexName": "link_type-first_seen_at-index",
-            "KeyConditionExpression": "link_type = :link_type",
-            "FilterExpression": "is_crawled = :false_val OR crawl_status = :status",
-            "ExpressionAttributeValues": {
-                ":link_type": "list3_directory",
-                ":false_val": False,
-                ":status": "DISCOVERED",
-            },
-            "Select": "COUNT",
-        }
-        if exclusive_start_key:
-            query_kwargs["ExclusiveStartKey"] = exclusive_start_key
-
-        response = table.query(**query_kwargs)
-        remaining += response.get("Count", 0)
-        exclusive_start_key = response.get("LastEvaluatedKey")
-        if not exclusive_start_key:
-            return remaining
-
-
 def utc_now() -> str:
-    """返回固定格式的 UTC 时间，避免 ``+00:00`` 与 ``Z`` 混用。"""
+    """返回固定格式的 UTC 时间。"""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
@@ -409,12 +259,28 @@ def make_queue_priority(depth: int, created_at: str, crawl_id: str) -> str:
     return f"{int(depth):05d}#{created_at}#{crawl_id}"
 
 
+def get_link_record(table, url: str) -> dict | None:
+    """从 DynamoDB 获取某个 URL 的记录。"""
+    crawl_id = make_crawl_id(url)
+    response = table.get_item(Key={"crawl_id": crawl_id})
+    return response.get("Item")
+
+
+def is_url_already_crawled(table, url: str) -> bool:
+    """判断该 URL 是否已经被递归检索过。"""
+    item = get_link_record(table, url)
+    if not item:
+        return False
+    return bool(item.get("is_crawled"))
+
+
 def enqueue_discovered_link(table, link: dict, root_url: str) -> dict:
     """将发现的目录幂等写入 DynamoDB 队列；已有状态不会被重置。"""
     url = link["url"]
     crawl_id = make_crawl_id(url)
     now = utc_now()
     depth = int(link.get("depth", 0))
+
     response = table.update_item(
         Key={"crawl_id": crawl_id},
         UpdateExpression="""
@@ -430,21 +296,32 @@ def enqueue_discovered_link(table, link: dict, root_url: str) -> dict:
                 last_seen_at = :now,
                 updated_at = :now,
                 attempt_count = if_not_exists(attempt_count, :zero),
-                category_id = :category_id,
-                category_name = :category_name,
-                anchor_text = :anchor_text,
-                source_url = :source_url
+                is_crawled = if_not_exists(is_crawled, :false_value),
+                is_terminal = if_not_exists(is_terminal, :false_value),
+                is_exhausted = if_not_exists(is_exhausted, :false_value),
+                category_id = if_not_exists(category_id, :category_id),
+                category_name = if_not_exists(category_name, :category_name),
+                anchor_text = if_not_exists(anchor_text, :anchor_text),
+                source_url = if_not_exists(source_url, :source_url),
+                crawl_status = if_not_exists(crawl_status, :discovered)
         """,
         ExpressionAttributeNames={"#url": "url", "#depth": "depth"},
         ExpressionAttributeValues={
-            ":url": url, ":link_type": "list3_directory", ":queued": "QUEUED",
-            ":priority": make_queue_priority(depth, now, crawl_id), ":depth": depth,
-            ":parent_url": link.get("source_url", ""), ":root_url": root_url,
-            ":now": now, ":zero": 0,
+            ":url": url,
+            ":link_type": "list3_directory",
+            ":queued": "QUEUED",
+            ":priority": make_queue_priority(depth, now, crawl_id),
+            ":depth": depth,
+            ":parent_url": link.get("source_url", ""),
+            ":root_url": root_url,
+            ":now": now,
+            ":zero": 0,
+            ":false_value": False,
             ":category_id": link.get("category_id") or extract_category_id(url) or "",
             ":category_name": link.get("category_name") or link.get("anchor_text", ""),
             ":anchor_text": link.get("anchor_text", ""),
             ":source_url": link.get("source_url", ""),
+            ":discovered": "DISCOVERED",
         },
         ReturnValues="ALL_OLD",
     )
@@ -468,7 +345,7 @@ def get_queued_items(table, limit: int) -> list[dict]:
             "KeyConditionExpression": "queue_status = :queued",
             "ExpressionAttributeValues": {":queued": "QUEUED"},
             "ScanIndexForward": True,
-            "Limit": limit - len(items),
+            "Limit": min(limit - len(items), GSI_QUERY_PAGE_SIZE),
         }
         if exclusive_start_key:
             kwargs["ExclusiveStartKey"] = exclusive_start_key
@@ -486,11 +363,18 @@ def claim_queue_item(table, crawl_id: str) -> dict | None:
     try:
         response = table.update_item(
             Key={"crawl_id": crawl_id},
-            UpdateExpression=("SET queue_status = :processing, claimed_at = :now, "
-                              "updated_at = :now ADD attempt_count :one"),
+            UpdateExpression=(
+                "SET queue_status = :processing, "
+                "claimed_at = :now, "
+                "updated_at = :now "
+                "ADD attempt_count :one"
+            ),
             ConditionExpression="queue_status = :queued",
             ExpressionAttributeValues={
-                ":queued": "QUEUED", ":processing": "PROCESSING", ":now": now, ":one": 1,
+                ":queued": "QUEUED",
+                ":processing": "PROCESSING",
+                ":now": now,
+                ":one": 1,
             },
             ReturnValues="ALL_NEW",
         )
@@ -503,17 +387,37 @@ def claim_queue_item(table, crawl_id: str) -> dict | None:
 
 def mark_queue_done(table, crawl_id: str, child_count: int,
                     new_child_count: int, is_terminal: bool) -> dict | None:
-    """仅将当前 PROCESSING 任务标记为 DONE。"""
+    """
+    将当前 PROCESSING 任务标记为 DONE。
+    同时同步更新旧字段：crawl_status, is_crawled, is_terminal, is_exhausted。
+    """
     now = utc_now()
+    crawl_status = "TERMINAL" if is_terminal else "CRAWLED"
+
     response = table.update_item(
         Key={"crawl_id": crawl_id},
-        UpdateExpression=("SET queue_status = :done, child_count = :child_count, "
-                          "new_child_count = :new_child_count, is_terminal = :is_terminal, "
-                          "done_at = :now, updated_at = :now REMOVE last_error"),
+        UpdateExpression=(
+            "SET queue_status = :done, "
+            "crawl_status = :crawl_status, "
+            "is_crawled = :true_value, "
+            "is_terminal = :is_terminal, "
+            "is_exhausted = :is_terminal, "
+            "child_count = :child_count, "
+            "new_child_count = :new_child_count, "
+            "done_at = :now, "
+            "updated_at = :now "
+            "REMOVE last_error"
+        ),
         ConditionExpression="queue_status = :processing",
         ExpressionAttributeValues={
-            ":processing": "PROCESSING", ":done": "DONE", ":child_count": child_count,
-            ":new_child_count": new_child_count, ":is_terminal": is_terminal, ":now": now,
+            ":processing": "PROCESSING",
+            ":done": "DONE",
+            ":crawl_status": crawl_status,
+            ":true_value": True,
+            ":child_count": child_count,
+            ":new_child_count": new_child_count,
+            ":is_terminal": is_terminal,
+            ":now": now,
         },
         ReturnValues="ALL_NEW",
     )
@@ -526,12 +430,18 @@ def mark_queue_failed(table, item: dict, error_message: str) -> dict | None:
     status = "QUEUED" if int(item.get("attempt_count", 0)) < MAX_ATTEMPTS else "ERROR"
     response = table.update_item(
         Key={"crawl_id": item["crawl_id"]},
-        UpdateExpression=("SET queue_status = :status, last_error = :error, "
-                          "last_error_at = :now, updated_at = :now"),
+        UpdateExpression=(
+            "SET queue_status = :status, "
+            "last_error = :error, "
+            "last_error_at = :now, "
+            "updated_at = :now"
+        ),
         ConditionExpression="queue_status = :processing",
         ExpressionAttributeValues={
-            ":processing": "PROCESSING", ":status": status,
-            ":error": str(error_message)[:1000], ":now": now,
+            ":processing": "PROCESSING",
+            ":status": status,
+            ":error": str(error_message)[:1000],
+            ":now": now,
         },
         ReturnValues="ALL_NEW",
     )
@@ -568,27 +478,6 @@ def count_queue_status(table, status: str) -> int:
             return total
 
 
-def _http_session():
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": USER_AGENT,
-        "Accept-Language": "ja,en;q=0.8",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    })
-    return session
-
-
-def seed_from_homepage(table) -> int:
-    """队列为空时从 Yahoo 首页发现并持久化第一层目录。"""
-    response = _http_session().get(DEFAULT_START_URL, timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
-    added = 0
-    for link in extract_links_from_page(response.text, DEFAULT_START_URL, depth=0):
-        result = enqueue_discovered_link(table, link, root_url=link["url"])
-        added += int(result["is_new"])
-    return added
-
-
 def recover_stale_processing_items(table, stale_seconds: int = 900) -> int:
     """简易扫描恢复超时任务；生产环境建议使用 queue_status-claimed_at-index。"""
     cutoff = datetime.fromtimestamp(time.time() - stale_seconds, timezone.utc).strftime(
@@ -611,8 +500,10 @@ def recover_stale_processing_items(table, stale_seconds: int = 900) -> int:
                     UpdateExpression="SET queue_status = :queued, updated_at = :now",
                     ConditionExpression="queue_status = :processing AND claimed_at < :cutoff",
                     ExpressionAttributeValues={
-                        ":queued": "QUEUED", ":processing": "PROCESSING",
-                        ":cutoff": cutoff, ":now": utc_now(),
+                        ":queued": "QUEUED",
+                        ":processing": "PROCESSING",
+                        ":cutoff": cutoff,
+                        ":now": utc_now(),
                     },
                 )
                 recovered += 1
@@ -622,6 +513,35 @@ def recover_stale_processing_items(table, stale_seconds: int = 900) -> int:
         exclusive_start_key = response.get("LastEvaluatedKey")
         if not exclusive_start_key:
             return recovered
+
+
+# ============================================================
+# HTTP 会话
+# ============================================================
+
+def _http_session():
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": USER_AGENT,
+        "Accept-Language": "ja,en;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    })
+    return session
+
+
+# ============================================================
+# 播种与队列消费
+# ============================================================
+
+def seed_from_homepage(table) -> int:
+    """队列为空时从 Yahoo 首页发现并持久化第一层目录。"""
+    response = _http_session().get(DEFAULT_START_URL, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+    added = 0
+    for link in extract_links_from_page(response.text, DEFAULT_START_URL, depth=0):
+        result = enqueue_discovered_link(table, link, root_url=link["url"])
+        added += int(result["is_new"])
+    return added
 
 
 def crawl_queue(table, max_pages: int | None = None, max_depth: int | None = None,
@@ -693,30 +613,54 @@ def crawl_queue(table, max_pages: int | None = None, max_depth: int | None = Non
     }
 
 
+# ============================================================
+# Lambda 入口
+# ============================================================
+
 def lambda_handler(event, context):
-    """EventBridge 入口：恢复、播种并消费 DynamoDB 持久化目录队列。"""
+    """
+    EventBridge 入口：恢复、播种并消费 DynamoDB 持久化目录队列。
+    
+    可选 event 参数：
+    - max_pages: 本次最大爬取页数
+    - max_depth: 最大爬取深度
+    - max_links_per_run: 本次最大处理链接数
+    - include_counts: 是否返回全表统计（默认 false，节省 DynamoDB 查询成本）
+    """
     event = event if isinstance(event, dict) else {}
     table = boto3.resource("dynamodb").Table(os.environ["LINK_CRAWLER_TABLE_NAME"])
-    recover_stale_processing_items(table)
+
+    # 恢复超时任务
+    recovered = recover_stale_processing_items(table)
+
+    # 播种：队列为空时从首页发现
     seeded = 0
     if not has_queued_items(table):
         seeded = seed_from_homepage(table)
+
+    # 消费队列
     result = crawl_queue(
         table,
         max_pages=event.get("max_pages"),
         max_depth=event.get("max_depth"),
         max_links_per_run=event.get("max_links_per_run"),
     )
-    queue = {
-        "queued": count_queue_status(table, "QUEUED"),
-        "processing": count_queue_status(table, "PROCESSING"),
-        "done": count_queue_status(table, "DONE"),
-        "error": count_queue_status(table, "ERROR"),
-    }
-    return {
+
+    response = {
         "statusCode": 200,
         "message": "队列式 /list3/* 目录采集完成",
         "seeded": seeded,
+        "recovered": recovered,
         "metrics": result,
-        "queue": queue,
     }
+
+    # 仅手动调试时才统计全表（避免每次 Lambda 执行昂贵的 COUNT 查询）
+    if event.get("include_counts"):
+        response["queue"] = {
+            "queued": count_queue_status(table, "QUEUED"),
+            "processing": count_queue_status(table, "PROCESSING"),
+            "done": count_queue_status(table, "DONE"),
+            "error": count_queue_status(table, "ERROR"),
+        }
+
+    return response
