@@ -223,41 +223,44 @@ def save_discovered_link(table, link: dict) -> None:
     url = link["url"]
     crawl_id = make_crawl_id(url)
 
-    table.update_item(
-        Key={"crawl_id": crawl_id},
-        UpdateExpression="""
-            SET
-                #url = :url,
-                anchor_text = if_not_exists(anchor_text, :anchor_text),
-                source_url = if_not_exists(source_url, :source_url),
-                depth = if_not_exists(depth, :depth),
-                link_type = :link_type,
-                crawl_status = if_not_exists(crawl_status, :status),
-                is_crawled = if_not_exists(is_crawled, :false_value),
-                is_terminal = if_not_exists(is_terminal, :false_value),
-                is_exhausted = if_not_exists(is_exhausted, :false_value),
-                first_seen_at = if_not_exists(first_seen_at, :now),
-                last_seen_at = :now,
-                updated_at = :now
-            ADD discovered_count :one
-        """,
-        ExpressionAttributeNames={
-            "#url": "url",
-        },
-        ExpressionAttributeValues={
-            ":url": url,
-            ":anchor_text": link.get("anchor_text", ""),
-            ":source_url": link.get("source_url", ""),
-            ":depth": link.get("depth", 0),
-            ":link_type": link.get("link_type", "list3_directory"),
-            ":status": "DISCOVERED",
-            ":false_value": False,
-            ":now": now,
-            ":one": 1,
-        },
-    )
-
-
+    try:
+        table.update_item(
+            Key={"crawl_id": crawl_id},
+            UpdateExpression="""
+                SET
+                    #url = :url,
+                    anchor_text = if_not_exists(anchor_text, :anchor_text),
+                    source_url = if_not_exists(source_url, :source_url),
+                    #depth = if_not_exists(#depth, :depth),
+                    link_type = :link_type,
+                    crawl_status = if_not_exists(crawl_status, :status),
+                    is_crawled = if_not_exists(is_crawled, :false_value),
+                    is_terminal = if_not_exists(is_terminal, :false_value),
+                    is_exhausted = if_not_exists(is_exhausted, :false_value),
+                    first_seen_at = if_not_exists(first_seen_at, :now),
+                    last_seen_at = :now,
+                    updated_at = :now
+                ADD discovered_count :one
+            """,
+            ExpressionAttributeNames={
+                "#url": "url",
+                "#depth": "depth",
+            },
+            ExpressionAttributeValues={
+                ":url": url,
+                ":anchor_text": link.get("anchor_text", ""),
+                ":source_url": link.get("source_url", ""),
+                ":depth": link.get("depth", 0),
+                ":link_type": link.get("link_type", "list3_directory"),
+                ":status": "DISCOVERED",
+                ":false_value": False,
+                ":now": now,
+                ":one": 1,
+            },
+        )
+    except Exception as e:
+        logger.error(f"保存链接失败 {url}: {e}")
+        # 不抛出异常，避免中断整个爬取流程
 def mark_link_crawled(
     table,
     url: str,
