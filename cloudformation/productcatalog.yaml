@@ -440,56 +440,56 @@ Resources:
         - Key: Environment
           Value: !Ref Environment
 
-    YahooAuctionLinksTable:
-      Type: AWS::DynamoDB::Table
-      Condition: DeployLinkCrawlerCondition
-      Properties:
-        TableName: !Sub "YahooAuctionLinks-${Environment}"
-        BillingMode: PAY_PER_REQUEST
-        AttributeDefinitions:
-          - AttributeName: crawl_id
-            AttributeType: S
-          - AttributeName: source_url
-            AttributeType: S
-          - AttributeName: crawled_at
-            AttributeType: S
-          - AttributeName: link_type           # 新增
-            AttributeType: S                   # 新增
-          - AttributeName: first_seen_at       # 新增
-            AttributeType: S                   # 新增
-        KeySchema:
-          - AttributeName: crawl_id
-            KeyType: HASH
-        GlobalSecondaryIndexes:
-          - IndexName: SourceUrlIndex
-            KeySchema:
-              - AttributeName: source_url
-                KeyType: HASH
-              - AttributeName: crawled_at
-                KeyType: RANGE
-            Projection:
-              ProjectionType: ALL
-          - IndexName: link_type-first_seen_at-index    # 新增 GSI
-            KeySchema:                                  # 新增
-              - AttributeName: link_type                # 新增
-                KeyType: HASH                           # 新增
-              - AttributeName: first_seen_at            # 新增
-                KeyType: RANGE                          # 新增
-            Projection:                                 # 新增
-              ProjectionType: INCLUDE                   # 新增
-              NonKeyAttributes:                         # 新增
-                - url                                   # 新增
-                - is_crawled                            # 新增
-                - crawl_status                          # 新增
-        PointInTimeRecoverySpecification:
-          PointInTimeRecoveryEnabled: true
-        SSESpecification:
-          SSEEnabled: true
-        Tags:
-          - Key: Application
-            Value: YahooAuctionLinkCrawler
-          - Key: Environment
-            Value: !Ref Environment
+  YahooAuctionLinksTable:
+    Type: AWS::DynamoDB::Table
+    Condition: DeployLinkCrawlerCondition
+    Properties:
+      TableName: !Sub "YahooAuctionLinks-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: crawl_id
+          AttributeType: S
+        - AttributeName: source_url
+          AttributeType: S
+        - AttributeName: crawled_at
+          AttributeType: S
+        - AttributeName: link_type
+          AttributeType: S
+        - AttributeName: first_seen_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: crawl_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: SourceUrlIndex
+          KeySchema:
+            - AttributeName: source_url
+              KeyType: HASH
+            - AttributeName: crawled_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: link_type-first_seen_at-index
+          KeySchema:
+            - AttributeName: link_type
+              KeyType: HASH
+            - AttributeName: first_seen_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes:
+              - url
+              - is_crawled
+              - crawl_status
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Application
+          Value: YahooAuctionLinkCrawler
+        - Key: Environment
+          Value: !Ref Environment
 
   YahooAuctionClosedTable:
     Type: AWS::DynamoDB::Table
@@ -1037,7 +1037,7 @@ Resources:
       - YahooAuctionLinkCrawlerRole
     Properties:
       FunctionName: !Sub "YahooAuctionLinkCrawler-${Environment}"
-      Description: Yahoo 拍卖递归链接采集器 (增量版，广度优先爬取所有列表页)
+      Description: Yahoo 拍卖递归链接采集器 (增量版，智能起始点选择)
       Runtime: python3.12
       Architectures:
         - arm64
@@ -1051,7 +1051,6 @@ Resources:
       Environment:
         Variables:
           LINK_CRAWLER_TABLE_NAME: !Ref YahooAuctionLinksTable
-          LINK_CRAWLER_START_URL: "https://auctions.yahoo.co.jp/"
           LINK_CRAWLER_MAX_PAGES: !Ref LinkCrawlerMaxPages
           LINK_CRAWLER_MAX_DEPTH: !Ref LinkCrawlerMaxDepth
           LINK_CRAWLER_MAX_LINKS_PER_RUN: !Ref LinkCrawlerMaxLinksPerRun
