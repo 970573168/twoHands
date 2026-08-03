@@ -3,8 +3,7 @@ AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   电子产品目录采集器 + AI API Secret + Yahoo Auction 抓取器 + 分析工作流 + 目录定期扫描器
   支持多 AI 模式切换（Gemini / 豆包 / OpenAI）
-  Secret 已存在时不会重复创建
-  API Key 统一通过 Secrets Manager 管理，不传入 Lambda 环境变量
+  包含递归链接爬虫
 
 Parameters:
   # ============ 通用参数 ============
@@ -35,94 +34,62 @@ Parameters:
       - gemini
       - doubao
       - openai
-    Description: AI 模式选择（gemini / doubao / openai）
+    Description: AI 模式选择
 
   # ============ Gemini 配置 ============
   GeminiApiKey:
     Type: String
     NoEcho: true
     Default: ""
-    Description: Gemini API Key（用于创建 Secret，留空则不创建）
-
+    Description: Gemini API Key
   GeminiModel:
     Type: String
     Default: "gemini-2.0-flash"
-    Description: Gemini 模型名称
-
   GeminiUrl:
     Type: String
     Default: "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
-    Description: Gemini API URL
-
   GeminiTimeout:
     Type: Number
     Default: 60
-    MinValue: 10
-    MaxValue: 300
-
   GeminiMaxTokens:
     Type: Number
     Default: 12000
-    MinValue: 100
-    MaxValue: 1000000
 
   # ============ 豆包配置 ============
   DoubaoApiKey:
     Type: String
     NoEcho: true
     Default: ""
-    Description: 豆包 API Key（用于创建 Secret，留空则不创建）
-
   DoubaoModel:
     Type: String
     Default: "qwen-plus-character"
-    Description: 豆包模型名称
-
   DoubaoUrl:
     Type: String
     Default: "https://ws-8lxmxlbemcgcus5u.ap-northeast-1.maas.aliyuncs.com/compatible-mode/v1/chat/completions"
-    Description: 豆包 API URL
-
   DoubaoTimeout:
     Type: Number
     Default: 300
-    MinValue: 10
-    MaxValue: 300
-
   DoubaoMaxTokens:
     Type: Number
     Default: 12000
-    MinValue: 100
-    MaxValue: 1000000
 
   # ============ OpenAI 配置 ============
   OpenaiApiKey:
     Type: String
     NoEcho: true
     Default: ""
-    Description: OpenAI API Key（用于创建 Secret，留空则不创建）
-
   OpenaiModel:
     Type: String
     Default: "gpt-4o-mini"
-    Description: OpenAI 模型名称
-
   OpenaiUrl:
     Type: String
     Default: "https://api.openai.com/v1/chat/completions"
-    Description: OpenAI API URL
-
   OpenaiTimeout:
     Type: Number
     Default: 60
-    MinValue: 10
-    MaxValue: 300
-
   OpenaiMaxTokens:
     Type: Number
     Default: 12000
-    MinValue: 100
-    MaxValue: 1000000
 
   # ============ 故障切换配置 ============
   AiFailoverCooldown:
@@ -130,322 +97,209 @@ Parameters:
     Default: 300
     MinValue: 60
     MaxValue: 3600
-    Description: AI 模式故障切换冷却时间（秒）
 
   # ============ 主应用参数 ============
   DeployMainApp:
     Type: String
     Default: "true"
-    AllowedValues:
-      - "true"
-      - "false"
-
+    AllowedValues: ["true", "false"]
   MaxCategoriesPerRun:
     Type: Number
     Default: 20
-    MinValue: 1
-    MaxValue: 100
-
   MaxBrandsPerCategory:
     Type: Number
     Default: 20
-    MinValue: 1
-    MaxValue: 100
-
   MaxModelsPerBrand:
     Type: Number
     Default: 50
-    MinValue: 1
-    MaxValue: 100
-
   MaxTotalTokens:
     Type: Number
     Default: 250000
-    MinValue: 10000
-    MaxValue: 1000000
-
   LambdaTimeoutBuffer:
     Type: Number
     Default: 30
-    MinValue: 10
-    MaxValue: 300
-
   ApiCallDelay:
     Type: Number
     Default: 1
-    MinValue: 0
-    MaxValue: 10
-
   CategoryLimit:
     Type: Number
     Default: 5
-    MinValue: 1
-    MaxValue: 20
-
   BrandLimit:
     Type: Number
     Default: 3
-    MinValue: 1
-    MaxValue: 10
-
   LogRetentionDays:
     Type: Number
     Default: 14
-    MinValue: 1
-    MaxValue: 3653
 
   # ============ Yahoo Auction 抓取器参数 ============
   DeployScraper:
     Type: String
     Default: "true"
-    AllowedValues:
-      - "true"
-      - "false"
-
+    AllowedValues: ["true", "false"]
   YahooAuctionMaxPages:
     Type: Number
     Default: 1
-    MinValue: 1
-    MaxValue: 10
-
   YahooAuctionRequestTimeout:
     Type: Number
     Default: 30
-    MinValue: 5
-    MaxValue: 120
-
   YahooAuctionDebugLogHtml:
     Type: String
     Default: "false"
-    AllowedValues:
-      - "true"
-      - "false"
-
+    AllowedValues: ["true", "false"]
   YahooAuctionItemsPerPage:
     Type: Number
     Default: 100
-    MinValue: 10
-    MaxValue: 100
 
-  # ============ 链接搜索爬虫参数 ============
+  # ============ 链接搜索爬虫参数 (递归版) ============
   DeployLinkCrawler:
     Type: String
     Default: "true"
-    AllowedValues:
-      - "true"
-      - "false"
+    AllowedValues: ["true", "false"]
     Description: 是否部署 Yahoo 拍卖链接采集器
 
   LinkCrawlerScheduleMinutes:
     Type: Number
-    Default: 30
-    MinValue: 1
+    Default: 60
+    MinValue: 5
     MaxValue: 1440
     Description: EventBridge 定时采集间隔（分钟）
 
-  LinkCrawlerMaxLinks:
+  LinkCrawlerMaxPages:
     Type: Number
-    Default: 500
+    Default: 100
     MinValue: 1
-    MaxValue: 5000
-    Description: 每次最多保存的链接数量
+    MaxValue: 500
+    Description: 递归爬取最大页面数
+
+  LinkCrawlerMaxDepth:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 10
+    Description: 递归爬取最大深度
+
+  LinkCrawlerMaxLinksPerRun:
+    Type: Number
+    Default: 5000
+    MinValue: 100
+    MaxValue: 20000
+    Description: 单次运行最大保存链接数
+
+  LinkCrawlerRequestInterval:
+    Type: Number
+    Default: 0.5
+    MinValue: 0.1
+    MaxValue: 5.0
+    Description: 请求间隔（秒）
+
+  LinkCrawlerEnableRecursive:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: 是否启用递归爬取
 
   # ============ Yahoo Auction Analyzer 参数 ============
   ModelParseBatchSize:
     Type: Number
     Default: 25
-    MinValue: 1
-    MaxValue: 1000
-
   ClosedParseBatchSize:
     Type: Number
     Default: 25
-    MinValue: 1
-    MaxValue: 1000
-
   MaxClosedPerModel:
     Type: Number
     Default: 100
-    MinValue: 10
-    MaxValue: 200
-
   DefaultSearchCount:
     Type: Number
     Default: 100
-    MinValue: 1
-    MaxValue: 1000
-
   MaxActiveItems:
     Type: Number
     Default: 100
-    MinValue: 1
-    MaxValue: 1000
-
   AiRequestTimeout:
     Type: Number
     Default: 300
-    MinValue: 30
-    MaxValue: 500
-
   AiMaxRetries:
     Type: Number
     Default: 3
-    MinValue: 1
-    MaxValue: 5
-
   RequestInterval:
     Type: Number
     Default: 1.0
-    MinValue: 0.1
-    MaxValue: 5.0
-
   ExpectedSellingFeeRate:
     Type: Number
     Default: 0.10
-    MinValue: 0
-    MaxValue: 1
-
   DefaultShippingCost:
     Type: Number
     Default: 1500
-    MinValue: 0
-    MaxValue: 10000
-
   DefaultRepairReserveRate:
     Type: Number
     Default: 0.05
-    MinValue: 0
-    MaxValue: 1
-
   MinComparableCount:
     Type: Number
     Default: 3
-    MinValue: 1
-    MaxValue: 10
-
   MaxPriceDeviation:
     Type: Number
     Default: 1.5
-    MinValue: 1
-    MaxValue: 5
-
   RiskReserveRate:
     Type: Number
     Default: 0.03
-    MinValue: 0
-    MaxValue: 1
-
   ActiveMaxRatio:
     Type: Number
     Default: 1.0
-    MinValue: 0
-    MaxValue: 1.0
-    Description: active 商品当前价相对于 closed 市场价的最高比例
-
   FinalCheckBeforeMinutes:
     Type: Number
     Default: 15
-    MinValue: 1
-    MaxValue: 60
-    Description: 在拍卖结束前多少分钟执行 BUY_CANDIDATE 最终复核
-
   FinalCheckBatchSize:
     Type: Number
     Default: 20
-    MinValue: 1
-    MaxValue: 100
-
   BuyMarginThreshold:
     Type: Number
     Default: 0.20
-    MinValue: 0.05
-    MaxValue: 0.50
-
   ReviewMarginThreshold:
     Type: Number
     Default: 0.10
-    MinValue: 0.05
-    MaxValue: 0.50
-
   HighConfidenceComparableCount:
     Type: Number
     Default: 10
-    MinValue: 5
-    MaxValue: 50
-
   MediumConfidenceComparableCount:
     Type: Number
     Default: 5
-    MinValue: 3
-    MaxValue: 20
-
   MinRoi:
     Type: Number
     Default: 0.15
-    MinValue: 0.05
-    MaxValue: 0.50
-
   DetailDescMaxChars:
     Type: Number
     Default: 3000
-    MinValue: 500
-    MaxValue: 10000
-
   LogAiRequestJson:
     Type: String
     Default: "false"
-    AllowedValues:
-      - "true"
-      - "false"
-    Description: 是否在 Analyzer 日志中打印发送给 AI 的完整 JSON（不包含 API Key）
-
+    AllowedValues: ["true", "false"]
   LogAiResponseJson:
     Type: String
     Default: "false"
-    AllowedValues:
-      - "true"
-      - "false"
-    Description: 是否在 Analyzer 日志中打印 AI 返回的完整 JSON
+    AllowedValues: ["true", "false"]
 
   # ============ Yahoo Auction 详情抓取参数 ============
   EnableDetailScrape:
     Type: String
     Default: "true"
-    AllowedValues:
-      - "true"
-      - "false"
-
+    AllowedValues: ["true", "false"]
   DetailRequestInterval:
     Type: Number
     Default: 0.3
-    MinValue: 0.1
-    MaxValue: 5.0
-
   DetailScrapeMaxItems:
     Type: Number
     Default: 30
-    MinValue: 1
-    MaxValue: 100
 
   # ============ Catalog Scanner 参数 ============
   DeployCatalogScanner:
     Type: String
     Default: "true"
-    AllowedValues:
-      - "true"
-      - "false"
-
+    AllowedValues: ["true", "false"]
   ProductCatalogDiscoveryIntervalMinutes:
     Type: Number
     Default: 5
-    MinValue: 1
-    MaxValue: 1440
-
   CatalogScannerMaxModels:
     Type: Number
     Default: 10
-    MinValue: 1
-    MaxValue: 100
 
 Conditions:
   CreateGeminiSecret: !Not [!Equals [!Ref GeminiApiKey, ""]]
@@ -461,7 +315,7 @@ Conditions:
 
 Resources:
   # ============================================
-  # AI API Secrets (由 CloudFormation 创建)
+  # AI API Secrets
   # ============================================
   
   GeminiApiSecret:
@@ -594,9 +448,22 @@ Resources:
       AttributeDefinitions:
         - AttributeName: crawl_id
           AttributeType: S
+        - AttributeName: source_url
+          AttributeType: S
+        - AttributeName: crawled_at
+          AttributeType: S
       KeySchema:
         - AttributeName: crawl_id
           KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: SourceUrlIndex
+          KeySchema:
+            - AttributeName: source_url
+              KeyType: HASH
+            - AttributeName: crawled_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
       PointInTimeRecoverySpecification:
         PointInTimeRecoveryEnabled: true
       SSESpecification:
@@ -876,7 +743,10 @@ Resources:
                 Action:
                   - dynamodb:PutItem
                   - dynamodb:BatchWriteItem
-                Resource: !GetAtt YahooAuctionLinksTable.Arn
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt YahooAuctionLinksTable.Arn
+                  - !Sub "${YahooAuctionLinksTable.Arn}/index/*"
               - Sid: WriteLogs
                 Effect: Allow
                 Action:
@@ -1134,6 +1004,10 @@ Resources:
         - Key: Environment
           Value: !Ref Environment
 
+  # ============================================================
+  # YahooAuctionLinkCrawler - 递归链接采集器
+  # ============================================================
+
   YahooAuctionLinkCrawler:
     Type: AWS::Lambda::Function
     Condition: DeployLinkCrawlerCondition
@@ -1142,13 +1016,13 @@ Resources:
       - YahooAuctionLinkCrawlerRole
     Properties:
       FunctionName: !Sub "YahooAuctionLinkCrawler-${Environment}"
-      Description: Yahoo 拍卖链接与锚文本定时采集器
+      Description: Yahoo 拍卖递归链接采集器 (广度优先爬取所有列表页)
       Runtime: python3.12
       Architectures:
         - arm64
       Handler: search_engine_crawler.lambda_handler
-      Timeout: 60
-      MemorySize: 256
+      Timeout: 300
+      MemorySize: 512
       Role: !GetAtt YahooAuctionLinkCrawlerRole.Arn
       Code:
         S3Bucket: !Ref LambdaCodeS3Bucket
@@ -1157,7 +1031,12 @@ Resources:
         Variables:
           LINK_CRAWLER_TABLE_NAME: !Ref YahooAuctionLinksTable
           LINK_CRAWLER_START_URL: "https://auctions.yahoo.co.jp/"
-          LINK_CRAWLER_MAX_LINKS: !Ref LinkCrawlerMaxLinks
+          LINK_CRAWLER_MAX_PAGES: !Ref LinkCrawlerMaxPages
+          LINK_CRAWLER_MAX_DEPTH: !Ref LinkCrawlerMaxDepth
+          LINK_CRAWLER_MAX_LINKS_PER_RUN: !Ref LinkCrawlerMaxLinksPerRun
+          LINK_CRAWLER_REQUEST_INTERVAL: !Ref LinkCrawlerRequestInterval
+          LINK_CRAWLER_ENABLE_RECURSIVE: !Ref LinkCrawlerEnableRecursive
+          LINK_CRAWLER_TIMEOUT: !Ref YahooAuctionRequestTimeout
       Tags:
         - Key: Application
           Value: YahooAuctionLinkCrawler
@@ -1169,7 +1048,7 @@ Resources:
     Condition: DeployLinkCrawlerCondition
     Properties:
       Name: !Sub "YahooAuctionLinkCrawler-Schedule-${Environment}"
-      Description: 定时触发 Yahoo 拍卖链接采集器
+      Description: 定时触发 Yahoo 拍卖递归链接采集器
       ScheduleExpression: !Sub "rate(${LinkCrawlerScheduleMinutes} minutes)"
       State: ENABLED
       Targets:
@@ -1184,6 +1063,10 @@ Resources:
       FunctionName: !Ref YahooAuctionLinkCrawler
       Principal: events.amazonaws.com
       SourceArn: !GetAtt YahooAuctionLinkCrawlerScheduleRule.Arn
+
+  # ============================================================
+  # 其他 Lambda 函数 (保持不变)
+  # ============================================================
 
   YahooAuctionFinalCheckFunction:
     Type: AWS::Lambda::Function
@@ -1404,7 +1287,7 @@ Outputs:
 
   YahooAuctionLinkCrawlerFunctionName:
     Condition: DeployLinkCrawlerCondition
-    Description: Yahoo 拍卖链接采集 Lambda
+    Description: Yahoo 拍卖递归链接采集 Lambda
     Value: !Ref YahooAuctionLinkCrawler
 
   AiTokenUsageTableName:
