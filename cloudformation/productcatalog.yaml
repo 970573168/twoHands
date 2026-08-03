@@ -1089,15 +1089,15 @@ Resources:
         - Key: Environment
           Value: !Ref Environment
 
-  # 定时器：Yahoo Auction Link Crawler - 默认每 5 分钟运行
+  # 定时器：Yahoo Auction Link Crawler - 默认关闭
   YahooAuctionLinkCrawlerScheduleRule:
     Type: AWS::Events::Rule
     Condition: DeployLinkCrawlerCondition
     Properties:
       Name: !Sub "YahooAuctionLinkCrawler-Schedule-${Environment}"
-      Description: 定时触发 Yahoo 拍卖递归链接采集器 (默认每 5 分钟运行)
+      Description: 定时触发 Yahoo 拍卖递归链接采集器 (默认关闭)
       ScheduleExpression: !Sub "rate(${LinkCrawlerScheduleMinutes} minutes)"
-      State: ENABLED
+      State: DISABLED
       Targets:
         - Arn: !GetAtt YahooAuctionLinkCrawler.Arn
           Id: YahooAuctionLinkCrawlerTarget
@@ -1152,15 +1152,15 @@ Resources:
         - Key: Environment
           Value: !Ref Environment
 
-  # 定时器：Yahoo Auction Final Check - 默认关闭
+  # 定时器：Yahoo Auction Final Check - 默认开启
   YahooAuctionFinalCheckScheduleRule:
     Type: AWS::Events::Rule
     Condition: DeployScraperCondition
     Properties:
       Name: !Sub "YahooAuctionFinalCheck-Schedule-${Environment}"
-      Description: 每分钟复核即将结束的 BUY_CANDIDATE (默认关闭)
+      Description: 每分钟复核即将结束的 BUY_CANDIDATE 并发送倒计时提醒 (默认开启)
       ScheduleExpression: rate(1 minute)
-      State: DISABLED
+      State: ENABLED
       Targets:
         - Arn: !GetAtt YahooAuctionFinalCheckFunction.Arn
           Id: YahooAuctionFinalCheckTarget

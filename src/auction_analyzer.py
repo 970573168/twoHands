@@ -695,6 +695,43 @@ sourceModelと同じ本体ならmatched=true。
 商品本体を特定できなければmodels=[]。
 他のフィールドは禁止。"""
 
+COUNTDOWN_ACTIVE_PARSE_PROMPT = """Yahoo!オークションの出品中商品タイトルから、価格比較に使える商品本体のブランドとモデルを抽出してください。
+入力:{items_json}
+
+次のJSONだけ返してください:
+{{
+"items":[
+{{
+"itemId":"123",
+"matched":true,
+"listingType":"MAIN_PRODUCT",
+"models":[
+{{"brand":"Apple","model":"iPhone 13"}}
+]
+}}
+]
+}}
+
+listingType:
+MAIN_PRODUCT=商品本体
+ACCESSORY=ケース/フィルム/充電器/ケーブル/バッテリー/互換品
+BOX_ONLY=箱のみ/元箱のみ/空箱
+PARTS=部品/修理用/部品取り
+RENTAL=レンタル/貸出
+BUNDLE=複数セット
+UNKNOWN=判断不能
+
+ルール:
+1. スマホ本体なら MAIN_PRODUCT。
+2. ブランドとモデルが明確に分かる場合だけ models に入れる。
+3. iPhone は Pro/Pro Max/Plus/mini/SE を区別してください。
+4. Android は Pixel/Galaxy/Xperia/AQUOS/OPPO/Xiaomi 等のモデル名を抽出してください。
+5. 容量、キャリア、色はこの簡易解析では不要です。
+6. ケース、フィルム、充電器、箱のみ、部品のみは MAIN_PRODUCT にしない。
+7. ジャンクや故障したスマホ本体は MAIN_PRODUCT としてよい。
+8. 型番が不明な場合は models=[]。
+9. JSONのみ返してください。"""
+
 CLOSED_PARSE_PROMPT = """Yahoo!オークションの終了商品を参照製品と比較してください。
 入力:{items_json}
 次のJSONだけ返してください:
@@ -819,6 +856,28 @@ def build_active_parse_prompt(items: List[Dict]) -> str:
         "items": items_data,
     }
     return ACTIVE_PARSE_PROMPT.replace(
+        "{items_json}",
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+    )
+
+
+def build_countdown_active_parse_prompt(items: List[Dict]) -> str:
+    """倒计时模式不依赖 sourceModel，直接从 active 标题抽取品牌和型号。"""
+    items_data = []
+    for item in items:
+        items_data.append({
+            "itemId": str(item.get("itemID", "")),
+            "title": str(item.get("title", ""))[:ACTIVE_TITLE_MAX],
+            "price": si(item.get("price", 0)),
+            "endTime": item.get("endTime", ""),
+        })
+
+    payload = {
+        "mode": "countdown_active_model_extract",
+        "category": "スマホ本体",
+        "items": items_data,
+    }
+    return COUNTDOWN_ACTIVE_PARSE_PROMPT.replace(
         "{items_json}",
         json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
     )
@@ -2091,6 +2150,145 @@ def scrape_active(kw: str, cnt: int, max_p: int = 0, force: bool = False,
         logger.error(f"Active scrape: {e}")
         return []
 
+def _first_identified_model(item: Dict) -> Optional[Dict]:
+    """返回 active AI 识别出的首个可搜索型号。"""
+    if not has_usable_model(item):
+        return None
+    models = item.get("models") or []
+    if isinstance(models, str):
+        try:
+            models = json.loads(models)
+        except (TypeError, ValueError):
+            return None
+    for model in models:
+        if not isinstance(model, dict):
+            continue
+        brand = norm(model.get("brand", ""))
+        model_name = norm(model.get("model", ""))
+        if brand and model_name and model_name.upper() not in ("UNKNOWN", "N/A", "不明"):
+            return {**model, "brand": brand, "model": model_name}
+    return None
+
+
+def execute_countdown_workflow(category_id: str, ac: int, cc: int, force: bool) -> Dict:
+    """从某个分类下即将结束的 active 商品开始分析。
+
+    与常规型号工作流不同，本入口先用空关键词按分类抓 active，再由 AI 识别
+    每件商品的具体型号，最后按识别结果分别抓取 closed 历史成交记录。
+    """
+    global _start_time
+    _start_time = time.time()
+    result = {"mode": "countdown", "keyword": "", "category_id": category_id}
+    try:
+        check_limits()
+        logger.info("倒计时步骤 13-14：按分类抓取即将结束商品 category_id=%s", category_id)
+        active_ids = scrape_active("", ac, 0, force, {"category_id": category_id})
+        result["active"] = len(active_ids)
+        if not active_ids:
+            return {**result, "status": "NO_ACTIVE"}
+
+        active_items = [get_record(active_db, aid) for aid in active_ids]
+        pending_active = [
+            item for item in active_items
+            if item and (force or item.get("modelStatus") == Status.PENDING)
+        ]
+        logger.info("倒计时步骤 15：AI 识别 active 具体型号 count=%s", len(pending_active))
+        if pending_active:
+            result["active_parsed"] = batch_parse(
+                active_db, pending_active, build_countdown_active_parse_prompt, SIMPLE_BATCH,
+                SIMPLE_MAX_TOKENS, saver=save_active_model,
+            )
+
+        identified = {}
+        for aid in active_ids:
+            model = _first_identified_model(get_record(active_db, aid) or {})
+            if model:
+                model["category_id"] = category_id
+                key = (model["brand"].casefold(), model["model"].casefold())
+                identified.setdefault(key, model)
+        result["identified_models"] = len(identified)
+        if not identified:
+            return {**result, "status": "NO_IDENTIFIED_MODEL"}
+
+        logger.info("倒计时步骤 16-17：按 %s 个识别型号抓取并解析 closed", len(identified))
+        closed_ids = []
+        for model in identified.values():
+            check_limits()
+            keyword = f'{model["brand"]} {model["model"]}'.strip()
+            model_closed_ids = scrape_closed(keyword, cc, force, model)
+            closed_ids.extend(iid for iid in model_closed_ids if iid not in closed_ids)
+            closed_items = [get_record(closed_db, iid) for iid in model_closed_ids]
+            pending_closed = [
+                item for item in closed_items
+                if item and (force or item.get("modelStatus") == Status.PENDING)
+            ]
+            if pending_closed:
+                batch_parse(
+                    closed_db, pending_closed, build_closed_parse_prompt, SIMPLE_BATCH,
+                    SIMPLE_MAX_TOKENS, saver=save_closed_model,
+                    resolver=resolve_closed_without_ai,
+                )
+        result["closed"] = len(closed_ids)
+        if not closed_ids:
+            return {**result, "status": "NO_CLOSED"}
+
+        logger.info("倒计时步骤 18-19：建立 closed 索引并为 active 定价")
+        idx = build_index(set(closed_ids))
+        result["index_size"] = len(idx)
+        priced = 0
+        review_ids = []
+        for aid in active_ids:
+            check_limits()
+            item = get_record(active_db, aid)
+            if not item or not has_usable_model(item):
+                continue
+            if not force and item.get("pricingStatus") != Status.PENDING:
+                continue
+            pricing = price_active_item(aid, idx, sync_candidate=False)
+            if pricing:
+                priced += 1
+                if should_reanalyze_description(item, pricing):
+                    review_ids.append(aid)
+
+        logger.info("倒计时步骤 20-21：详情复核并同步 BUY_CANDIDATE count=%s", len(review_ids))
+        recheck_items = []
+        for aid in review_ids:
+            existing = get_record(active_db, aid)
+            detail_item = existing if (
+                existing and existing.get("detailScrapeStatus") == "COMPLETED"
+                and str(existing.get("detailDescription", "")).strip()
+            ) else scrape_profitable_active_detail(aid)
+            if detail_item and str(detail_item.get("detailDescription", "")).strip():
+                detail_item["closedReferenceSamples"] = build_closed_reference_samples(
+                    detail_item.get("pricingResult") or {}, limit=10
+                )
+                recheck_items.append(detail_item)
+        if recheck_items:
+            result["active_description_reanalysis"] = batch_parse(
+                active_db, recheck_items, build_description_parse_prompt,
+                DETAIL_BATCH, DETAIL_MAX_TOKENS,
+            )
+        repriced = 0
+        for item in recheck_items:
+            aid = str(item.get("itemID", ""))
+            current = get_record(active_db, aid) if aid else None
+            if current and has_usable_model(current) and price_active_item(aid, idx, sync_candidate=True):
+                repriced += 1
+
+        result.update({
+            "priced": priced,
+            "detail_reviewed": len(recheck_items),
+            "description_repriced": repriced,
+            "status": "COMPLETED",
+            "elapsed": round(time.time() - _start_time, 1),
+        })
+        return result
+    except RuntimeError as e:
+        return {**result, "status": "INTERRUPTED", "reason": str(e)}
+    except Exception as e:
+        logger.error("倒计时工作流失败: %s", e, exc_info=True)
+        return {**result, "status": "FAILED", "error": str(e)}
+
 def calc_market_price(closed_ids: List[str]) -> Dict:
     """根据成交价分布剔除疑似低价配件簇，再计算市场价。"""
     candidates = []
@@ -2526,13 +2724,29 @@ def lambda_handler(event, context):
     _start_time = time.time()
     
     try:
-        kw = norm(event.get("keyword", ""))
-        if not kw:
-            return {"statusCode": 400, "body": json.dumps({"error": "keyword required"})}
-        
         ac = max(1, min(int(event.get("active_count", 100)), 100))
         cc_val = max(1, min(int(event.get("closed_count", 100)), 100))
         force = str(event.get("force_reprocess", "")).lower() in ("true", "1", "yes")
+        mode = norm(event.get("mode", "")).lower()
+        category_id = norm(event.get("category_id", ""))
+        kw = norm(event.get("keyword", ""))
+
+        if mode == "countdown":
+            if not category_id:
+                return {
+                    "statusCode": 400,
+                    "body": json.dumps({"error": "倒计时模式需要 category_id"}, ensure_ascii=False),
+                }
+            result = execute_countdown_workflow(category_id, ac, cc_val, force)
+            return {
+                "statusCode": 200,
+                "body": json.dumps(result, ensure_ascii=False, default=str),
+            }
+        if not kw:
+            return {
+                "statusCode": 400,
+                "body": json.dumps({"error": "常规模式需要 keyword"}, ensure_ascii=False),
+            }
         
         logger.info(f"Starting workflow: kw={kw}, active={ac}, closed={cc_val}, force={force}")
         aliases = event.get("aliases") or event.get("alias") or []
