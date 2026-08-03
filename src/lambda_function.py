@@ -1166,9 +1166,15 @@ def get_crawled_categories(limit=MAX_CATEGORIES):
     categories = []
     seen_ids = set()
     scan_kwargs = {
-        "FilterExpression": "attribute_exists(category_id) AND category_id <> :empty",
-        "ExpressionAttributeValues": {":empty": ""},
-        "ProjectionExpression": "category_id, category_name, anchor_text, #url",
+        "FilterExpression": (
+            "attribute_exists(category_id) AND category_id <> :empty "
+            "AND is_terminal = :true AND child_count = :zero"
+        ),
+        "ExpressionAttributeValues": {":empty": "", ":true": True, ":zero": 0},
+        "ProjectionExpression": (
+            "category_id, category_name, anchor_text, #url, "
+            "is_terminal, child_count"
+        ),
         "ExpressionAttributeNames": {"#url": "url"},
     }
     while len(categories) < limit:
@@ -1215,6 +1221,9 @@ def process_discovery(event):
             target_categories = event.get("target_categories", None)
             
             if target_categories:
+                crawled_leaves = get_crawled_categories(MAX_CATEGORIES)
+                leaves_by_id = {item["category_id"]: item for item in crawled_leaves}
+                leaves_by_name = {item["category"]: item for item in crawled_leaves}
                 categories = []
                 for item in target_categories:
                     if isinstance(item, dict):
@@ -1222,10 +1231,13 @@ def process_discovery(event):
                         category_id = normalize(item.get("category_id"))
                     else:
                         category, category_id = normalize(item), ""
-                    if category:
-                        upsert_category(category, category_id)
-                        categories.append({"category": category, "category_id": category_id})
-                log("INFO", "使用指定品类", categories=categories)
+                    leaf = leaves_by_id.get(category_id) or leaves_by_name.get(category)
+                    if leaf:
+                        upsert_category(leaf["category"], leaf["category_id"])
+                        categories.append(leaf)
+                    else:
+                        log("WARNING", "跳过非叶子目录", category=category, category_id=category_id)
+                log("INFO", "使用指定的叶子品类", categories=categories)
             else:
                 categories = get_crawled_categories(MAX_CATEGORIES)
                 for item in categories:
