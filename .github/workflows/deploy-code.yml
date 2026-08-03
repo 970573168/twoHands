@@ -61,14 +61,29 @@ on:
         default: true
         type: boolean
 
+      update_link_crawler:
+        description: '更新 Yahoo Auction Link Crawler'
+        required: true
+        default: true
+        type: boolean
+
+      update_final_check:
+        description: '更新 Yahoo Auction Final Check Reminder'
+        required: true
+        default: true
+        type: boolean
+
 permissions:
   id-token: write
   contents: read
 
+env:
+  AWS_REGION: ap-northeast-1
+  STACK_NAME_PREFIX: productcatalog-app
+
 jobs:
-  deploy-code:
+  deploy:
     runs-on: ubuntu-latest
-    # 自动触发时默认用 dev 环境，手动触发时用选择的环境
     environment: ${{ github.event.inputs.environment || 'dev' }}
 
     steps:
@@ -87,74 +102,77 @@ jobs:
         run: |
           pip install -r requirements.txt
 
-      - name: 检查是否需要构建
+      - name: 检查部署模式和环境
         id: check
         run: |
-          # CloudFormation 有变化时必须更新堆栈和全部 Lambda；仅代码变化时
-          # 直接更新 Lambda 代码，避免一次不必要且较慢的堆栈部署。
-          DEPLOY_ALL="false"
+          # 确定部署模式和环境
           if [[ "${{ github.event_name }}" == "push" ]]; then
+            ENVIRONMENT="dev"
+            # 自动触发时检查 CloudFormation 是否变更
             if git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" | grep -q '^cloudformation/'; then
               DEPLOY_ALL="true"
+            else
+              DEPLOY_ALL="false"
             fi
-          elif [[ "${{ github.event.inputs.deployment_mode }}" == "all" ]]; then
-            DEPLOY_ALL="true"
-          elif [[ "${{ github.event.inputs.deployment_mode }}" == "auto" ]] && \
-               git diff --name-only HEAD^ HEAD | grep -q '^cloudformation/'; then
-            DEPLOY_ALL="true"
+          else
+            ENVIRONMENT="${{ github.event.inputs.environment }}"
+            if [[ "${{ github.event.inputs.deployment_mode }}" == "all" ]]; then
+              DEPLOY_ALL="true"
+            elif [[ "${{ github.event.inputs.deployment_mode }}" == "auto" ]]; then
+              # 手动触发 auto 模式：检查最近一次提交
+              if git diff --name-only HEAD^ HEAD 2>/dev/null | grep -q '^cloudformation/'; then
+                DEPLOY_ALL="true"
+              else
+                DEPLOY_ALL="false"
+              fi
+            else
+              # code 模式：仅更新代码
+              DEPLOY_ALL="false"
+            fi
           fi
 
-          # 自动触发时更新所有函数，手动触发时按选择
+          # 确定需要更新的函数
           if [[ "${{ github.event_name }}" == "push" || "$DEPLOY_ALL" == "true" ]]; then
             UPDATE_AUCTION="true"
             UPDATE_ANALYZER="true"
             UPDATE_CATALOG="true"
             UPDATE_CATALOG_SCANNER="true"
-            ENVIRONMENT="dev"
+            UPDATE_LINK_CRAWLER="true"
+            UPDATE_FINAL_CHECK="true"
           else
             UPDATE_AUCTION="${{ github.event.inputs.update_auction }}"
             UPDATE_ANALYZER="${{ github.event.inputs.update_analyzer }}"
             UPDATE_CATALOG="${{ github.event.inputs.update_catalog }}"
             UPDATE_CATALOG_SCANNER="${{ github.event.inputs.update_catalog_scanner }}"
-            ENVIRONMENT="${{ github.event.inputs.environment }}"
+            UPDATE_LINK_CRAWLER="${{ github.event.inputs.update_link_crawler }}"
+            UPDATE_FINAL_CHECK="${{ github.event.inputs.update_final_check }}"
           fi
-          
+
+          # 构建需要更新的函数列表
+          NEED_BUILD="false"
+          if [[ "$UPDATE_AUCTION" == "true" ]] || [[ "$UPDATE_ANALYZER" == "true" ]] || \
+             [[ "$UPDATE_CATALOG" == "true" ]] || [[ "$UPDATE_CATALOG_SCANNER" == "true" ]] || \
+             [[ "$UPDATE_LINK_CRAWLER" == "true" ]] || [[ "$UPDATE_FINAL_CHECK" == "true" ]]; then
+            NEED_BUILD="true"
+          fi
+
+          echo "=========================================="
+          echo "部署配置："
+          echo "  环境: $ENVIRONMENT"
+          echo "  完整部署: $DEPLOY_ALL"
+          echo "  需要构建: $NEED_BUILD"
+          echo "=========================================="
+
+          # 输出到环境变量
           echo "environment=$ENVIRONMENT" >> $GITHUB_ENV
           echo "deploy_all=$DEPLOY_ALL" >> "$GITHUB_OUTPUT"
-          echo "完整部署: $DEPLOY_ALL"
-          
-          NEED_BUILD="false"
-          BUILD_REASONS=""
-          
-          if [[ "$UPDATE_AUCTION" == "true" ]]; then
-            echo "✅ 需要更新 Yahoo Auction Scraper"
-            NEED_BUILD="true"
-            BUILD_REASONS="${BUILD_REASONS} AuctionScraper"
-          fi
-          
-          if [[ "$UPDATE_ANALYZER" == "true" ]]; then
-            echo "✅ 需要更新 Yahoo Auction Analyzer"
-            NEED_BUILD="true"
-            BUILD_REASONS="${BUILD_REASONS} Analyzer"
-          fi
-          
-          if [[ "$UPDATE_CATALOG" == "true" ]]; then
-            echo "✅ 需要更新 ProductCatalog Discovery"
-            NEED_BUILD="true"
-            BUILD_REASONS="${BUILD_REASONS} Catalog"
-          fi
-          
-          if [[ "$UPDATE_CATALOG_SCANNER" == "true" ]]; then
-            echo "✅ 需要更新 Catalog Scanner"
-            NEED_BUILD="true"
-            BUILD_REASONS="${BUILD_REASONS} CatalogScanner"
-          fi
-          
-          echo "need_build=$NEED_BUILD" >> $GITHUB_OUTPUT
-          echo "update_auction=$UPDATE_AUCTION" >> $GITHUB_OUTPUT
-          echo "update_analyzer=$UPDATE_ANALYZER" >> $GITHUB_OUTPUT
-          echo "update_catalog=$UPDATE_CATALOG" >> $GITHUB_OUTPUT
-          echo "update_catalog_scanner=$UPDATE_CATALOG_SCANNER" >> $GITHUB_OUTPUT
+          echo "need_build=$NEED_BUILD" >> "$GITHUB_OUTPUT"
+          echo "update_auction=$UPDATE_AUCTION" >> "$GITHUB_OUTPUT"
+          echo "update_analyzer=$UPDATE_ANALYZER" >> "$GITHUB_OUTPUT"
+          echo "update_catalog=$UPDATE_CATALOG" >> "$GITHUB_OUTPUT"
+          echo "update_catalog_scanner=$UPDATE_CATALOG_SCANNER" >> "$GITHUB_OUTPUT"
+          echo "update_link_crawler=$UPDATE_LINK_CRAWLER" >> "$GITHUB_OUTPUT"
+          echo "update_final_check=$UPDATE_FINAL_CHECK" >> "$GITHUB_OUTPUT"
 
       - name: 构建 Lambda 包
         if: steps.check.outputs.need_build == 'true'
@@ -162,25 +180,32 @@ jobs:
           echo "🔨 正在构建 Lambda 包..."
           chmod +x build.sh
           ./build.sh
+          echo "✅ 构建完成"
+          ls -lh lambda.zip
 
       - name: 配置 AWS 凭证
         if: steps.check.outputs.need_build == 'true'
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::767076981380:role/twoHands-GitHubActions-Role
-          aws-region: ap-northeast-1
+          aws-region: ${{ env.AWS_REGION }}
 
       - name: 上传到 S3
         if: steps.check.outputs.need_build == 'true'
+        id: upload
         run: |
           TIMESTAMP=$(date +%Y%m%d%H%M%S)
           S3_BUCKET="${{ github.event.inputs.s3_bucket || 'productcatalog-lambda-code-767076981380' }}"
           S3_KEY="productcatalog/lambda-${TIMESTAMP}.zip"
           
           echo "📤 正在上传 Lambda 代码到 S3..."
-          aws s3 cp lambda.zip "s3://$S3_BUCKET/$S3_KEY"
+          echo "  存储桶: $S3_BUCKET"
+          echo "  对象键: $S3_KEY"
           
-          if aws s3 ls "s3://$S3_BUCKET/$S3_KEY" > /dev/null 2>&1; then
+          aws s3 cp lambda.zip "s3://${S3_BUCKET}/${S3_KEY}" --no-progress
+          
+          # 验证上传
+          if aws s3 ls "s3://${S3_BUCKET}/${S3_KEY}" > /dev/null 2>&1; then
             echo "✅ 上传成功"
           else
             echo "❌ 上传失败"
@@ -195,13 +220,17 @@ jobs:
         run: |
           echo "🔎 正在验证 CloudFormation 模板..."
           aws cloudformation validate-template \
-            --template-body file://cloudformation/productcatalog.yaml >/dev/null
+            --template-body file://cloudformation/productcatalog.yaml
+          echo "✅ 模板验证通过"
 
-      - name: 完整部署 CloudFormation 和 Lambda
+      - name: 完整部署 CloudFormation 堆栈
         if: steps.check.outputs.deploy_all == 'true'
+        id: deploy
         run: |
-          STACK_NAME="productcatalog-app-${{ env.environment }}"
-          echo "🚀 模板已变更，正在完整部署 $STACK_NAME..."
+          STACK_NAME="${{ env.STACK_NAME_PREFIX }}-${{ env.environment }}"
+          echo "🚀 正在部署 CloudFormation 堆栈: $STACK_NAME"
+          echo "  S3 Bucket: ${{ env.s3_bucket }}"
+          echo "  S3 Key: ${{ env.s3_key }}"
 
           set +e
           aws cloudformation deploy \
@@ -212,101 +241,128 @@ jobs:
               "LambdaCodeS3Bucket=${{ env.s3_bucket }}" \
               "LambdaCodeS3Key=${{ env.s3_key }}" \
             --capabilities CAPABILITY_NAMED_IAM \
-            --no-fail-on-empty-changeset
-          DEPLOY_STATUS=$?
+            --no-fail-on-empty-changeset \
+            2>&1 | tee deploy.log
+          DEPLOY_STATUS=${PIPESTATUS[0]}
           set -e
 
           if [[ "$DEPLOY_STATUS" -ne 0 ]]; then
-            echo "::error::CloudFormation 部署失败，下面显示失败资源及具体原因。"
+            echo "::error::CloudFormation 部署失败"
+            echo ""
+            echo "📋 失败资源详情:"
             aws cloudformation describe-stack-events \
               --stack-name "$STACK_NAME" \
-              --query "StackEvents[?contains(ResourceStatus, 'FAILED')].[Timestamp,LogicalResourceId,ResourceType,ResourceStatusReason]" \
+              --query "reverse(StackEvents)[?ResourceStatus=='CREATE_FAILED' || ResourceStatus=='UPDATE_FAILED' || ResourceStatus=='DELETE_FAILED'].[Timestamp,LogicalResourceId,ResourceType,ResourceStatusReason]" \
               --output table || true
             exit "$DEPLOY_STATUS"
           fi
 
+          echo "✅ CloudFormation 部署成功"
+
       - name: 显示堆栈输出
         if: steps.check.outputs.deploy_all == 'true'
         run: |
+          echo "📊 堆栈输出:"
+          echo ""
           aws cloudformation describe-stacks \
-            --stack-name "productcatalog-app-${{ env.environment }}" \
+            --stack-name "${{ env.STACK_NAME_PREFIX }}-${{ env.environment }}" \
             --query 'Stacks[0].Outputs[*].[OutputKey,OutputValue]' \
             --output table
 
-      - name: 更新 Yahoo Auction Scraper 函数
-        if: steps.check.outputs.deploy_all != 'true' && steps.check.outputs.need_build == 'true' && steps.check.outputs.update_auction == 'true'
+      - name: 更新 Lambda 函数代码
+        if: steps.check.outputs.deploy_all != 'true' && steps.check.outputs.need_build == 'true'
         run: |
-          FUNCTION_NAME="YahooAuctionScraper-${{ env.environment }}"
-          echo "🔄 正在更新 $FUNCTION_NAME..."
-          
-          if aws lambda get-function --function-name "$FUNCTION_NAME" >/dev/null 2>&1; then
-            aws lambda update-function-code \
-              --function-name "$FUNCTION_NAME" \
-              --s3-bucket "${{ env.s3_bucket }}" \
-              --s3-key "${{ env.s3_key }}"
-            aws lambda wait function-updated --function-name "$FUNCTION_NAME"
-            echo "✅ $FUNCTION_NAME 更新完成"
-          else
-            echo "⚠️ 函数 $FUNCTION_NAME 不存在，跳过"
+          echo "🔄 正在更新 Lambda 函数代码..."
+          echo ""
+
+          # 函数名映射
+          declare -A FUNCTIONS=(
+            ["auction"]="YahooAuctionScraper"
+            ["analyzer"]="YahooAuctionAnalyzer"
+            ["catalog"]="ProductCatalog-Discovery"
+            ["catalog_scanner"]="CatalogScanner"
+            ["link_crawler"]="YahooAuctionLinkCrawler"
+            ["final_check"]="YahooAuctionFinalCheckReminder"
+          )
+
+          # 更新状态映射
+          declare -A UPDATES=(
+            ["auction"]="${{ steps.check.outputs.update_auction }}"
+            ["analyzer"]="${{ steps.check.outputs.update_analyzer }}"
+            ["catalog"]="${{ steps.check.outputs.update_catalog }}"
+            ["catalog_scanner"]="${{ steps.check.outputs.update_catalog_scanner }}"
+            ["link_crawler"]="${{ steps.check.outputs.update_link_crawler }}"
+            ["final_check"]="${{ steps.check.outputs.update_final_check }}"
+          )
+
+          UPDATED_COUNT=0
+          SKIPPED_COUNT=0
+          FAILED_COUNT=0
+
+          for KEY in "${!FUNCTIONS[@]}"; do
+            if [[ "${UPDATES[$KEY]}" == "true" ]]; then
+              FUNCTION_NAME="${FUNCTIONS[$KEY]}-${{ env.environment }}"
+              echo "📦 正在更新 $FUNCTION_NAME..."
+              
+              # 检查函数是否存在
+              if aws lambda get-function --function-name "$FUNCTION_NAME" --no-cli-pager >/dev/null 2>&1; then
+                if aws lambda update-function-code \
+                  --function-name "$FUNCTION_NAME" \
+                  --s3-bucket "${{ env.s3_bucket }}" \
+                  --s3-key "${{ env.s3_key }}" \
+                  --no-cli-pager >/dev/null 2>&1; then
+                  
+                  # 等待更新完成
+                  echo "   ⏳ 等待函数更新完成..."
+                  aws lambda wait function-updated \
+                    --function-name "$FUNCTION_NAME" \
+                    --no-cli-pager
+                  
+                  echo "   ✅ $FUNCTION_NAME 更新完成"
+                  UPDATED_COUNT=$((UPDATED_COUNT + 1))
+                else
+                  echo "   ❌ $FUNCTION_NAME 更新失败"
+                  FAILED_COUNT=$((FAILED_COUNT + 1))
+                fi
+              else
+                echo "   ⚠️ $FUNCTION_NAME 不存在，跳过"
+                SKIPPED_COUNT=$((SKIPPED_COUNT + 1))
+              fi
+              echo ""
+            fi
+          done
+
+          echo "=========================================="
+          echo "📊 Lambda 更新汇总:"
+          echo "  成功: $UPDATED_COUNT"
+          echo "  跳过: $SKIPPED_COUNT"
+          echo "  失败: $FAILED_COUNT"
+          echo "=========================================="
+
+          if [[ "$FAILED_COUNT" -gt 0 ]]; then
+            echo "::error::部分 Lambda 函数更新失败"
+            exit 1
           fi
 
-      - name: 更新 Yahoo Auction Analyzer 函数
-        if: steps.check.outputs.deploy_all != 'true' && steps.check.outputs.need_build == 'true' && steps.check.outputs.update_analyzer == 'true'
-        run: |
-          FUNCTION_NAME="YahooAuctionAnalyzer-${{ env.environment }}"
-          echo "🔄 正在更新 $FUNCTION_NAME..."
-          
-          if aws lambda get-function --function-name "$FUNCTION_NAME" >/dev/null 2>&1; then
-            aws lambda update-function-code \
-              --function-name "$FUNCTION_NAME" \
-              --s3-bucket "${{ env.s3_bucket }}" \
-              --s3-key "${{ env.s3_key }}"
-            aws lambda wait function-updated --function-name "$FUNCTION_NAME"
-            echo "✅ $FUNCTION_NAME 更新完成"
-          else
-            echo "⚠️ 函数 $FUNCTION_NAME 不存在，跳过"
-          fi
-
-      - name: 更新 ProductCatalog Discovery 函数
-        if: steps.check.outputs.deploy_all != 'true' && steps.check.outputs.need_build == 'true' && steps.check.outputs.update_catalog == 'true'
-        run: |
-          FUNCTION_NAME="ProductCatalog-Discovery-${{ env.environment }}"
-          echo "🔄 正在更新 $FUNCTION_NAME..."
-          
-          if aws lambda get-function --function-name "$FUNCTION_NAME" >/dev/null 2>&1; then
-            aws lambda update-function-code \
-              --function-name "$FUNCTION_NAME" \
-              --s3-bucket "${{ env.s3_bucket }}" \
-              --s3-key "${{ env.s3_key }}"
-            aws lambda wait function-updated --function-name "$FUNCTION_NAME"
-            echo "✅ $FUNCTION_NAME 更新完成"
-          else
-            echo "⚠️ 函数 $FUNCTION_NAME 不存在，跳过"
-          fi
-
-      - name: 更新 Catalog Scanner 函数
-        if: steps.check.outputs.deploy_all != 'true' && steps.check.outputs.need_build == 'true' && steps.check.outputs.update_catalog_scanner == 'true'
-        run: |
-          FUNCTION_NAME="CatalogScanner-${{ env.environment }}"
-          echo "🔄 正在更新 $FUNCTION_NAME..."
-          
-          if aws lambda get-function --function-name "$FUNCTION_NAME" >/dev/null 2>&1; then
-            aws lambda update-function-code \
-              --function-name "$FUNCTION_NAME" \
-              --s3-bucket "${{ env.s3_bucket }}" \
-              --s3-key "${{ env.s3_key }}"
-            aws lambda wait function-updated --function-name "$FUNCTION_NAME"
-            echo "✅ $FUNCTION_NAME 更新完成"
-          else
-            echo "⚠️ 函数 $FUNCTION_NAME 不存在，跳过"
-          fi
-
-      - name: 部署成功
+      - name: 部署成功汇总
         if: success()
         run: |
           echo "=========================================="
-          echo "✅ 部署成功！"
+          echo "🎉 部署成功！"
+          echo "=========================================="
           echo "环境: ${{ env.environment }}"
           echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
+          echo "方式: $([ '${{ steps.check.outputs.deploy_all }}' == 'true' ] && echo '完整部署 (CloudFormation + Lambda)' || echo '代码更新 (Lambda)')"
           echo "包路径: s3://${{ env.s3_bucket }}/${{ env.s3_key }}"
+          echo "=========================================="
+
+      - name: 部署失败通知
+        if: failure()
+        run: |
+          echo "=========================================="
+          echo "❌ 部署失败"
+          echo "=========================================="
+          echo "环境: ${{ env.environment }}"
+          echo "时间: $(date '+%Y-%m-%d %H:%M:%S')"
+          echo "请检查上方日志获取详细错误信息"
           echo "=========================================="
