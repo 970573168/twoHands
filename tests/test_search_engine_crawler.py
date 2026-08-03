@@ -2,6 +2,9 @@ import os
 import sys
 import unittest
 from unittest.mock import Mock
+from unittest.mock import patch
+
+from botocore.exceptions import ClientError
 
 
 os.environ.setdefault("AWS_DEFAULT_REGION", "ap-northeast-1")
@@ -11,6 +14,8 @@ os.environ.setdefault("AWS_EC2_METADATA_DISABLED", "true")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from search_engine_crawler import (
+    claim_queue_item, count_queue_status, enqueue_discovered_link,
+    get_queued_items, lambda_handler, mark_queue_done, mark_queue_failed,
     count_remaining_unvisited,
     extract_category_id, extract_links, extract_links_from_page,
     get_next_unvisited_url, is_allowed_url, normalize_url,
@@ -19,6 +24,114 @@ from search_engine_crawler import (
 
 
 class SearchEngineCrawlerTest(unittest.TestCase):
+    def test_enqueue_discovered_link_creates_queued_item(self):
+        table = Mock()
+        table.update_item.return_value = {}
+        result = enqueue_discovered_link(table, {
+            "url": "https://auctions.yahoo.co.jp/list3/1-category.html",
+            "depth": 1,
+            "source_url": "https://auctions.yahoo.co.jp/list3/root-category.html",
+        }, "https://auctions.yahoo.co.jp/list3/root-category.html")
+
+        self.assertTrue(result["is_new"])
+        kwargs = table.update_item.call_args.kwargs
+        self.assertEqual(kwargs["ReturnValues"], "ALL_OLD")
+        self.assertIn("queue_status", kwargs["UpdateExpression"])
+        self.assertEqual(kwargs["ExpressionAttributeValues"][":queued"], "QUEUED")
+
+    def test_enqueue_discovered_link_reports_existing_item(self):
+        table = Mock()
+        table.update_item.return_value = {"Attributes": {"queue_status": "DONE"}}
+        result = enqueue_discovered_link(table, {
+            "url": "https://auctions.yahoo.co.jp/list3/1-category.html"
+        }, "https://auctions.yahoo.co.jp/list3/1-category.html")
+        self.assertFalse(result["is_new"])
+        self.assertEqual(result["previous_status"], "DONE")
+
+    def test_get_queued_items_uses_queue_index_and_paginates(self):
+        table = Mock()
+        table.query.side_effect = [
+            {"Items": [{"crawl_id": "one"}], "LastEvaluatedKey": {"crawl_id": "one"}},
+            {"Items": [{"crawl_id": "two"}]},
+        ]
+        self.assertEqual(len(get_queued_items(table, 3)), 2)
+        first, second = table.query.call_args_list
+        self.assertEqual(first.kwargs["IndexName"], "queue_status-queue_priority-index")
+        self.assertTrue(first.kwargs["ScanIndexForward"])
+        self.assertEqual(second.kwargs["ExclusiveStartKey"], {"crawl_id": "one"})
+
+    def test_claim_queue_item_moves_queued_to_processing(self):
+        table = Mock()
+        table.update_item.return_value = {"Attributes": {"queue_status": "PROCESSING"}}
+        self.assertEqual(claim_queue_item(table, "id")["queue_status"], "PROCESSING")
+        kwargs = table.update_item.call_args.kwargs
+        self.assertEqual(kwargs["ConditionExpression"], "queue_status = :queued")
+        self.assertIn("ADD attempt_count :one", kwargs["UpdateExpression"])
+        self.assertEqual(kwargs["ExpressionAttributeValues"][":processing"], "PROCESSING")
+        self.assertEqual(kwargs["ReturnValues"], "ALL_NEW")
+
+    def test_claim_queue_item_returns_none_when_already_claimed(self):
+        table = Mock()
+        table.update_item.side_effect = ClientError(
+            {"Error": {"Code": "ConditionalCheckFailedException", "Message": "claimed"}},
+            "UpdateItem",
+        )
+        self.assertIsNone(claim_queue_item(table, "id"))
+
+    def test_mark_queue_done_requires_processing(self):
+        table = Mock()
+        table.update_item.return_value = {}
+        mark_queue_done(table, "id", 4, 2, False)
+        kwargs = table.update_item.call_args.kwargs
+        self.assertEqual(kwargs["ConditionExpression"], "queue_status = :processing")
+        for text in ("queue_status", "child_count", "new_child_count", "is_terminal",
+                     "REMOVE last_error"):
+            self.assertIn(text, kwargs["UpdateExpression"])
+        self.assertEqual(kwargs["ExpressionAttributeValues"][":done"], "DONE")
+
+    def test_mark_queue_failed_requeues_before_max_attempts(self):
+        table = Mock()
+        table.update_item.return_value = {}
+        mark_queue_failed(table, {"crawl_id": "id", "attempt_count": 2}, "temporary")
+        kwargs = table.update_item.call_args.kwargs
+        self.assertEqual(kwargs["ExpressionAttributeValues"][":status"], "QUEUED")
+        self.assertEqual(kwargs["ConditionExpression"], "queue_status = :processing")
+
+    def test_mark_queue_failed_errors_after_max_attempts(self):
+        table = Mock()
+        table.update_item.return_value = {}
+        mark_queue_failed(table, {"crawl_id": "id", "attempt_count": 3}, "permanent")
+        self.assertEqual(
+            table.update_item.call_args.kwargs["ExpressionAttributeValues"][":status"],
+            "ERROR",
+        )
+
+    def test_count_queue_status_sums_all_pages(self):
+        table = Mock()
+        table.query.side_effect = [
+            {"Count": 2, "LastEvaluatedKey": {"crawl_id": "next"}}, {"Count": 5}
+        ]
+        self.assertEqual(count_queue_status(table, "DONE"), 7)
+        self.assertEqual(table.query.call_count, 2)
+
+    @patch("search_engine_crawler.count_queue_status", return_value=0)
+    @patch("search_engine_crawler.crawl_queue", return_value={"pages_crawled": 0})
+    @patch("search_engine_crawler.seed_from_homepage", return_value=2)
+    @patch("search_engine_crawler.has_queued_items", return_value=False)
+    @patch("search_engine_crawler.recover_stale_processing_items", return_value=0)
+    @patch("search_engine_crawler.boto3.resource")
+    @patch("search_engine_crawler.get_next_unvisited_url")
+    def test_lambda_no_longer_initializes_single_start_url_queue(
+        self, old_start, resource, recover, has_items, seed, crawl, count
+    ):
+        with patch.dict(os.environ, {"LINK_CRAWLER_TABLE_NAME": "links"}):
+            result = lambda_handler({}, None)
+        old_start.assert_not_called()
+        seed.assert_called_once_with(resource.return_value.Table.return_value)
+        crawl.assert_called_once()
+        self.assertNotIn("start_url", result)
+        self.assertEqual(result["seeded"], 2)
+
     def test_next_unvisited_url_continues_after_empty_filtered_page(self):
         table = Mock()
         table.query.side_effect = [
