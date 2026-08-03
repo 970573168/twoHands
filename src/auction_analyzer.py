@@ -695,6 +695,43 @@ sourceModelと同じ本体ならmatched=true。
 商品本体を特定できなければmodels=[]。
 他のフィールドは禁止。"""
 
+COUNTDOWN_ACTIVE_PARSE_PROMPT = """Yahoo!オークションの出品中商品タイトルから、価格比較に使える商品本体のブランドとモデルを抽出してください。
+入力:{items_json}
+
+次のJSONだけ返してください:
+{{
+"items":[
+{{
+"itemId":"123",
+"matched":true,
+"listingType":"MAIN_PRODUCT",
+"models":[
+{{"brand":"Apple","model":"iPhone 13"}}
+]
+}}
+]
+}}
+
+listingType:
+MAIN_PRODUCT=商品本体
+ACCESSORY=ケース/フィルム/充電器/ケーブル/バッテリー/互換品
+BOX_ONLY=箱のみ/元箱のみ/空箱
+PARTS=部品/修理用/部品取り
+RENTAL=レンタル/貸出
+BUNDLE=複数セット
+UNKNOWN=判断不能
+
+ルール:
+1. スマホ本体なら MAIN_PRODUCT。
+2. ブランドとモデルが明確に分かる場合だけ models に入れる。
+3. iPhone は Pro/Pro Max/Plus/mini/SE を区別してください。
+4. Android は Pixel/Galaxy/Xperia/AQUOS/OPPO/Xiaomi 等のモデル名を抽出してください。
+5. 容量、キャリア、色はこの簡易解析では不要です。
+6. ケース、フィルム、充電器、箱のみ、部品のみは MAIN_PRODUCT にしない。
+7. ジャンクや故障したスマホ本体は MAIN_PRODUCT としてよい。
+8. 型番が不明な場合は models=[]。
+9. JSONのみ返してください。"""
+
 CLOSED_PARSE_PROMPT = """Yahoo!オークションの終了商品を参照製品と比較してください。
 入力:{items_json}
 次のJSONだけ返してください:
@@ -819,6 +856,28 @@ def build_active_parse_prompt(items: List[Dict]) -> str:
         "items": items_data,
     }
     return ACTIVE_PARSE_PROMPT.replace(
+        "{items_json}",
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+    )
+
+
+def build_countdown_active_parse_prompt(items: List[Dict]) -> str:
+    """倒计时模式不依赖 sourceModel，直接从 active 标题抽取品牌和型号。"""
+    items_data = []
+    for item in items:
+        items_data.append({
+            "itemId": str(item.get("itemID", "")),
+            "title": str(item.get("title", ""))[:ACTIVE_TITLE_MAX],
+            "price": si(item.get("price", 0)),
+            "endTime": item.get("endTime", ""),
+        })
+
+    payload = {
+        "mode": "countdown_active_model_extract",
+        "category": "スマホ本体",
+        "items": items_data,
+    }
+    return COUNTDOWN_ACTIVE_PARSE_PROMPT.replace(
         "{items_json}",
         json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
     )
@@ -2136,7 +2195,7 @@ def execute_countdown_workflow(category_id: str, ac: int, cc: int, force: bool) 
         logger.info("倒计时步骤 15：AI 识别 active 具体型号 count=%s", len(pending_active))
         if pending_active:
             result["active_parsed"] = batch_parse(
-                active_db, pending_active, build_active_parse_prompt, SIMPLE_BATCH,
+                active_db, pending_active, build_countdown_active_parse_prompt, SIMPLE_BATCH,
                 SIMPLE_MAX_TOKENS, saver=save_active_model,
             )
 

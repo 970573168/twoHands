@@ -17,6 +17,7 @@ from auction_analyzer import (
     Status,
     batch_parse,
     build_active_parse_prompt,
+    build_countdown_active_parse_prompt,
     build_closed_parse_prompt,
     build_description_parse_prompt,
     build_closed_reference_samples,
@@ -69,6 +70,21 @@ class NormalizePricingKeyTest(unittest.TestCase):
 
 
 class LeanAiWorkflowTest(unittest.TestCase):
+    def test_countdown_active_prompt_extracts_model_without_source_model(self):
+        prompt = build_countdown_active_parse_prompt([{
+            "itemID": "a1",
+            "title": "Apple iPhone 13 Pro 256GB SIMフリー",
+            "price": Decimal("42000"),
+            "endTime": "2026-08-03T12:00:00+00:00",
+        }])
+
+        self.assertIn('"mode":"countdown_active_model_extract"', prompt)
+        self.assertIn('"category":"スマホ本体"', prompt)
+        self.assertIn('"itemId":"a1"', prompt)
+        self.assertIn('"price":42000', prompt)
+        self.assertIn('"models"', prompt)
+        self.assertNotIn('"sourceModel"', prompt)
+
     @patch("auction_analyzer.execute_countdown_workflow", return_value={"status": "COMPLETED"})
     def test_lambda_handler_routes_countdown_mode_by_category(self, workflow):
         response = lambda_handler({
@@ -120,6 +136,10 @@ class LeanAiWorkflowTest(unittest.TestCase):
         scrape_closed_mock.assert_called_once()
         self.assertEqual(scrape_closed_mock.call_args.args[0], "Nikon Z 7II")
         self.assertEqual(batch_parse_mock.call_count, 2)
+        self.assertIs(
+            batch_parse_mock.call_args_list[0].args[2],
+            build_countdown_active_parse_prompt,
+        )
 
     @patch("auction_analyzer.product_catalog_db.update_item")
     @patch("auction_analyzer.execute_workflow", return_value={"status": "COMPLETED"})
