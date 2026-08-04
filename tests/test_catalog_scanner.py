@@ -43,6 +43,48 @@ class CatalogScannerTest(unittest.TestCase):
         self.assertIs(values[":enabled"], True)
         self.assertEqual(values[":next"], 1000)
 
+    def test_named_profiles_apply_the_selected_tier(self):
+        self.table.scan.return_value = {"Items": [{
+            "crawl_id": "link-1", "category_id": "1", "category_name": "スマホ本体",
+        }]}
+
+        result = catalog_scanner.configure_profiles({
+            "profiles": {"スマホ本体": "FAST"},
+        }, now=1000)
+
+        self.assertEqual(result["profiles"], {"スマホ本体": "FAST"})
+        values = self.table.update_item.call_args.kwargs["ExpressionAttributeValues"]
+        self.assertEqual(values[":profile"], "FAST")
+        self.assertEqual(values[":active"], 30)
+        self.assertEqual(values[":closed"], 15)
+        self.assertEqual(values[":interval"], 5)
+        self.assertIs(values[":enabled"], True)
+
+    def test_empty_profiles_returns_current_runtime_configuration(self):
+        self.table.scan.return_value = {"Items": [
+            {"crawl_id": "1", "category_id": "1", "category_name": "スマホ本体"},
+            {"crawl_id": "2", "category_id": "2", "category_name": "プリンタ",
+             "countdown_scan_profile": "OFF"},
+        ]}
+
+        result = catalog_scanner.configure_profiles({"profiles": {}})
+
+        self.assertEqual(result["状态"], "当前运行配置")
+        self.assertEqual(result["profiles"], {"スマホ本体": "FAST", "プリンタ": "OFF"})
+        self.table.update_item.assert_not_called()
+
+    def test_off_profile_disables_scanning_with_zero_counts(self):
+        self.table.scan.return_value = {"Items": [{
+            "crawl_id": "link-1", "category_id": "1", "anchor_text": "プリンタ",
+        }]}
+        catalog_scanner.configure_profiles({"profiles": {"プリンタ": "OFF"}}, now=1000)
+        values = self.table.update_item.call_args.kwargs["ExpressionAttributeValues"]
+        self.assertEqual(values[":active"], 0)
+        self.assertEqual(values[":closed"], 0)
+        self.assertEqual(values[":interval"], 0)
+        self.assertIs(values[":enabled"], False)
+        self.assertEqual(values[":next"], 0)
+
     def test_schedule_only_finds_enabled_due_catalogs(self):
         self.table.scan.return_value = {"Items": [], "ScannedCount": 0}
         catalog_scanner.find_due_catalogs(2000)

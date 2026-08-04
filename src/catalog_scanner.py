@@ -15,10 +15,21 @@ import boto3
 TABLE_NAME = os.environ.get("LINK_CRAWLER_TABLE_NAME", "YahooAuctionLinks-dev")
 ANALYZER_FUNCTION_NAME = os.environ.get("ANALYZER_FUNCTION_NAME", "YahooAuctionAnalyzer-dev")
 MAX_MODELS_PER_RUN = int(os.environ.get("MAX_MODELS_PER_RUN", "10"))
-DEFAULT_ACTIVE_COUNT = int(os.environ.get("MAX_ACTIVE_COUNT", "20"))
-DEFAULT_CLOSED_COUNT = int(os.environ.get("MAX_CLOSED_COUNT", "50"))
-DEFAULT_INTERVAL_MINUTES = int(os.environ.get("DEFAULT_SCAN_INTERVAL_MINUTES", "180"))
 LOCK_SECONDS = int(os.environ.get("SCAN_LOCK_SECONDS", "900"))
+
+SCAN_PROFILES = {
+    "OFF": {"enabled": False, "active": 0, "closed": 0, "interval": 0},
+    "SLOW": {"enabled": True, "active": 10, "closed": 8, "interval": 30},
+    "MEDIUM": {"enabled": True, "active": 20, "closed": 10, "interval": 10},
+    "FAST": {"enabled": True, "active": 30, "closed": 15, "interval": 5},
+}
+CATEGORY_DEFAULT_PROFILES = {
+    "スマホ本体": "FAST",
+    "デジタルカメラ": "MEDIUM",
+    "ノートPC": "MEDIUM",
+    "プリンタ": "SLOW",
+}
+DEFAULT_PROFILE = "MEDIUM"
 
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table(TABLE_NAME)
@@ -54,6 +65,75 @@ def _find_directory(directory_id: str) -> Dict:
     return items[0]
 
 
+def _scan_directories() -> List[Dict]:
+    """读取所有叶子目录，供按分类名字配置挡位使用。"""
+    items, start_key = [], None
+    while True:
+        params = {
+            "FilterExpression": "attribute_exists(category_id) AND category_id <> :empty",
+            "ExpressionAttributeValues": {":empty": ""},
+            "ProjectionExpression": ("crawl_id, category_id, category_name, anchor_text, "
+                                     "countdown_scan_profile"),
+        }
+        if start_key:
+            params["ExclusiveStartKey"] = start_key
+        response = table.scan(**params)
+        items.extend(response.get("Items", []))
+        start_key = response.get("LastEvaluatedKey")
+        if not start_key:
+            return items
+
+
+def _category_name(item: Dict) -> str:
+    return str(item.get("category_name") or item.get("anchor_text") or "").strip()
+
+
+def configure_profiles(event: Dict, now: int = None) -> Dict:
+    """按分类名字批量设置 OFF/SLOW/MEDIUM/FAST；空配置返回当前运行配置。"""
+    profiles = event.get("profiles")
+    if profiles is None:
+        profiles = {}
+    if not isinstance(profiles, dict):
+        raise ValueError("profiles 必须是分类名字到挡位的对象")
+    directories = _scan_directories()
+    if not profiles:
+        current = {
+            name: str(item.get("countdown_scan_profile") or
+                      CATEGORY_DEFAULT_PROFILES.get(name, DEFAULT_PROFILE)).upper()
+            for item in directories if (name := _category_name(item))
+        }
+        return {"状态": "当前运行配置", "profiles": current, "可用挡位": list(SCAN_PROFILES)}
+
+    by_name = {_category_name(item): item for item in directories if _category_name(item)}
+    now = int(now if now is not None else time.time())
+    updated = {}
+    for name, requested_profile in profiles.items():
+        profile_name = str(requested_profile).strip().upper()
+        if profile_name not in SCAN_PROFILES:
+            raise ValueError(f"分类 {name} 的挡位无效，只支持 OFF、SLOW、MEDIUM、FAST")
+        item = by_name.get(str(name).strip())
+        if not item:
+            raise ValueError(f"未找到分类名字：{name}")
+        profile = SCAN_PROFILES[profile_name]
+        table.update_item(
+            Key={"crawl_id": str(item["crawl_id"])},
+            UpdateExpression=("SET countdown_scan_profile = :profile, countdown_active_count = :active, "
+                              "countdown_closed_count = :closed, countdown_interval_minutes = :interval, "
+                              "countdown_scan_enabled = :enabled, countdown_next_scan_at = :next, "
+                              "updated_at = :modified REMOVE countdown_scan_lock_until"),
+            ConditionExpression="category_id = :category_id",
+            ExpressionAttributeValues={
+                ":profile": profile_name, ":active": profile["active"], ":closed": profile["closed"],
+                ":interval": profile["interval"], ":enabled": profile["enabled"],
+                ":next": now if profile["enabled"] else 0,
+                ":modified": datetime.now(timezone.utc).isoformat(),
+                ":category_id": str(item["category_id"]),
+            },
+        )
+        updated[str(name)] = profile_name
+    return {"状态": "配置已更新", "profiles": updated}
+
+
 def configure_catalog(event: Dict, now: int = None) -> Dict:
     """修改 YahooAuctionLinks 中单个目录的倒计时扫描配置。"""
     directory_id = str(event.get("directory_id", event.get("category_id", ""))).strip()
@@ -61,9 +141,9 @@ def configure_catalog(event: Dict, now: int = None) -> Dict:
         raise ValueError("缺少 directory_id（目录 ID）")
     item = _find_directory(directory_id)
     now = int(now if now is not None else time.time())
-    active = _integer(event.get("active_count", DEFAULT_ACTIVE_COUNT), "active_count", 1, 1000)
-    closed = _integer(event.get("closed_count", DEFAULT_CLOSED_COUNT), "closed_count", 1, 1000)
-    interval = _integer(event.get("scan_interval_minutes", DEFAULT_INTERVAL_MINUTES),
+    active = _integer(event.get("active_count", 20), "active_count", 1, 1000)
+    closed = _integer(event.get("closed_count", 10), "closed_count", 1, 1000)
+    interval = _integer(event.get("scan_interval_minutes", 10),
                         "scan_interval_minutes", 1, 10080)
     enabled = event.get("scan_enabled", True)
     if not isinstance(enabled, bool):
@@ -111,7 +191,7 @@ def find_due_catalogs(now: int, limit: int = MAX_MODELS_PER_RUN) -> List[Dict]:
 
 
 def claim_catalog(item: Dict, now: int) -> bool:
-    interval = _integer(item.get("countdown_interval_minutes", DEFAULT_INTERVAL_MINUTES),
+    interval = _integer(item.get("countdown_interval_minutes", SCAN_PROFILES[DEFAULT_PROFILE]["interval"]),
                         "countdown_interval_minutes", 1, 10080)
     try:
         lock_until = now + min(LOCK_SECONDS, max(30, interval * 60 - 1))
@@ -134,8 +214,8 @@ def dispatch_to_analyzer(item: Dict) -> bool:
     payload = {"mode": "countdown", "source": "countdown_directory_scanner",
                "category_id": str(item["category_id"]),
                "category": str(item.get("category_name") or item.get("anchor_text") or "").strip(),
-               "active_count": int(item.get("countdown_active_count", DEFAULT_ACTIVE_COUNT)),
-               "closed_count": int(item.get("countdown_closed_count", DEFAULT_CLOSED_COUNT)),
+               "active_count": int(item.get("countdown_active_count", SCAN_PROFILES[DEFAULT_PROFILE]["active"])),
+               "closed_count": int(item.get("countdown_closed_count", SCAN_PROFILES[DEFAULT_PROFILE]["closed"])),
                "force_reprocess": False}
     response = lambda_client.invoke(FunctionName=ANALYZER_FUNCTION_NAME, InvocationType="Event",
                                     Payload=json.dumps(payload, ensure_ascii=False).encode("utf-8"))
@@ -180,7 +260,8 @@ def lambda_handler(event, context):
     try:
         mode = event.get("mode", "schedule")
         if mode == "configure":
-            result = configure_catalog(event)
+            result = (configure_profiles(event) if "profiles" in event or not
+                      (event.get("directory_id") or event.get("category_id")) else configure_catalog(event))
         elif mode == "schedule":
             result = run_schedule(event)
         else:

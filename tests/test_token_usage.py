@@ -22,6 +22,7 @@ class TokenUsageTest(unittest.TestCase):
             {"promptTokenCount": 12, "candidatesTokenCount": 8, "totalTokenCount": 20},
             prompt="测试提示",
             task_type="DISCOVER_MODELS",
+            category_name="デジタルカメラ",
             table=table,
         )
 
@@ -34,6 +35,7 @@ class TokenUsageTest(unittest.TestCase):
         self.assertEqual(item["total_tokens"], 20)
         self.assertEqual(item["prompt_chars"], 4)
         self.assertEqual(item["task_type"], "DISCOVER_MODELS")
+        self.assertEqual(item["category_name"], "デジタルカメラ")
         self.assertTrue(item["call_id"].endswith("#abc"))
 
     def test_storage_failure_does_not_break_ai_workflow(self):

@@ -181,6 +181,7 @@ review_db = dynamodb.Table(REVIEW_TABLE)
 sns = boto3.client("sns")
 _total_tokens = 0
 _start_time = None
+_token_usage_category = ""
 
 # ======================================
 # Repository
@@ -511,7 +512,8 @@ def call_ai(prompt: str, max_tokens: int) -> Tuple[Optional[Dict],Optional[str]]
                 tokens_used = u.get("total_tokens",u.get("totalTokenCount",0))
                 _total_tokens += tokens_used
                 record_token_usage(mode, cfg["model"], u, prompt=prompt,
-                                   task_type="AUCTION_ANALYSIS")
+                                   task_type="AUCTION_ANALYSIS",
+                                   category_name=_token_usage_category)
                 logger.info(f"AI response: mode={mode}, tokens={tokens_used}, total_tokens={_total_tokens}")
                 
                 if is_gem:
@@ -2777,9 +2779,10 @@ def execute_workflow(kw: str, ac: int, cc: int, force: bool, source_model: Optio
 # ======================================
 
 def lambda_handler(event, context):
-    global _total_tokens, _start_time
+    global _total_tokens, _start_time, _token_usage_category
     _total_tokens = 0
     _start_time = time.time()
+    _token_usage_category = ""
     
     try:
         ac = max(1, min(int(event.get("active_count", 100)), 100))
@@ -2795,8 +2798,9 @@ def lambda_handler(event, context):
                     "statusCode": 400,
                     "body": json.dumps({"error": "倒计时模式需要 category_id"}, ensure_ascii=False),
                 }
+            _token_usage_category = norm(event.get("category", ""))
             result = execute_countdown_workflow(
-                category_id, ac, cc_val, force, norm(event.get("category", ""))
+                category_id, ac, cc_val, force, _token_usage_category
             )
             return {
                 "statusCode": 200,

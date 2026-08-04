@@ -14,7 +14,8 @@ import boto3
 logger = logging.getLogger(__name__)
 
 
-def record_token_usage(provider, model, usage, *, prompt="", task_type="", table=None):
+def record_token_usage(provider, model, usage, *, prompt="", task_type="",
+                       category_name="", table=None):
     """记录一次已完成的 AI 调用；统计写入失败不会影响主业务。"""
     table_name = os.environ.get("TOKEN_USAGE_TABLE", "")
     if table is None and not table_name:
@@ -35,6 +36,7 @@ def record_token_usage(provider, model, usage, *, prompt="", task_type="", table
         "provider": str(provider),
         "model": str(model),
         "task_type": str(task_type),
+        "category_name": str(category_name),
         "function_name": os.environ.get("AWS_LAMBDA_FUNCTION_NAME", "local"),
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
