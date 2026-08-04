@@ -80,6 +80,7 @@ PRODUCT_TABLE_NAME = os.environ.get("TABLE_NAME", "ProductCatalog-dev")
 BUY_CANDIDATE_TABLE = os.environ.get(
     "BUY_CANDIDATE_TABLE", "YahooAuctionBuyCandidates-dev"
 )
+REVIEW_TABLE = os.environ.get("REVIEW_TABLE", "YahooAuctionReview-dev")
 FINAL_CHECK_BEFORE_MINUTES = _env("FINAL_CHECK_BEFORE_MINUTES", 15, int)
 SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN", "")
 AI_MODE = _env("AI_MODE", "doubao")
@@ -111,6 +112,14 @@ AI_CONFIGS = {
         "model": _env("DOUBAO_MODEL", "qwen-plus-character"),
         "timeout": max(300, _env("DOUBAO_TIMEOUT", 300, int)),
         "max_tokens": _env("DOUBAO_MAX_TOKENS", 12000, int),
+    },
+    "deepseek": {
+        "name": "deepseek",
+        "type": "openai",
+        "url": _env("DEEPSEEK_URL", "https://api.deepseek.com/chat/completions"),
+        "model": _env("DEEPSEEK_MODEL", "deepseek-v4-flash"),
+        "timeout": _env("DEEPSEEK_TIMEOUT", 60, int),
+        "max_tokens": _env("DEEPSEEK_MAX_TOKENS", 12000, int),
     },
     "openai": {
         "name": "openai",
@@ -168,6 +177,7 @@ active_db = dynamodb.Table(TABLE_ACTIVE)
 closed_db = dynamodb.Table(TABLE_CLOSED)
 product_catalog_db = dynamodb.Table(PRODUCT_TABLE_NAME)
 buy_candidate_db = dynamodb.Table(BUY_CANDIDATE_TABLE)
+review_db = dynamodb.Table(REVIEW_TABLE)
 sns = boto3.client("sns")
 _total_tokens = 0
 _start_time = None
@@ -413,7 +423,9 @@ def get_ai_cfg(excluded_modes=None):
     excluded_modes 只用于一次 call_ai 调用内的故障转移，避免失败状态跨批次保留。
     """
     excluded_modes = set(excluded_modes or ())
-    order = [AI_MODE] + [m for m in ["gemini","doubao","openai"] if m != AI_MODE]
+    # 当前首选模式失败后，DeepSeek 固定为第二优先级。
+    fallback_order = ["deepseek", "gemini", "doubao", "openai"]
+    order = [AI_MODE] + [m for m in fallback_order if m != AI_MODE]
 
     for mode in order:
         if mode in excluded_modes:
@@ -454,7 +466,7 @@ def call_ai(prompt: str, max_tokens: int) -> Tuple[Optional[Dict],Optional[str]]
     logger.info("PROMPT_LENGTH=%s current_tokens=%s", len(prompt), _total_tokens)
 
     failed_modes = set()
-    for attempt in range(3):
+    for attempt in range(len(AI_CONFIGS)):
         cfg = get_ai_cfg(failed_modes)
         if not cfg:
             logger.error("All AI modes unavailable")
@@ -1896,6 +1908,50 @@ def upsert_buy_candidate(item_id: str, item: Dict, pricing: Dict,
         update_record(buy_candidate_db, str(item_id), notification_fields)
 
 
+def upsert_review_item(item_id: str, item: Dict, pricing: Dict,
+                       recommendation: str):
+    """将所有推荐或待审核商品写入人工审核表，不按置信度过滤。"""
+    if recommendation not in (Recommendation.BUY_CANDIDATE, Recommendation.REVIEW):
+        return
+    now = int(time.time())
+    models = item.get("models") or []
+    active_snapshot = {
+        key: item.get(key) for key in (
+            "itemID", "title", "url", "thumbnailUrl", "keyword", "price",
+            "buynowPrice", "endTime", "sellerType", "listingType",
+            "conditionClass", "modelStatus", "detailSummary", "riskSummary",
+            "buyReason", "conditionRisk", "aiMatched",
+        ) if key in item
+    }
+    active_snapshot["models"] = models
+    closed_samples = build_closed_reference_samples(pricing, limit=10)
+    fields = {
+        "界面语言": "中文",
+        "审核状态": "待审核",
+        "recommendation": recommendation,
+        "pricingConfidence": str(pricing.get("pricingConfidence", 0)),
+        "activeItem": active_snapshot,
+        "closedReferences": closed_samples,
+        "closedReferenceCount": len(closed_samples),
+        "pricingResult": pricing,
+        "updatedAt": now,
+    }
+    names, values, assignments = {}, {":created": now}, [
+        "createdAt = if_not_exists(createdAt, :created)"
+    ]
+    for index, (key, value) in enumerate(fields.items()):
+        name, token = f"#review{index}", f":review{index}"
+        names[name], values[token] = key, _to_dynamo(value)
+        assignments.append(f"{name} = {token}")
+    review_db.update_item(
+        Key={"itemID": str(item_id)},
+        UpdateExpression="SET " + ", ".join(assignments),
+        ExpressionAttributeNames=names,
+        ExpressionAttributeValues=values,
+    )
+    logger.info("人工审核记录已保存: itemID=%s recommendation=%s", item_id, recommendation)
+
+
 def deactivate_buy_candidate(item_id: str, reason: str):
     """取消尚未发送提醒的候选记录。"""
     existing = buy_candidate_db.get_item(Key={"itemID": str(item_id)}).get("Item")
@@ -1952,6 +2008,11 @@ def price_active_item(item_id: str, idx: Dict[str,List[Dict]],
         sd(pricing.get("profitMarginAtCurrentBid", 0)),
     )
     save_pricing(item_id, pricing, recommendation)
+    try:
+        upsert_review_item(item_id, item, pricing, recommendation)
+    except Exception as exc:
+        # 人工审核表是旁路能力，不能阻断定价主流程。
+        logger.exception("人工审核表同步失败: itemID=%s error=%s", item_id, exc)
     if sync_candidate:
         try:
             if recommendation == Recommendation.BUY_CANDIDATE:
