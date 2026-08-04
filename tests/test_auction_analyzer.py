@@ -98,12 +98,13 @@ class LeanAiWorkflowTest(unittest.TestCase):
             "mode": "countdown",
             "keyword": "",
             "category_id": "2084317598",
+            "category": "智能手机本体",
             "active_count": 13,
             "closed_count": 17,
         }, None)
 
         self.assertEqual(response["statusCode"], 200)
-        workflow.assert_called_once_with("2084317598", 13, 17, False)
+        workflow.assert_called_once_with("2084317598", 13, 17, False, "智能手机本体")
 
     def test_lambda_handler_requires_category_for_countdown_mode(self):
         response = lambda_handler({"mode": "countdown", "keyword": ""}, None)
@@ -138,7 +139,7 @@ class LeanAiWorkflowTest(unittest.TestCase):
 
         self.assertEqual(result["status"], "COMPLETED")
         scrape_active_mock.assert_called_once_with(
-            "", 10, 0, False, {"category_id": "2084317598"}
+            "", 10, 0, False, {"category_id": "2084317598", "category": ""}
         )
         scrape_closed_mock.assert_called_once()
         self.assertEqual(scrape_closed_mock.call_args.args[0], "Nikon Z 7II")
@@ -553,7 +554,7 @@ class LeanAiWorkflowTest(unittest.TestCase):
             {"itemId": "expensive", "price": 101},
         ]
 
-        source_model = {"brand": "Sony", "model": "PlayStation 5"}
+        source_model = {"category": "游戏机", "brand": "Sony", "model": "PlayStation 5"}
         item_ids = scrape_active("camera", 10, max_p=100, source_model=source_model)
 
         self.assertEqual(item_ids, ["cheap", "limit"])
@@ -561,6 +562,7 @@ class LeanAiWorkflowTest(unittest.TestCase):
         saved_ids = [call.args[1] for call in upsert_scraped_item.call_args_list]
         self.assertEqual(saved_ids, ["cheap", "limit"])
         for call in upsert_scraped_item.call_args_list:
+            self.assertEqual(call.args[2]["category"], "游戏机")
             self.assertEqual(call.args[2]["sourceModel"], source_model)
             # A record without a previous sourceModel must be reset so that an
             # old model result can never be reused for this target.
