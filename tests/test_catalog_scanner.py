@@ -52,7 +52,8 @@ class CatalogScannerTest(unittest.TestCase):
         self.assertEqual(kwargs["ExpressionAttributeValues"][":now"], 2000)
 
     def test_claim_uses_atomic_time_and_lock_guards(self):
-        item = {"crawl_id": "link-1", "category_id": "1", "countdown_interval_minutes": 15}
+        item = {"crawl_id": "link-1", "category_id": "1", "category_name": "相机",
+                "countdown_interval_minutes": 15}
         self.assertTrue(catalog_scanner.claim_catalog(item, 1000))
         kwargs = self.table.update_item.call_args.kwargs
         self.assertIn("countdown_next_scan_at <= :now", kwargs["ConditionExpression"])
@@ -62,13 +63,15 @@ class CatalogScannerTest(unittest.TestCase):
     def test_dispatch_uses_catalog_counts_and_countdown_mode(self):
         self.lambda_client.invoke.return_value = {"StatusCode": 202}
         item = {
-            "crawl_id": "link-1", "category_id": "1", "countdown_active_count": 30,
+            "crawl_id": "link-1", "category_id": "1", "category_name": "相机",
+            "countdown_active_count": 30,
             "countdown_closed_count": 80,
         }
         self.assertTrue(catalog_scanner.dispatch_to_analyzer(item))
         payload = json.loads(self.lambda_client.invoke.call_args.kwargs["Payload"])
         self.assertEqual(payload["mode"], "countdown")
         self.assertEqual(payload["category_id"], "1")
+        self.assertEqual(payload["category"], "相机")
         self.assertNotIn("product_pk", payload)
         self.assertEqual(payload["active_count"], 30)
         self.assertEqual(payload["closed_count"], 80)

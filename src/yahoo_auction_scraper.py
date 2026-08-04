@@ -1309,6 +1309,10 @@ def scrape_auctions(keyword, search_type, include_paypay=True,
 
             items = enriched_items
 
+        # 将调用方已知的分类名称附到每件商品上，入库后可直接查看分类。
+        for item in items:
+            item["category"] = str(category or "").strip()
+
         all_items.extend(items)
 
         if parsed_item_count < ITEMS_PER_PAGE:
@@ -1782,6 +1786,7 @@ def save_items(items, table):
                     "modifiedAt": modified_at,
                     "itemType": item.get("itemType", "unknown"),
                     "title": item.get("title", ""),
+                    "category": item.get("category", ""),
                     "localListingType": item.get("localListingType", LocalListingType.UNKNOWN),
                     "localFilterReason": item.get("localFilterReason", ""),
                     "price": item.get("price", 0),

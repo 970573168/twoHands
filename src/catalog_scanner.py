@@ -133,6 +133,7 @@ def claim_catalog(item: Dict, now: int) -> bool:
 def dispatch_to_analyzer(item: Dict) -> bool:
     payload = {"mode": "countdown", "source": "countdown_directory_scanner",
                "category_id": str(item["category_id"]),
+               "category": str(item.get("category_name") or item.get("anchor_text") or "").strip(),
                "active_count": int(item.get("countdown_active_count", DEFAULT_ACTIVE_COUNT)),
                "closed_count": int(item.get("countdown_closed_count", DEFAULT_CLOSED_COUNT)),
                "force_reprocess": False}

@@ -2121,6 +2121,9 @@ def scrape_active(kw: str, cnt: int, max_p: int = 0, force: bool = False,
                         "itemCondition": item.get("itemCondition"),
                         "thumbnailUrl": item.get("thumbnailUrl", ""),
                         "keyword": kw,
+                        # 分类名称放在顶层，便于直接在 ActiveItems 表中查看、筛选，
+                        # 不必再展开 sourceModel。
+                        "category": norm((source_model or {}).get("category", "")),
                         "sourceModel": source_model or {},
                     },
                     # Active records are global by auction ID.  Re-run model
@@ -2158,7 +2161,8 @@ def _first_identified_model(item: Dict) -> Optional[Dict]:
     return None
 
 
-def execute_countdown_workflow(category_id: str, ac: int, cc: int, force: bool) -> Dict:
+def execute_countdown_workflow(category_id: str, ac: int, cc: int, force: bool,
+                               category: str = "") -> Dict:
     """从某个分类下即将结束的 active 商品开始分析。
 
     与常规型号工作流不同，本入口先用空关键词按分类抓 active，再由 AI 识别
@@ -2170,7 +2174,10 @@ def execute_countdown_workflow(category_id: str, ac: int, cc: int, force: bool) 
     try:
         check_limits()
         logger.info("倒计时步骤 13-14：按分类抓取即将结束商品 category_id=%s", category_id)
-        active_ids = scrape_active("", ac, 0, force, {"category_id": category_id})
+        active_ids = scrape_active(
+            "", ac, 0, force,
+            {"category_id": category_id, "category": norm(category)},
+        )
         result["active"] = len(active_ids)
         if not active_ids:
             return {**result, "status": "NO_ACTIVE"}
@@ -2727,7 +2734,9 @@ def lambda_handler(event, context):
                     "statusCode": 400,
                     "body": json.dumps({"error": "倒计时模式需要 category_id"}, ensure_ascii=False),
                 }
-            result = execute_countdown_workflow(category_id, ac, cc_val, force)
+            result = execute_countdown_workflow(
+                category_id, ac, cc_val, force, norm(event.get("category", ""))
+            )
             return {
                 "statusCode": 200,
                 "body": json.dumps(result, ensure_ascii=False, default=str),
