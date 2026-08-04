@@ -287,7 +287,7 @@ class LeanAiWorkflowTest(unittest.TestCase):
         })
 
     def test_buy_and_review_always_require_detail_recheck(self):
-        base = {"pricingStatus": Status.COMPLETED, "netProfitAtCurrentBid": 1}
+        base = {"pricingStatus": Status.COMPLETED, "netProfitAtCurrentBid": 5000}
         self.assertTrue(should_reanalyze_description({}, {
             **base, "profitMarginAtCurrentBid": Decimal("0.20"),
         }))
@@ -530,6 +530,7 @@ class LeanAiWorkflowTest(unittest.TestCase):
 
         upsert_buy_candidate("item-2", {"endTime": "unknown"}, {
             "estimatedMarketPrice": 10000,
+            "netProfitAtCurrentBid": 5000,
         })
 
         values = candidate_db.update_item.call_args.kwargs["ExpressionAttributeValues"]
@@ -582,6 +583,7 @@ class LeanAiWorkflowTest(unittest.TestCase):
         }
         pricing = {
             "estimatedMarketPrice": 17500,
+            "netProfitAtCurrentBid": 5000,
             "comparableItemIds": ["closed-1"],
         }
 
@@ -616,6 +618,8 @@ class LeanAiWorkflowTest(unittest.TestCase):
         pricing = {
             "pricingConfidence": Decimal("0.01"),
             "estimatedMarketPrice": 18000,
+            "netProfitAtCurrentBid": 8000,
+            "pricingStatus": Status.INSUFFICIENT_DATA,
             "comparableItemIds": ["closed-1"],
         }
 
@@ -624,6 +628,7 @@ class LeanAiWorkflowTest(unittest.TestCase):
         values = review_db.update_item.call_args.kwargs["ExpressionAttributeValues"]
         self.assertIn("待审核", values.values())
         self.assertIn("0.01", values.values())
+        self.assertIn(True, values.values())
         active = next(value for value in values.values() if isinstance(value, dict)
                       and value.get("itemID") == "active-1")
         closed = next(value for value in values.values() if isinstance(value, list)
@@ -1002,8 +1007,27 @@ class LeanAiWorkflowTest(unittest.TestCase):
 
     def test_purchase_decision_uses_only_profit_rules(self):
         self.assertEqual(calc_decision(Decimal("-1"), Decimal("0.50")), Recommendation.AVOID)
-        self.assertEqual(calc_decision(Decimal("1"), Decimal("0.20")), Recommendation.BUY_CANDIDATE)
-        self.assertEqual(calc_decision(Decimal("1"), Decimal("0.199")), Recommendation.REVIEW)
+        self.assertEqual(calc_decision(Decimal("4999"), Decimal("0.50")), Recommendation.AVOID)
+        self.assertEqual(calc_decision(Decimal("5000"), Decimal("0.20")), Recommendation.BUY_CANDIDATE)
+        self.assertEqual(calc_decision(Decimal("5000"), Decimal("0.199")), Recommendation.REVIEW)
+
+    @patch("auction_analyzer.review_db")
+    def test_low_profit_is_not_written_to_review_table(self, review_db):
+        upsert_review_item("active-1", {}, {
+            "netProfitAtCurrentBid": 4999,
+            "pricingStatus": Status.INSUFFICIENT_DATA,
+        }, Recommendation.REVIEW)
+
+        review_db.update_item.assert_not_called()
+
+    @patch("auction_analyzer.buy_candidate_db")
+    def test_low_profit_is_not_written_to_candidate_table(self, candidate_db):
+        upsert_buy_candidate("active-1", {}, {
+            "netProfitAtCurrentBid": 4999,
+        })
+
+        candidate_db.update_item.assert_not_called()
+        candidate_db.get_item.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

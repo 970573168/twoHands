@@ -292,6 +292,11 @@ Parameters:
   ReviewMarginThreshold:
     Type: Number
     Default: 0.10
+  MinReviewProfit:
+    Type: Number
+    Default: 5000
+    MinValue: 0
+    Description: 进入人工审核表或购买候选表所需的最低预计利润（日元）
   HighConfidenceComparableCount:
     Type: Number
     Default: 10
@@ -1224,6 +1229,7 @@ Resources:
           MIN_COMPARABLE_COUNT: !Ref MinComparableCount
           BUY_MARGIN_THRESHOLD: !Ref BuyMarginThreshold
           REVIEW_MARGIN_THRESHOLD: !Ref ReviewMarginThreshold
+          MIN_REVIEW_PROFIT: !Ref MinReviewProfit
           SELLER_BLACKLIST_OCCURRENCE_THRESHOLD: !Ref SellerBlacklistOccurrenceThreshold
 
           MAX_TOKENS: !Ref MaxTotalTokens
