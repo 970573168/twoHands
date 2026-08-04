@@ -240,6 +240,9 @@ jobs:
               "Environment=${{ env.environment }}" \
               "LambdaCodeS3Bucket=${{ env.s3_bucket }}" \
               "LambdaCodeS3Key=${{ env.s3_key }}" \
+              "GeminiApiKey=${{ secrets.GEMINI_API_KEY }}" \
+              "DoubaoApiKey=${{ secrets.DOUBAO_API_KEY }}" \
+              "OpenaiApiKey=${{ secrets.OPENAI_API_KEY }}" \
             --capabilities CAPABILITY_NAMED_IAM \
             --no-fail-on-empty-changeset \
             2>&1 | tee deploy.log
