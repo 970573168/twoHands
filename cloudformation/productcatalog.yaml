@@ -245,6 +245,11 @@ Parameters:
   MaxActiveItems:
     Type: Number
     Default: 100
+  SellerBlacklistOccurrenceThreshold:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    Description: 卖家出现次数超过此值且从未产生正利润率时加入黑名单
   AiRequestTimeout:
     Type: Number
     Default: 300
@@ -1219,6 +1224,7 @@ Resources:
           MIN_COMPARABLE_COUNT: !Ref MinComparableCount
           BUY_MARGIN_THRESHOLD: !Ref BuyMarginThreshold
           REVIEW_MARGIN_THRESHOLD: !Ref ReviewMarginThreshold
+          SELLER_BLACKLIST_OCCURRENCE_THRESHOLD: !Ref SellerBlacklistOccurrenceThreshold
 
           MAX_TOKENS: !Ref MaxTotalTokens
           SIMPLE_MAX_TOKENS: "4000"
