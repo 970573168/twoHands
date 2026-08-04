@@ -12,6 +12,7 @@ os.environ.setdefault("AWS_EC2_METADATA_DISABLED", "true")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from auction_analyzer import (
+    _get_key,
     ListingType,
     Recommendation,
     Status,
@@ -39,6 +40,12 @@ from auction_analyzer import (
     upsert_buy_candidate,
     update_record,
 )
+
+
+class AiApiKeyEnvironmentTest(unittest.TestCase):
+    def test_reads_api_key_injected_from_github_secret(self):
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "github-secret-key"}):
+            self.assertEqual(_get_key("openai"), "github-secret-key")
 
 
 class NormalizePricingKeyTest(unittest.TestCase):

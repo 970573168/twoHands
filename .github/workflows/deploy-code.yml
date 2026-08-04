@@ -240,6 +240,9 @@ jobs:
               "Environment=${{ env.environment }}" \
               "LambdaCodeS3Bucket=${{ env.s3_bucket }}" \
               "LambdaCodeS3Key=${{ env.s3_key }}" \
+              "GeminiApiKey=${{ secrets.GEMINI_API_KEY }}" \
+              "DoubaoApiKey=${{ secrets.DOUBAO_API_KEY }}" \
+              "OpenaiApiKey=${{ secrets.OPENAI_API_KEY }}" \
             --capabilities CAPABILITY_NAMED_IAM \
             --no-fail-on-empty-changeset \
             2>&1 | tee deploy.log
@@ -355,6 +358,32 @@ jobs:
           echo "方式: $([ '${{ steps.check.outputs.deploy_all }}' == 'true' ] && echo '完整部署 (CloudFormation + Lambda)' || echo '代码更新 (Lambda)')"
           echo "包路径: s3://${{ env.s3_bucket }}/${{ env.s3_key }}"
           echo "=========================================="
+
+      - name: 发送真实提醒测试邮件
+        if: success() && steps.check.outputs.update_final_check == 'true'
+        run: |
+          FUNCTION_NAME="YahooAuctionFinalCheckReminder-${{ env.environment }}"
+          echo "📧 正在通过 $FUNCTION_NAME 发送真实 SNS 测试邮件..."
+          aws lambda invoke \
+            --function-name "$FUNCTION_NAME" \
+            --cli-binary-format raw-in-base64-out \
+            --payload '{"mode":"test_email","deployment_id":"${{ github.sha }}"}' \
+            --no-cli-pager \
+            test-email-response.json > test-email-metadata.json
+
+          if jq -e '.FunctionError' test-email-metadata.json >/dev/null; then
+            echo "❌ Lambda 执行失败"
+            cat test-email-metadata.json
+            cat test-email-response.json
+            exit 1
+          fi
+          if [[ "$(jq -r '.statusCode' test-email-response.json)" != "200" ]]; then
+            echo "❌ 真实测试邮件发布失败"
+            cat test-email-response.json
+            exit 1
+          fi
+          echo "✅ 真实测试邮件发布成功"
+          cat test-email-response.json
 
       - name: 部署失败通知
         if: failure()

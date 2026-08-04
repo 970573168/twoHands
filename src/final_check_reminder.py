@@ -106,10 +106,12 @@ def lock_candidate(item_id):
 
 
 def _email(candidate, current_price, pricing):
-    subject = "【BUY候选】あと15分：{} {}".format(
+    subject = "【BUY候选】结束前提醒：{} {}".format(
         candidate.get("brand", ""), candidate.get("model", "")
     )
-    message = f"""BUY_CANDIDATE 复核通过，拍卖即将结束。
+    message = f"""第二次复核已通过，拍卖即将结束。
+
+当前利润仍满足 BUY 候选条件，请及时决定是否出价。
 
 商品：{candidate.get('title', '')}
 当前价：{current_price}円
@@ -126,6 +128,29 @@ ROI：{pricing['roi']}
 
 请在结束前确认是否出价。"""
     sns.publish(TopicArn=SNS_TOPIC_ARN, Subject=subject[:100], Message=message)
+
+
+def send_deployment_test_email(deployment_id=""):
+    """向真实 SNS Topic 发送部署测试邮件；发布失败会让 Lambda 调用失败。"""
+    if not SNS_TOPIC_ARN:
+        raise RuntimeError("未配置提醒邮件 SNS Topic")
+    subject = "【部署测试】BUY 候选提醒邮件发送正常"
+    message = f"""这是一封自动部署测试邮件。
+
+BUY 候选提醒 Lambda 已成功连接 SNS，并完成真实邮件发布。
+部署标识：{deployment_id or '未提供'}
+测试时间：{datetime.now(timezone.utc).isoformat()}
+
+无需处理本邮件。"""
+    response = sns.publish(
+        TopicArn=SNS_TOPIC_ARN,
+        Subject=subject,
+        Message=message,
+    )
+    message_id = response.get("MessageId")
+    if not message_id:
+        raise RuntimeError("SNS 未返回 MessageId")
+    return message_id
 
 
 def process_candidate(candidate, now=None):
@@ -222,6 +247,16 @@ def process_candidate(candidate, now=None):
 
 
 def lambda_handler(event, context):
+    event = event or {}
+    if event.get("mode") == "test_email":
+        message_id = send_deployment_test_email(str(event.get("deployment_id", "")))
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "状态": "真实测试邮件已发送",
+                "SNS消息ID": message_id,
+            }, ensure_ascii=False),
+        }
     now = int(time.time())
     response = candidate_db.query(
         IndexName="GSI_FinalCheck",

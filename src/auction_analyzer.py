@@ -168,7 +168,6 @@ active_db = dynamodb.Table(TABLE_ACTIVE)
 closed_db = dynamodb.Table(TABLE_CLOSED)
 product_catalog_db = dynamodb.Table(PRODUCT_TABLE_NAME)
 buy_candidate_db = dynamodb.Table(BUY_CANDIDATE_TABLE)
-secrets = boto3.client("secretsmanager")
 sns = boto3.client("sns")
 _total_tokens = 0
 _start_time = None
@@ -390,84 +389,26 @@ def check_limits():
 # AI Service
 # ======================================
 
-def _extract_secret_value(secret_string: str, mode: str) -> str:
-    """从 Secrets Manager 的 SecretString 中提取 API Key。"""
-    if not secret_string:
-        return ""
-
-    try:
-        secret_dict = json.loads(secret_string)
-    except json.JSONDecodeError:
-        return secret_string.strip()
-
-    if not isinstance(secret_dict, dict):
-        return ""
-
-    logger.info("Secret JSON keys: %s", list(secret_dict.keys()))
-    for key_name in (
-        "apiKey",
-        "api_key",
-        "key",
-        "GEMINI_API_KEY",
-        "DOUBAO_API_KEY",
-        "OPENAI_API_KEY",
-        f"{mode.upper()}_API_KEY",
-    ):
-        val = secret_dict.get(key_name)
-        if val:
-            logger.info("Found key via '%s'", key_name)
-            return str(val).strip()
-
-    first_val = next((v for v in secret_dict.values() if v), "")
-    if first_val:
-        logger.info("Using first non-empty value from JSON secret")
-        return str(first_val).strip()
-
-    return ""
-
-
 def _is_valid_header_key(key: str, mode: str) -> bool:
     """验证 API Key 能否安全写入 HTTP Header。"""
     if not key or any(char.isspace() for char in key):
-        logger.error("Secret value for %s is empty or contains whitespace", mode)
+        logger.error("API Key for %s is empty or contains whitespace", mode)
         return False
     try:
         key.encode("ascii")
     except UnicodeEncodeError:
-        logger.error("Secret value for %s contains non-ASCII characters", mode)
+        logger.error("API Key for %s contains non-ASCII characters", mode)
         return False
     return True
 
 
 def _get_key(mode: str) -> str:
-    """仅从 Secrets Manager 获取 AI API Key。
-
-    API Key 不从 Lambda 环境变量读取，统一通过
-    <mode>-api-key-<ENVIRONMENT> 管理；SECRET_NAME 仅作为旧版 Secret 名称兜底。
-    """
-    env = os.getenv("ENVIRONMENT", "dev")
-    secret_names = [f"{mode}-api-key-{env}"]
-
-    legacy_secret = os.getenv("SECRET_NAME", "").strip()
-    if legacy_secret:
-        secret_names.append(legacy_secret)
-
-    for secret_name in dict.fromkeys(secret_names):
-        logger.info("Reading secret: %s", secret_name)
-        try:
-            response = secrets.get_secret_value(SecretId=secret_name)
-            secret_string = response.get("SecretString", "")
-            logger.info("Secret retrieved, length=%s", len(secret_string))
-            key = _extract_secret_value(secret_string, mode)
-            if key and _is_valid_header_key(key, mode):
-                return key
-        except Exception as e:
-            logger.error("Secret read failed for %s: %s: %s", secret_name, type(e).__name__, e)
-
-    return ""
+    """读取由 GitHub Actions Secret 注入 CloudFormation 的 Lambda 环境变量。"""
+    key = os.getenv(f"{mode.upper()}_API_KEY", "").strip()
+    return key if _is_valid_header_key(key, mode) else ""
 
 def get_ai_cfg(excluded_modes=None):
-    """获取 AI 配置，key 只从 Secrets Manager 读取。
+    """获取 AI 配置，API Key 由部署流程从 GitHub Secrets 注入。
 
     excluded_modes 只用于一次 call_ai 调用内的故障转移，避免失败状态跨批次保留。
     """
@@ -484,13 +425,12 @@ def get_ai_cfg(excluded_modes=None):
         
         cfg = dict(original)
         
-        # ★ 只从 Secrets Manager 读 key
         key = _get_key(mode)
         url = str(cfg.get("url") or "").strip()
         model = str(cfg.get("model") or "").strip()
         
         if not key:
-            logger.warning("AI mode %s skipped: API key missing from Secrets Manager", mode)
+            logger.warning("AI mode %s skipped: API key environment variable missing", mode)
             continue
         
         if not url:
@@ -1808,10 +1748,10 @@ def build_closed_reference_samples(pricing: Dict, limit: int = 10) -> List[Dict]
 
 def send_countdown_candidate_email(candidate: Dict):
     """发送倒计时模式候选商品的首次入库通知。"""
-    subject = "【倒计时入库】{} {}".format(
+    subject = "【倒计时发现】立即查看：{} {}".format(
         candidate.get("brand", ""), candidate.get("model", "")
     ).strip()
-    message = f"""倒计时模式发现新的 BUY_CANDIDATE，已写入候选库。
+    message = f"""倒计时发现新的 BUY 候选，已立即写入候选库。
 
 商品：{candidate.get('title', '')}
 当前价：{candidate.get('currentBidPrice', 0)}円
@@ -1826,7 +1766,7 @@ ROI：{candidate.get('roiAtCurrentBid', '')}
 商品链接：
 {candidate.get('url', '')}
 
-系统仍会在拍卖结束前进行最终复核。"""
+剩余时间过半后，系统仍会在拍卖结束前进行第二次复核；只有利润仍满足条件时，才会发送最终 BUY 候选邮件。"""
     sns.publish(TopicArn=SNS_TOPIC_ARN, Subject=subject[:100], Message=message)
 
 
