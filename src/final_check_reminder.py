@@ -106,10 +106,12 @@ def lock_candidate(item_id):
 
 
 def _email(candidate, current_price, pricing):
-    subject = "【BUY候选】あと15分：{} {}".format(
+    subject = "【BUY候选】结束前提醒：{} {}".format(
         candidate.get("brand", ""), candidate.get("model", "")
     )
-    message = f"""BUY_CANDIDATE 复核通过，拍卖即将结束。
+    message = f"""第二次复核已通过，拍卖即将结束。
+
+当前利润仍满足 BUY 候选条件，请及时决定是否出价。
 
 商品：{candidate.get('title', '')}
 当前价：{current_price}円
