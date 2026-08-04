@@ -559,6 +559,8 @@ class LeanAiWorkflowTest(unittest.TestCase):
             "itemID": "active-1", "title": "当前拍卖", "price": 10000,
             "url": "https://example.test/active-1",
             "models": [{"brand": "Sony", "model": "A1"}],
+            "seller": {"id": "seller-1", "rating": 99},
+            "新字段": "必须保留",
         }
         pricing = {
             "pricingConfidence": Decimal("0.01"),
@@ -576,6 +578,7 @@ class LeanAiWorkflowTest(unittest.TestCase):
         closed = next(value for value in values.values() if isinstance(value, list)
                       and value and value[0].get("itemID") == "closed-1")
         self.assertEqual(active["title"], "当前拍卖")
+        self.assertEqual(active, item)
         self.assertEqual(closed[0]["title"], "成交参考")
 
     @patch("auction_analyzer.upsert_scraped_item")

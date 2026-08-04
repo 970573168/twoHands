@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from decimal import Decimal
 
 import boto3
@@ -130,21 +130,6 @@ ROI：{pricing['roi']}
     sns.publish(TopicArn=SNS_TOPIC_ARN, Subject=subject[:100], Message=message)
 
 
-def send_test_email():
-    """通过真实 SNS Topic 发送部署测试邮件，不写入候选表。"""
-    if not SNS_TOPIC_ARN:
-        raise RuntimeError("缺少 SNS_TOPIC_ARN，无法发送测试邮件")
-    now = datetime.now(timezone.utc).isoformat()
-    response = sns.publish(
-        TopicArn=SNS_TOPIC_ARN,
-        Subject="【系统测试】Yahoo 拍卖提醒邮件",
-        Message=("这是一封真实的邮件发送测试。\n\n"
-                 "Yahoo 拍卖最终复核提醒服务已成功连接 SNS。\n"
-                 f"测试时间（UTC）：{now}\n"),
-    )
-    return {"状态": "测试邮件已发送", "消息ID": response.get("MessageId", "")}
-
-
 def process_candidate(candidate, now=None):
     now = int(now if now is not None else time.time())
     item_id = str(candidate["itemID"])
@@ -240,13 +225,11 @@ def process_candidate(candidate, now=None):
 
 def lambda_handler(event, context):
     event = event or {}
-    if event.get("mode") == "test_email":
-        try:
-            result = send_test_email()
-            return {"statusCode": 200, "body": json.dumps(result, ensure_ascii=False)}
-        except Exception as exc:
-            logger.exception("测试邮件发送失败")
-            return {"statusCode": 500, "body": json.dumps({"错误": str(exc)}, ensure_ascii=False)}
+    if event.get("mode") not in (None, "schedule"):
+        return {
+            "statusCode": 400,
+            "body": json.dumps({"错误": "邮件测试功能已关闭，仅支持定时复核"}, ensure_ascii=False),
+        }
     now = int(time.time())
     response = candidate_db.query(
         IndexName="GSI_FinalCheck",
