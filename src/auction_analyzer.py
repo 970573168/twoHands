@@ -1916,16 +1916,9 @@ def upsert_review_item(item_id: str, item: Dict, pricing: Dict,
     if recommendation not in (Recommendation.BUY_CANDIDATE, Recommendation.REVIEW):
         return
     now = int(time.time())
-    models = item.get("models") or []
-    active_snapshot = {
-        key: item.get(key) for key in (
-            "itemID", "title", "url", "thumbnailUrl", "keyword", "price",
-            "buynowPrice", "endTime", "sellerType", "listingType",
-            "conditionClass", "modelStatus", "detailSummary", "riskSummary",
-            "buyReason", "conditionRisk", "aiMatched",
-        ) if key in item
-    }
-    active_snapshot["models"] = models
+    # 人工审核时需要查看 active 表的完整原始记录；不要在这里维护容易遗漏
+    # 新字段的白名单。转换为普通字典也可避免后续给审核记录补字段时修改入参。
+    active_snapshot = dict(item)
     closed_samples = build_closed_reference_samples(pricing, limit=10)
     fields = {
         "界面语言": "中文",

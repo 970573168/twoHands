@@ -66,9 +66,7 @@ def _scan_directories() -> List[Dict]:
             "FilterExpression": "attribute_exists(category_id) AND category_id <> :empty",
             "ExpressionAttributeValues": {":empty": ""},
             "ProjectionExpression": ("crawl_id, category_id, category_name, anchor_text, "
-                                     "countdown_scan_profile, countdown_scan_enabled, "
-                                     "countdown_active_count, countdown_closed_count, "
-                                     "countdown_interval_minutes"),
+                                     "countdown_scan_profile, countdown_scan_enabled"),
         }
         if start_key:
             params["ExclusiveStartKey"] = start_key
@@ -97,12 +95,7 @@ def configure_profiles(event: Dict, now: int = None) -> Dict:
             name = _category_name(item)
             if not name or not item.get("countdown_scan_enabled"):
                 continue
-            current[name] = {
-                "profile": item.get("countdown_scan_profile"),
-                "active": int(item.get("countdown_active_count", 0)),
-                "closed": int(item.get("countdown_closed_count", 0)),
-                "interval": int(item.get("countdown_interval_minutes", 0)),
-            }
+            current[name] = item.get("countdown_scan_profile")
         return {"状态": "运行中配置", "count": len(current), "profiles": current}
 
     by_name = {_category_name(item): item for item in directories if _category_name(item)}

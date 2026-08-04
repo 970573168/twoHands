@@ -12,7 +12,7 @@ os.environ.setdefault("AWS_EC2_METADATA_DISABLED", "true")
 os.environ.setdefault("SNS_TOPIC_ARN", "arn:aws:sns:ap-northeast-1:123456789012:test")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from final_check_reminder import calculate_final_pricing, process_candidate
+from final_check_reminder import calculate_final_pricing, lambda_handler, process_candidate
 
 
 class FinalCheckReminderTest(unittest.TestCase):
@@ -27,6 +27,16 @@ class FinalCheckReminderTest(unittest.TestCase):
         pricing = calculate_final_pricing(self.candidate, 50000)
         self.assertEqual(pricing["market"], 100000)
         self.assertEqual(pricing["recommendation"], "BUY_CANDIDATE")
+
+    @patch("final_check_reminder.sns.publish")
+    @patch("final_check_reminder.candidate_db.query")
+    def test_test_email_mode_is_closed(self, query, publish):
+        response = lambda_handler({"mode": "test_email"}, None)
+
+        self.assertEqual(response["statusCode"], 400)
+        self.assertIn("邮件测试功能已关闭", response["body"])
+        query.assert_not_called()
+        publish.assert_not_called()
 
     @patch("final_check_reminder._email")
     @patch("final_check_reminder._update")

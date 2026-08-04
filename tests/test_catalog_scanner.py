@@ -76,17 +76,13 @@ class CatalogScannerTest(unittest.TestCase):
         self.assertEqual(result, {
             "状态": "运行中配置",
             "count": 1,
-            "profiles": {
-                "デジタルカメラ": {
-                    "profile": "MEDIUM", "active": 20, "closed": 10, "interval": 10,
-                },
-            },
+            "profiles": {"デジタルカメラ": "MEDIUM"},
         })
         self.table.update_item.assert_not_called()
 
         projection = self.table.scan.call_args.kwargs["ProjectionExpression"]
         self.assertIn("countdown_scan_enabled", projection)
-        self.assertIn("countdown_active_count", projection)
+        self.assertNotIn("countdown_active_count", projection)
 
     def test_off_profile_disables_scanning_with_zero_counts(self):
         self.table.scan.return_value = {"Items": [{
