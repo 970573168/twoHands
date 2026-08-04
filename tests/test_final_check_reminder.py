@@ -12,7 +12,7 @@ os.environ.setdefault("AWS_EC2_METADATA_DISABLED", "true")
 os.environ.setdefault("SNS_TOPIC_ARN", "arn:aws:sns:ap-northeast-1:123456789012:test")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
-from final_check_reminder import calculate_final_pricing, process_candidate
+from final_check_reminder import _email, calculate_final_pricing, process_candidate
 
 
 class FinalCheckReminderTest(unittest.TestCase):
@@ -27,6 +27,22 @@ class FinalCheckReminderTest(unittest.TestCase):
         pricing = calculate_final_pricing(self.candidate, 50000)
         self.assertEqual(pricing["market"], 100000)
         self.assertEqual(pricing["recommendation"], "BUY_CANDIDATE")
+
+    @patch("final_check_reminder.sns.publish")
+    def test_reminder_can_publish_chinese_email(self, publish):
+        pricing = calculate_final_pricing(self.candidate, 50000)
+
+        _email(self.candidate, 50000, pricing)
+
+        publish.assert_called_once()
+        request = publish.call_args.kwargs
+        self.assertEqual(
+            request["TopicArn"],
+            "arn:aws:sns:ap-northeast-1:123456789012:test",
+        )
+        self.assertIn("【BUY候选】结束前提醒", request["Subject"])
+        self.assertIn("第二次复核已通过", request["Message"])
+        self.assertIn("当前利润仍满足", request["Message"])
 
     @patch("final_check_reminder._email")
     @patch("final_check_reminder._update")

@@ -1808,10 +1808,10 @@ def build_closed_reference_samples(pricing: Dict, limit: int = 10) -> List[Dict]
 
 def send_countdown_candidate_email(candidate: Dict):
     """发送倒计时模式候选商品的首次入库通知。"""
-    subject = "【倒计时入库】{} {}".format(
+    subject = "【倒计时发现】立即查看：{} {}".format(
         candidate.get("brand", ""), candidate.get("model", "")
     ).strip()
-    message = f"""倒计时模式发现新的 BUY_CANDIDATE，已写入候选库。
+    message = f"""倒计时发现新的 BUY 候选，已立即写入候选库。
 
 商品：{candidate.get('title', '')}
 当前价：{candidate.get('currentBidPrice', 0)}円
@@ -1826,7 +1826,7 @@ ROI：{candidate.get('roiAtCurrentBid', '')}
 商品链接：
 {candidate.get('url', '')}
 
-系统仍会在拍卖结束前进行最终复核。"""
+剩余时间过半后，系统仍会在拍卖结束前进行第二次复核；只有利润仍满足条件时，才会发送最终 BUY 候选邮件。"""
     sns.publish(TopicArn=SNS_TOPIC_ARN, Subject=subject[:100], Message=message)
 
 
