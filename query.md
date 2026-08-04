@@ -12,9 +12,9 @@ TABLES = [
     "AiTokenUsage-dev",
     "YahooAuctionActiveItems-dev",
     "YahooAuctionItems-dev",
-    "ProductCatalog-dev",
-    "YahooAuctionBuyCandidates-dev",
     "YahooAuctionReview-dev",
+    "YahooAuctionBuyCandidates-dev",
+    "ProductCatalog-dev",
     "YahooAuctionLinks-dev"  # 新增
 ]
 
