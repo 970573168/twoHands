@@ -359,6 +359,27 @@ jobs:
           echo "包路径: s3://${{ env.s3_bucket }}/${{ env.s3_key }}"
           echo "=========================================="
 
+      - name: 发送真实测试邮件
+        if: success() && (steps.check.outputs.deploy_all == 'true' || steps.check.outputs.update_final_check == 'true')
+        run: |
+          FUNCTION_NAME="YahooAuctionFinalCheckReminder-${{ env.environment }}"
+          echo "📧 正在通过 $FUNCTION_NAME 发送真实 SNS 测试邮件..."
+          aws lambda invoke \
+            --function-name "$FUNCTION_NAME" \
+            --cli-binary-format raw-in-base64-out \
+            --payload '{"mode":"test_email"}' \
+            /tmp/test-email-response.json \
+            --no-cli-pager >/tmp/test-email-metadata.json
+          cat /tmp/test-email-response.json
+          python - <<'PY'
+          import json
+          with open('/tmp/test-email-response.json', encoding='utf-8') as file:
+              response = json.load(file)
+          if response.get('statusCode') != 200:
+              raise SystemExit(f"真实测试邮件发送失败：{response}")
+          print("✅ 真实测试邮件已经提交给 SNS")
+          PY
+
       - name: 部署失败通知
         if: failure()
         run: |

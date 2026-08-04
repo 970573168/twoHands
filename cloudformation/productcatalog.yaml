@@ -317,6 +317,7 @@ Conditions:
     - !Equals [!Ref DeployCatalogScanner, "true"]
     - !Condition DeployMainAppCondition
     - !Condition DeployScraperCondition
+    - !Condition DeployLinkCrawlerCondition
 
 Resources:
   # ============================================
@@ -855,8 +856,8 @@ Resources:
                   - dynamodb:Scan
                   - dynamodb:UpdateItem
                 Resource:
-                  - !GetAtt ProductCatalogTable.Arn
-                  - !Sub "${ProductCatalogTable.Arn}/index/*"
+                  - !GetAtt YahooAuctionLinksTable.Arn
+                  - !Sub "${YahooAuctionLinksTable.Arn}/index/*"
               - Sid: InvokeAnalyzerLambda
                 Effect: Allow
                 Action: lambda:InvokeFunction
@@ -1218,7 +1219,7 @@ Resources:
       - CatalogScannerRole
     Properties:
       FunctionName: !Sub "CatalogScanner-${Environment}"
-      Description: 管理目录倒计时配置，并按目录间隔触发倒计时分析
+      Description: 使用 YahooAuctionLinks 管理目录倒计时配置，并按目录 ID 触发倒计时分析
       Runtime: python3.12
       Architectures:
         - arm64
@@ -1231,7 +1232,7 @@ Resources:
         S3Key: !Ref LambdaCodeS3Key
       Environment:
         Variables:
-          TABLE_NAME: !Ref ProductCatalogTable
+          LINK_CRAWLER_TABLE_NAME: !Ref YahooAuctionLinksTable
           ANALYZER_FUNCTION_NAME: !Ref AuctionAnalyzerFunction
           MAX_MODELS_PER_RUN: !Ref CatalogScannerMaxModels
           DEFAULT_SCAN_INTERVAL_MINUTES: "180"
