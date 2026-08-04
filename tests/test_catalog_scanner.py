@@ -64,14 +64,29 @@ class CatalogScannerTest(unittest.TestCase):
         self.table.scan.return_value = {"Items": [
             {"crawl_id": "1", "category_id": "1", "category_name": "スマホ本体"},
             {"crawl_id": "2", "category_id": "2", "category_name": "プリンタ",
-             "countdown_scan_profile": "OFF"},
+             "countdown_scan_profile": "OFF", "countdown_scan_enabled": False},
+            {"crawl_id": "3", "category_id": "3", "category_name": "デジタルカメラ",
+             "countdown_scan_profile": "MEDIUM", "countdown_scan_enabled": True,
+             "countdown_active_count": 20, "countdown_closed_count": 10,
+             "countdown_interval_minutes": 10},
         ]}
 
         result = catalog_scanner.configure_profiles({"profiles": {}})
 
-        self.assertEqual(result["状态"], "当前运行配置")
-        self.assertEqual(result["profiles"], {"スマホ本体": "FAST", "プリンタ": "OFF"})
+        self.assertEqual(result, {
+            "状态": "运行中配置",
+            "count": 1,
+            "profiles": {
+                "デジタルカメラ": {
+                    "profile": "MEDIUM", "active": 20, "closed": 10, "interval": 10,
+                },
+            },
+        })
         self.table.update_item.assert_not_called()
+
+        projection = self.table.scan.call_args.kwargs["ProjectionExpression"]
+        self.assertIn("countdown_scan_enabled", projection)
+        self.assertIn("countdown_active_count", projection)
 
     def test_off_profile_disables_scanning_with_zero_counts(self):
         self.table.scan.return_value = {"Items": [{
