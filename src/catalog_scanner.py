@@ -99,9 +99,9 @@ def configure_profiles(event: Dict, now: int = None) -> Dict:
                 continue
             current[name] = {
                 "profile": item.get("countdown_scan_profile"),
-                "active": item.get("countdown_active_count"),
-                "closed": item.get("countdown_closed_count"),
-                "interval": item.get("countdown_interval_minutes"),
+                "active": int(item.get("countdown_active_count", 0)),
+                "closed": int(item.get("countdown_closed_count", 0)),
+                "interval": int(item.get("countdown_interval_minutes", 0)),
             }
         return {"状态": "运行中配置", "count": len(current), "profiles": current}
 
