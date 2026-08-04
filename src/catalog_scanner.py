@@ -23,13 +23,6 @@ SCAN_PROFILES = {
     "MEDIUM": {"enabled": True, "active": 20, "closed": 10, "interval": 10},
     "FAST": {"enabled": True, "active": 30, "closed": 15, "interval": 5},
 }
-CATEGORY_DEFAULT_PROFILES = {
-    "スマホ本体": "FAST",
-    "デジタルカメラ": "MEDIUM",
-    "ノートPC": "MEDIUM",
-    "プリンタ": "SLOW",
-}
-DEFAULT_PROFILE = "MEDIUM"
 
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table(TABLE_NAME)
@@ -73,7 +66,9 @@ def _scan_directories() -> List[Dict]:
             "FilterExpression": "attribute_exists(category_id) AND category_id <> :empty",
             "ExpressionAttributeValues": {":empty": ""},
             "ProjectionExpression": ("crawl_id, category_id, category_name, anchor_text, "
-                                     "countdown_scan_profile"),
+                                     "countdown_scan_profile, countdown_scan_enabled, "
+                                     "countdown_active_count, countdown_closed_count, "
+                                     "countdown_interval_minutes"),
         }
         if start_key:
             params["ExclusiveStartKey"] = start_key
@@ -97,12 +92,18 @@ def configure_profiles(event: Dict, now: int = None) -> Dict:
         raise ValueError("profiles 必须是分类名字到挡位的对象")
     directories = _scan_directories()
     if not profiles:
-        current = {
-            name: str(item.get("countdown_scan_profile") or
-                      CATEGORY_DEFAULT_PROFILES.get(name, DEFAULT_PROFILE)).upper()
-            for item in directories if (name := _category_name(item))
-        }
-        return {"状态": "当前运行配置", "profiles": current, "可用挡位": list(SCAN_PROFILES)}
+        current = {}
+        for item in directories:
+            name = _category_name(item)
+            if not name or not item.get("countdown_scan_enabled"):
+                continue
+            current[name] = {
+                "profile": item.get("countdown_scan_profile"),
+                "active": item.get("countdown_active_count"),
+                "closed": item.get("countdown_closed_count"),
+                "interval": item.get("countdown_interval_minutes"),
+            }
+        return {"状态": "运行中配置", "count": len(current), "profiles": current}
 
     by_name = {_category_name(item): item for item in directories if _category_name(item)}
     now = int(now if now is not None else time.time())
@@ -191,7 +192,7 @@ def find_due_catalogs(now: int, limit: int = MAX_MODELS_PER_RUN) -> List[Dict]:
 
 
 def claim_catalog(item: Dict, now: int) -> bool:
-    interval = _integer(item.get("countdown_interval_minutes", SCAN_PROFILES[DEFAULT_PROFILE]["interval"]),
+    interval = _integer(item.get("countdown_interval_minutes"),
                         "countdown_interval_minutes", 1, 10080)
     try:
         lock_until = now + min(LOCK_SECONDS, max(30, interval * 60 - 1))
@@ -211,11 +212,13 @@ def claim_catalog(item: Dict, now: int) -> bool:
 
 
 def dispatch_to_analyzer(item: Dict) -> bool:
+    active_count = _integer(item.get("countdown_active_count"), "countdown_active_count", 1, 1000)
+    closed_count = _integer(item.get("countdown_closed_count"), "countdown_closed_count", 1, 1000)
     payload = {"mode": "countdown", "source": "countdown_directory_scanner",
                "category_id": str(item["category_id"]),
                "category": str(item.get("category_name") or item.get("anchor_text") or "").strip(),
-               "active_count": int(item.get("countdown_active_count", SCAN_PROFILES[DEFAULT_PROFILE]["active"])),
-               "closed_count": int(item.get("countdown_closed_count", SCAN_PROFILES[DEFAULT_PROFILE]["closed"])),
+               "active_count": active_count,
+               "closed_count": closed_count,
                "force_reprocess": False}
     response = lambda_client.invoke(FunctionName=ANALYZER_FUNCTION_NAME, InvocationType="Event",
                                     Payload=json.dumps(payload, ensure_ascii=False).encode("utf-8"))
