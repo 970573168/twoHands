@@ -1,10 +1,10 @@
 AWSTemplateFormatVersion: "2010-09-09"
 
 Description: >
-  电子产品目录采集器 + AI API Secret + Yahoo Auction 抓取器 + 分析工作流 + 目录定期扫描器
+  电子产品目录采集器 + Yahoo Auction 抓取器 + 分析工作流 + 倒计时目录扫描器
   支持多 AI 模式切换（Gemini / 豆包 / OpenAI）
   包含递归链接爬虫（增量版）
-  所有定时器默认关闭，需手动启用
+  倒计时目录扫描器每分钟运行；其他定时器按资源配置启停
 
 Parameters:
   # ============ 通用参数 ============
@@ -288,11 +288,6 @@ Parameters:
     Default: "false"
     AllowedValues: ["true", "false"]
 
-  CountdownScanEventJson:
-    Type: String
-    Default: '{"mode":"countdown","keyword":"","category_id":"2084317598","active_count":100,"closed_count":100}'
-    Description: 倒计时扫描定时器传给 YahooAuctionAnalyzer 的 JSON 参数
-
   # ============ Yahoo Auction 详情抓取参数 ============
   EnableDetailScrape:
     Type: String
@@ -315,9 +310,6 @@ Parameters:
     Default: 10
 
 Conditions:
-  CreateGeminiSecret: !Not [!Equals [!Ref GeminiApiKey, ""]]
-  CreateDoubaoSecret: !Not [!Equals [!Ref DoubaoApiKey, ""]]
-  CreateOpenaiSecret: !Not [!Equals [!Ref OpenaiApiKey, ""]]
   DeployMainAppCondition: !Equals [!Ref DeployMainApp, "true"]
   DeployScraperCondition: !Equals [!Ref DeployScraper, "true"]
   DeployLinkCrawlerCondition: !Equals [!Ref DeployLinkCrawler, "true"]
@@ -327,55 +319,6 @@ Conditions:
     - !Condition DeployScraperCondition
 
 Resources:
-  # ============================================
-  # AI API Secrets
-  # ============================================
-  
-  GeminiApiSecret:
-    Type: AWS::SecretsManager::Secret
-    Condition: CreateGeminiSecret
-    Properties:
-      Name: !Sub "gemini-api-key-${Environment}"
-      Description: Gemini API Key for Yahoo Auction Analyzer
-      SecretString: !Sub '{"GEMINI_API_KEY":"${GeminiApiKey}"}'
-      Tags:
-        - Key: Application
-          Value: YahooAuctionAnalyzer
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: Type
-          Value: Gemini
-
-  DoubaoApiSecret:
-    Type: AWS::SecretsManager::Secret
-    Condition: CreateDoubaoSecret
-    Properties:
-      Name: !Sub "doubao-api-key-${Environment}"
-      Description: Doubao API Key for Yahoo Auction Analyzer
-      SecretString: !Sub '{"DOUBAO_API_KEY":"${DoubaoApiKey}"}'
-      Tags:
-        - Key: Application
-          Value: YahooAuctionAnalyzer
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: Type
-          Value: Doubao
-
-  OpenaiApiSecret:
-    Type: AWS::SecretsManager::Secret
-    Condition: CreateOpenaiSecret
-    Properties:
-      Name: !Sub "openai-api-key-${Environment}"
-      Description: OpenAI API Key for Yahoo Auction Analyzer
-      SecretString: !Sub '{"OPENAI_API_KEY":"${OpenaiApiKey}"}'
-      Tags:
-        - Key: Application
-          Value: YahooAuctionAnalyzer
-        - Key: Environment
-          Value: !Ref Environment
-        - Key: Type
-          Value: OpenAI
-
   # ============================================
   # DynamoDB Tables
   # ============================================
@@ -714,13 +657,6 @@ Resources:
                 Effect: Allow
                 Action: dynamodb:PutItem
                 Resource: !GetAtt AiTokenUsageTable.Arn
-              - Sid: ReadApiSecrets
-                Effect: Allow
-                Action: secretsmanager:GetSecretValue
-                Resource:
-                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:gemini-api-key-${Environment}-*"
-                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:doubao-api-key-${Environment}-*"
-                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:openai-api-key-${Environment}-*"
               - Sid: WriteLambdaLogs
                 Effect: Allow
                 Action:
@@ -877,13 +813,6 @@ Resources:
                 Effect: Allow
                 Action: dynamodb:UpdateItem
                 Resource: !GetAtt ProductCatalogTable.Arn
-              - Sid: ReadAllApiSecrets
-                Effect: Allow
-                Action: secretsmanager:GetSecretValue
-                Resource:
-                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:gemini-api-key-${Environment}-*"
-                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:doubao-api-key-${Environment}-*"
-                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:openai-api-key-${Environment}-*"
               - Sid: WriteTokenUsage
                 Effect: Allow
                 Action: dynamodb:PutItem
@@ -969,6 +898,9 @@ Resources:
           TOKEN_USAGE_TABLE: !Ref AiTokenUsageTable
           ENVIRONMENT: !Ref Environment
           AI_MODE: !Ref AiMode
+          GEMINI_API_KEY: !Ref GeminiApiKey
+          DOUBAO_API_KEY: !Ref DoubaoApiKey
+          OPENAI_API_KEY: !Ref OpenaiApiKey
           GEMINI_MODEL: !Ref GeminiModel
           GEMINI_URL: !Ref GeminiUrl
           GEMINI_TIMEOUT: !Ref GeminiTimeout
@@ -1214,6 +1146,9 @@ Resources:
           TOKEN_USAGE_TABLE: !Ref AiTokenUsageTable
 
           AI_MODE: !Ref AiMode
+          GEMINI_API_KEY: !Ref GeminiApiKey
+          DOUBAO_API_KEY: !Ref DoubaoApiKey
+          OPENAI_API_KEY: !Ref OpenaiApiKey
           GEMINI_MODEL: !Ref GeminiModel
           GEMINI_URL: !Ref GeminiUrl
           GEMINI_TIMEOUT: !Ref GeminiTimeout
@@ -1275,29 +1210,6 @@ Resources:
         - Key: Environment
           Value: !Ref Environment
 
-  # 定时器：Yahoo Auction Analyzer 倒计时扫描 - 每 5 分钟，默认关闭
-  YahooAuctionCountdownScanScheduleRule:
-    Type: AWS::Events::Rule
-    Condition: DeployScraperCondition
-    Properties:
-      Name: !Sub "YahooAuctionAnalyzer-Countdown-Schedule-${Environment}"
-      Description: 每 5 分钟触发 Yahoo Auction Analyzer 倒计时扫描（默认关闭）
-      ScheduleExpression: rate(5 minutes)
-      State: DISABLED
-      Targets:
-        - Arn: !GetAtt AuctionAnalyzerFunction.Arn
-          Id: YahooAuctionCountdownScanTarget
-          Input: !Ref CountdownScanEventJson
-
-  YahooAuctionCountdownScanInvokePermission:
-    Type: AWS::Lambda::Permission
-    Condition: DeployScraperCondition
-    Properties:
-      Action: lambda:InvokeFunction
-      FunctionName: !Ref AuctionAnalyzerFunction
-      Principal: events.amazonaws.com
-      SourceArn: !GetAtt YahooAuctionCountdownScanScheduleRule.Arn
-
   CatalogScannerFunction:
     Type: AWS::Lambda::Function
     Condition: DeployCatalogScannerCondition
@@ -1306,7 +1218,7 @@ Resources:
       - CatalogScannerRole
     Properties:
       FunctionName: !Sub "CatalogScanner-${Environment}"
-      Description: 定期扫描产品目录，触发分析
+      Description: 管理目录倒计时配置，并按目录间隔触发倒计时分析
       Runtime: python3.12
       Architectures:
         - arm64
@@ -1322,35 +1234,29 @@ Resources:
           TABLE_NAME: !Ref ProductCatalogTable
           ANALYZER_FUNCTION_NAME: !Ref AuctionAnalyzerFunction
           MAX_MODELS_PER_RUN: !Ref CatalogScannerMaxModels
-          SCAN_INTERVAL_DAYS: "3"
+          DEFAULT_SCAN_INTERVAL_MINUTES: "180"
+          SCAN_LOCK_SECONDS: "900"
           MAX_ACTIVE_COUNT: !Ref MaxActiveItems
           MAX_CLOSED_COUNT: !Ref MaxClosedPerModel
-          DISPATCH_INTERVAL_SECONDS: "0.3"
-          DISPATCH_JITTER_SECONDS: "0.2"
-          STARTUP_JITTER_SECONDS: "1"
-          BATCH_SIZE: "5"
-          BATCH_INTERVAL_SECONDS: "1"
-          TODAY_TAG_KEY: "last_scanned_date"
-          DATA_SOURCE: "AI_DISCOVERY"
       Tags:
         - Key: Application
           Value: CatalogScanner
         - Key: Environment
           Value: !Ref Environment
 
-  # 定时器：Catalog Scanner - 默认关闭
+  # 定时器：倒计时目录扫描 - 每分钟开启
   CatalogScannerScheduleRule:
     Type: AWS::Events::Rule
     Condition: DeployCatalogScannerCondition
     Properties:
       Name: !Sub "CatalogScanner-Schedule-${Environment}"
-      Description: 定期触发目录扫描器 (默认关闭)
-      ScheduleExpression: rate(3 minutes)
-      State: DISABLED
+      Description: 每分钟遍历已开启且到期的目录，并避免重复投递
+      ScheduleExpression: rate(1 minute)
+      State: ENABLED
       Targets:
         - Arn: !GetAtt CatalogScannerFunction.Arn
           Id: "CatalogScannerTarget"
-          Input: !Sub '{"source":"aws.events","max_models":${CatalogScannerMaxModels}}'
+          Input: !Sub '{"source":"aws.events","mode":"schedule","max_models":${CatalogScannerMaxModels}}'
 
   CatalogScannerInvokePermission:
     Type: AWS::Lambda::Permission

@@ -15,7 +15,6 @@ from token_usage import record_token_usage
 
 dynamodb = boto3.resource("dynamodb")
 table = dynamodb.Table(os.environ["TABLE_NAME"])
-secretsmanager = boto3.client("secretsmanager")
 
 # ============================================
 # 所有配置项都从环境变量读取
@@ -60,7 +59,6 @@ BLOCK_HIGH_COUNTERFEIT = os.environ.get("BLOCK_HIGH_COUNTERFEIT", "false").lower
 CATALOG_SAVE_BUT_DISABLE_SCAN = os.environ.get("CATALOG_SAVE_BUT_DISABLE_SCAN", "true").lower() == "true"
 
 # ========== 旧版配置（向后兼容） ==========
-SECRET_NAME = os.environ.get("SECRET_NAME", "")
 API_URL = os.environ.get("API_URL", "")
 MODEL = os.environ.get("AI_MODEL", "")
 
@@ -435,42 +433,6 @@ def is_good_for_auction_analysis(
 # AI 配置管理
 # ============================================
 
-def _get_api_key_from_secrets(mode: str) -> str:
-    """从 Secrets Manager 获取 API Key"""
-    secret_name_map = {
-        "gemini": f"gemini-api-key-{os.environ.get('ENVIRONMENT', 'dev')}",
-        "doubao": f"doubao-api-key-{os.environ.get('ENVIRONMENT', 'dev')}",
-        "openai": f"openai-api-key-{os.environ.get('ENVIRONMENT', 'dev')}",
-    }
-    
-    secret_name = secret_name_map.get(mode)
-    if not secret_name:
-        return ""
-    
-    try:
-        response = secretsmanager.get_secret_value(SecretId=secret_name)
-        secret_string = response.get("SecretString", "")
-        if not secret_string:
-            return ""
-        
-        try:
-            secret_dict = json.loads(secret_string)
-            return (
-                secret_dict.get("apiKey") or 
-                secret_dict.get("api_key") or 
-                secret_dict.get("key") or
-                secret_dict.get("GEMINI_API_KEY") or
-                secret_dict.get("DOUBAO_API_KEY") or
-                secret_dict.get("OPENAI_API_KEY") or
-                ""
-            )
-        except json.JSONDecodeError:
-            return secret_string.strip()
-    except Exception as e:
-        log("DEBUG", "从 Secrets Manager 获取 Key 失败", mode=mode, error=str(e))
-        return ""
-
-
 def get_ai_config(mode: str = None) -> dict:
     """获取 AI 配置"""
     if mode is None:
@@ -479,25 +441,25 @@ def get_ai_config(mode: str = None) -> dict:
     configs = {
         "gemini": {
             "name": "gemini", "type": "gemini", "url": GEMINI_URL,
-            "key": GEMINI_API_KEY or _get_api_key_from_secrets("gemini"),
+            "key": GEMINI_API_KEY,
             "model": GEMINI_MODEL, "timeout": GEMINI_TIMEOUT, "max_tokens": GEMINI_MAX_TOKENS,
         },
         "doubao": {
             "name": "doubao", "type": "openai_compatible", "url": DOUBAO_URL,
-            "key": DOUBAO_API_KEY or _get_api_key_from_secrets("doubao"),
+            "key": DOUBAO_API_KEY,
             "model": DOUBAO_MODEL, "timeout": DOUBAO_TIMEOUT, "max_tokens": DOUBAO_MAX_TOKENS,
         },
         "openai": {
             "name": "openai", "type": "openai_compatible", "url": OPENAI_URL,
-            "key": OPENAI_API_KEY or _get_api_key_from_secrets("openai"),
+            "key": OPENAI_API_KEY,
             "model": OPENAI_MODEL, "timeout": OPENAI_TIMEOUT, "max_tokens": OPENAI_MAX_TOKENS,
         }
     }
     
-    if mode not in configs and SECRET_NAME and API_URL:
+    if mode not in configs and API_URL:
         return {
             "name": "legacy", "type": "openai_compatible", "url": API_URL,
-            "key": _get_legacy_api_key(), "model": MODEL or "doubao-seed-2-1-pro-260628",
+            "key": os.environ.get("API_KEY", ""), "model": MODEL or "doubao-seed-2-1-pro-260628",
             "timeout": REQUEST_TIMEOUT, "max_tokens": int(os.environ.get("MAX_TOKENS", "4000")),
         }
     
@@ -509,18 +471,7 @@ def get_ai_config(mode: str = None) -> dict:
 
 
 def _get_legacy_api_key() -> str:
-    if not SECRET_NAME: return ""
-    try:
-        response = secretsmanager.get_secret_value(SecretId=SECRET_NAME)
-        secret_string = response.get("SecretString", "")
-        if not secret_string: return ""
-        try:
-            secret_data = json.loads(secret_string)
-            return secret_data.get("apiKey") or secret_data.get("api_key") or secret_data.get("key") or ""
-        except json.JSONDecodeError:
-            return secret_string.strip()
-    except Exception:
-        return ""
+    return os.environ.get("API_KEY", "")
 
 
 def get_available_ai_config() -> dict:
@@ -542,7 +493,7 @@ def get_available_ai_config() -> dict:
             log("INFO", f"选择 AI 模式: '{mode}'")
             return config
     
-    if SECRET_NAME and API_URL:
+    if API_URL:
         legacy_config = get_ai_config("legacy")
         if legacy_config["key"]:
             log("INFO", "使用旧版 AI 配置")

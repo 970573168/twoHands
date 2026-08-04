@@ -55,6 +55,10 @@ if grep -n '_ai_state' "$LAMBDA_DIR/auction_analyzer.py"; then
 fi
 
 echo ""
+echo "🧪 Running automatic tests (including countdown scheduler and reminder checks)..."
+python -m unittest tests.test_catalog_scanner tests.test_final_check_reminder
+
+echo ""
 echo "📦 Installing dependencies into build directory..."
 pip install -r requirements.txt -t "$BUILD_DIR" \
   --platform manylinux2014_aarch64 \
