@@ -27,13 +27,15 @@ class CatalogScannerTest(unittest.TestCase):
         self.addCleanup(self.lambda_patch.stop)
 
     def test_configure_mode_updates_four_catalog_fields(self):
+        self.table.scan.return_value = {"Items": [{"crawl_id": "link-1", "category_id": "1"}]}
         result = catalog_scanner.configure_catalog({
-            "product_pk": "PRODUCT#Sony#A7", "active_count": 30,
+            "directory_id": "1", "active_count": 30,
             "closed_count": 80, "scan_interval_minutes": 15,
             "scan_enabled": True,
         }, now=1000)
 
-        self.assertEqual(result["状态"], "配置已更新")
+        self.assertEqual(result["目录ID"], "1")
+        self.assertEqual(self.table.update_item.call_args.kwargs["Key"], {"crawl_id": "link-1"})
         values = self.table.update_item.call_args.kwargs["ExpressionAttributeValues"]
         self.assertEqual(values[":active"], 30)
         self.assertEqual(values[":closed"], 80)
@@ -50,7 +52,7 @@ class CatalogScannerTest(unittest.TestCase):
         self.assertEqual(kwargs["ExpressionAttributeValues"][":now"], 2000)
 
     def test_claim_uses_atomic_time_and_lock_guards(self):
-        item = {"PK": "PRODUCT#Sony#A7", "countdown_interval_minutes": 15}
+        item = {"crawl_id": "link-1", "category_id": "1", "countdown_interval_minutes": 15}
         self.assertTrue(catalog_scanner.claim_catalog(item, 1000))
         kwargs = self.table.update_item.call_args.kwargs
         self.assertIn("countdown_next_scan_at <= :now", kwargs["ConditionExpression"])
@@ -60,18 +62,19 @@ class CatalogScannerTest(unittest.TestCase):
     def test_dispatch_uses_catalog_counts_and_countdown_mode(self):
         self.lambda_client.invoke.return_value = {"StatusCode": 202}
         item = {
-            "PK": "PRODUCT#Sony#A7", "category": "相机", "category_id": "1",
-            "brand": "Sony", "model": "A7", "countdown_active_count": 30,
+            "crawl_id": "link-1", "category_id": "1", "countdown_active_count": 30,
             "countdown_closed_count": 80,
         }
         self.assertTrue(catalog_scanner.dispatch_to_analyzer(item))
         payload = json.loads(self.lambda_client.invoke.call_args.kwargs["Payload"])
         self.assertEqual(payload["mode"], "countdown")
+        self.assertEqual(payload["category_id"], "1")
+        self.assertNotIn("product_pk", payload)
         self.assertEqual(payload["active_count"], 30)
         self.assertEqual(payload["closed_count"], 80)
 
     def test_dispatch_failure_releases_lock_and_retries_next_minute(self):
-        catalog_scanner.mark_dispatch_failed("PRODUCT#Sony#A7", 1000)
+        catalog_scanner.mark_dispatch_failed("link-1", 1000)
         kwargs = self.table.update_item.call_args.kwargs
         self.assertIn("REMOVE countdown_scan_lock_until", kwargs["UpdateExpression"])
         self.assertEqual(kwargs["ExpressionAttributeValues"][":retry"], 1060)
