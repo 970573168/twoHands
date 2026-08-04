@@ -26,6 +26,7 @@ from auction_analyzer import (
     calc_decision,
     execute_countdown_workflow,
     execute_workflow,
+    get_seller_blacklist,
     lambda_handler,
     normalize_pricing_key,
     pricing_key_with_condition,
@@ -82,6 +83,56 @@ class NormalizePricingKeyTest(unittest.TestCase):
 
 
 class LeanAiWorkflowTest(unittest.TestCase):
+    @patch("auction_analyzer.active_db.scan")
+    def test_seller_blacklist_requires_more_than_fifty_without_positive_profit(self, scan):
+        scan.side_effect = [
+            {
+                "Items": [
+                    {"sellerId": "never-profitable", "pricingResult": {
+                        "profitMarginAtCurrentBid": Decimal("0")
+                    }} for _ in range(50)
+                ] + [
+                    {"sellerId": "has-profit", "pricingResult": {
+                        "profitMarginAtCurrentBid": Decimal("-0.1")
+                    }} for _ in range(50)
+                ],
+                "LastEvaluatedKey": {"itemID": "page-1"},
+            },
+            {
+                "Items": (
+                    [
+                        {"sellerId": "never-profitable"},
+                        {"sellerId": "has-profit", "pricingResult": {
+                            "profitMarginAtCurrentBid": Decimal("0.01")
+                        }},
+                    ] + [{"sellerId": "unknown"} for _ in range(100)]
+                ),
+            },
+        ]
+
+        self.assertEqual(get_seller_blacklist(), {"never-profitable"})
+        self.assertEqual(
+            scan.call_args_list[1].kwargs["ExclusiveStartKey"], {"itemID": "page-1"}
+        )
+
+    @patch("auction_analyzer.get_seller_blacklist", return_value={"blocked-seller"})
+    @patch("auction_analyzer.upsert_scraped_item")
+    @patch("auction_analyzer.get_record", return_value=None)
+    @patch("auction_analyzer.scrape_auctions")
+    def test_active_scrape_excludes_blacklisted_sellers_before_limit(
+        self, scrape_auctions, _get_record, upsert_scraped_item, _blacklist
+    ):
+        scrape_auctions.return_value = [
+            {"itemId": "blocked", "sellerId": "blocked-seller", "price": 10},
+            {"itemId": "allowed", "sellerId": "good-seller", "price": 20},
+        ]
+
+        item_ids = scrape_active("camera", 1)
+
+        self.assertEqual(item_ids, ["allowed"])
+        upsert_scraped_item.assert_called_once()
+        self.assertEqual(upsert_scraped_item.call_args.args[1], "allowed")
+
     def test_countdown_active_prompt_extracts_model_without_source_model(self):
         prompt = build_countdown_active_parse_prompt([{
             "itemID": "a1",
@@ -581,11 +632,12 @@ class LeanAiWorkflowTest(unittest.TestCase):
         self.assertEqual(active, item)
         self.assertEqual(closed[0]["title"], "成交参考")
 
+    @patch("auction_analyzer.get_seller_blacklist", return_value=set())
     @patch("auction_analyzer.upsert_scraped_item")
     @patch("auction_analyzer.get_record", return_value=None)
     @patch("auction_analyzer.scrape_auctions")
     def test_active_scrape_filters_current_price_by_market_upper_limit(
-        self, scrape_auctions, _get_record, upsert_scraped_item
+        self, scrape_auctions, _get_record, upsert_scraped_item, _blacklist
     ):
         scrape_auctions.return_value = [
             {"itemId": "invalid", "price": 0, "buynowPrice": 10},

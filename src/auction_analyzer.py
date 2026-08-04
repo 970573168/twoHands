@@ -145,6 +145,9 @@ MIN_COMPARABLE = _env("MIN_COMPARABLE_COUNT", 3, int)
 HIGH_CONF = _env("HIGH_CONFIDENCE_COUNT", 10, int)
 MED_CONF = _env("MEDIUM_CONFIDENCE_COUNT", 5, int)
 ACTIVE_MAX_RATIO = _env("ACTIVE_MAX_RATIO", Decimal("1.0"), Decimal)
+SELLER_BLACKLIST_OCCURRENCE_THRESHOLD = _env(
+    "SELLER_BLACKLIST_OCCURRENCE_THRESHOLD", 50, int
+)
 MIN_ROI = _env("MIN_ROI", Decimal("0.15"), Decimal)
 FEE_RATE = _env("FEE_RATE", Decimal("0.10"), Decimal)
 SHIPPING_COST = _env("SHIPPING_COST", Decimal("1500"), Decimal)
@@ -2121,6 +2124,51 @@ def scrape_closed(kw: str, cnt: int, force: bool = False, source_model: Optional
         logger.error(f"Closed scrape: {e}")
         return []
 
+
+def get_seller_blacklist() -> Set[str]:
+    """从 active 历史记录生成无盈利卖家黑名单。
+
+    同一卖家出现次数超过配置阈值，并且所有已保存记录都没有正利润率时，
+    才会加入黑名单。扫描失败时返回空集合，避免外部数据读取异常阻断检索。
+    """
+    seller_stats: Dict[str, Dict[str, Union[int, bool]]] = {}
+    start_key = None
+    try:
+        while True:
+            params = {"ProjectionExpression": "sellerId, pricingResult"}
+            if start_key:
+                params["ExclusiveStartKey"] = start_key
+            response = active_db.scan(**params)
+            for record in response.get("Items", []):
+                seller_id = str(record.get("sellerId") or "").strip()
+                if not seller_id or seller_id.lower() == "unknown":
+                    continue
+                stats = seller_stats.setdefault(
+                    seller_id, {"occurrences": 0, "has_positive_profit": False}
+                )
+                stats["occurrences"] = int(stats["occurrences"]) + 1
+                pricing = record.get("pricingResult") or {}
+                if sd(pricing.get("profitMarginAtCurrentBid", 0)) > 0:
+                    stats["has_positive_profit"] = True
+            start_key = response.get("LastEvaluatedKey")
+            if not start_key:
+                break
+    except Exception as exc:
+        logger.exception("读取卖家黑名单失败，将继续处理检索结果: %s", exc)
+        return set()
+
+    blacklist = {
+        seller_id for seller_id, stats in seller_stats.items()
+        if int(stats["occurrences"]) > SELLER_BLACKLIST_OCCURRENCE_THRESHOLD
+        and not bool(stats["has_positive_profit"])
+    }
+    logger.info(
+        "卖家黑名单已生成: threshold=%s sellers=%s",
+        SELLER_BLACKLIST_OCCURRENCE_THRESHOLD,
+        len(blacklist),
+    )
+    return blacklist
+
 def scrape_active(kw: str, cnt: int, max_p: int = 0, force: bool = False,
                   source_model: Optional[Dict] = None) -> List[str]:
     """抓取活跃商品，新商品自动设为 PENDING"""
@@ -2135,6 +2183,19 @@ def scrape_active(kw: str, cnt: int, max_p: int = 0, force: bool = False,
             category_id=(source_model or {}).get("category_id", ""),
             aliases=(source_model or {}).get("aliases") or (source_model or {}).get("alias") or [],
         )
+        seller_blacklist = get_seller_blacklist()
+        if seller_blacklist:
+            before_count = len(items)
+            items = [
+                item for item in items
+                if str(item.get("sellerId") or "").strip() not in seller_blacklist
+            ]
+            logger.info(
+                "Active 卖家黑名单过滤完成: before=%s after=%s excluded=%s",
+                before_count,
+                len(items),
+                before_count - len(items),
+            )
         if max_p > 0:
             before_count = len(items)
             items = [
