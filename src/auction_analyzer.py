@@ -141,6 +141,7 @@ logger.info(
 
 BUY_MARGIN = _env("BUY_MARGIN_THRESHOLD", Decimal("0.20"), Decimal)
 REVIEW_MARGIN = _env("REVIEW_MARGIN_THRESHOLD", Decimal("0.10"), Decimal)
+MIN_REVIEW_PROFIT = _env("MIN_REVIEW_PROFIT", Decimal("5000"), Decimal)
 MIN_COMPARABLE = _env("MIN_COMPARABLE_COUNT", 3, int)
 HIGH_CONF = _env("HIGH_CONFIDENCE_COUNT", 10, int)
 MED_CONF = _env("MEDIUM_CONFIDENCE_COUNT", 5, int)
@@ -1614,7 +1615,8 @@ def calc_profit(est: Decimal, buy: Decimal, ship: Decimal) -> Dict:
 
 def calc_decision(net: Decimal, margin: Decimal) -> str:
     """完全由代码规则生成购买建议，不调用 AI 风险评估。"""
-    if net <= 0:
+    # 低于最低绝对利润的商品没有人工审核价值，也不能成为购买候选。
+    if net < MIN_REVIEW_PROFIT:
         return Recommendation.AVOID
     if margin >= Decimal("0.20"):
         return Recommendation.BUY_CANDIDATE
@@ -1790,6 +1792,12 @@ ROI：{candidate.get('roiAtCurrentBid', '')}
 def upsert_buy_candidate(item_id: str, item: Dict, pricing: Dict,
                          countdown_mode: bool = False):
     """保存 BUY_CANDIDATE；倒计时模式首次入库后立即发送一次邮件。"""
+    if sd(pricing.get("netProfitAtCurrentBid", 0)) < MIN_REVIEW_PROFIT:
+        logger.info(
+            "购买候选已跳过：itemID=%s 预计利润低于最低值 %s 円",
+            item_id, MIN_REVIEW_PROFIT,
+        )
+        return
     market_price = si(pricing.get("estimatedMarketPrice", 0))
     if market_price <= 0:
         review_status = "NO_MARKET_PRICE"
@@ -1918,6 +1926,12 @@ def upsert_review_item(item_id: str, item: Dict, pricing: Dict,
     """将所有推荐或待审核商品写入人工审核表，不按置信度过滤。"""
     if recommendation not in (Recommendation.BUY_CANDIDATE, Recommendation.REVIEW):
         return
+    if sd(pricing.get("netProfitAtCurrentBid", 0)) < MIN_REVIEW_PROFIT:
+        logger.info(
+            "人工审核已跳过：itemID=%s 预计利润低于最低值 %s 円",
+            item_id, MIN_REVIEW_PROFIT,
+        )
+        return
     now = int(time.time())
     # 人工审核时需要查看 active 表的完整原始记录；不要在这里维护容易遗漏
     # 新字段的白名单。转换为普通字典也可避免后续给审核记录补字段时修改入参。
@@ -1926,6 +1940,7 @@ def upsert_review_item(item_id: str, item: Dict, pricing: Dict,
     fields = {
         "界面语言": "中文",
         "审核状态": "待审核",
+        "insufficient": pricing.get("pricingStatus") == Status.INSUFFICIENT_DATA,
         "recommendation": recommendation,
         "pricingConfidence": str(pricing.get("pricingConfidence", 0)),
         "activeItem": active_snapshot,
