@@ -33,6 +33,7 @@ Parameters:
     Default: "doubao"
     AllowedValues:
       - gemini
+      - deepseek
       - doubao
       - openai
     Description: AI 模式选择
@@ -89,6 +90,25 @@ Parameters:
     Type: Number
     Default: 60
   OpenaiMaxTokens:
+    Type: Number
+    Default: 12000
+
+  # ============ DeepSeek 配置（API Key 由 GitHub Secret 注入） ============
+  DeepseekApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: DeepSeek API Key（由 GitHub Secret 注入）
+  DeepseekModel:
+    Type: String
+    Default: "deepseek-v4-flash"
+  DeepseekUrl:
+    Type: String
+    Default: "https://api.deepseek.com/chat/completions"
+  DeepseekTimeout:
+    Type: Number
+    Default: 60
+  DeepseekMaxTokens:
     Type: Number
     Default: 12000
 
@@ -564,6 +584,28 @@ Resources:
         - Key: Environment
           Value: !Ref Environment
 
+  YahooAuctionReviewTable:
+    Type: AWS::DynamoDB::Table
+    Condition: DeployScraperCondition
+    Properties:
+      TableName: !Sub "YahooAuctionReview-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: itemID
+          AttributeType: S
+      KeySchema:
+        - AttributeName: itemID
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Application
+          Value: YahooAuction人工审核
+        - Key: Environment
+          Value: !Ref Environment
+
   YahooAuctionBuyCandidateReminderTopic:
     Type: AWS::SNS::Topic
     Condition: DeployScraperCondition
@@ -810,6 +852,7 @@ Resources:
                   - !GetAtt YahooAuctionActiveTable.Arn
                   - !GetAtt YahooAuctionBuyCandidateTable.Arn
                   - !Sub "${YahooAuctionBuyCandidateTable.Arn}/index/*"
+                  - !GetAtt YahooAuctionReviewTable.Arn
               - Sid: UpdateProductCatalog
                 Effect: Allow
                 Action: dynamodb:UpdateItem
@@ -902,6 +945,7 @@ Resources:
           GEMINI_API_KEY: !Ref GeminiApiKey
           DOUBAO_API_KEY: !Ref DoubaoApiKey
           OPENAI_API_KEY: !Ref OpenaiApiKey
+          DEEPSEEK_API_KEY: !Ref DeepseekApiKey
           GEMINI_MODEL: !Ref GeminiModel
           GEMINI_URL: !Ref GeminiUrl
           GEMINI_TIMEOUT: !Ref GeminiTimeout
@@ -914,6 +958,10 @@ Resources:
           OPENAI_URL: !Ref OpenaiUrl
           OPENAI_TIMEOUT: !Ref OpenaiTimeout
           OPENAI_MAX_TOKENS: !Ref OpenaiMaxTokens
+          DEEPSEEK_MODEL: !Ref DeepseekModel
+          DEEPSEEK_URL: !Ref DeepseekUrl
+          DEEPSEEK_TIMEOUT: !Ref DeepseekTimeout
+          DEEPSEEK_MAX_TOKENS: !Ref DeepseekMaxTokens
           AI_FAILOVER_COOLDOWN: !Ref AiFailoverCooldown
           MAX_CATEGORIES: !Ref MaxCategoriesPerRun
           MAX_BRANDS: !Ref MaxBrandsPerCategory
@@ -1141,6 +1189,7 @@ Resources:
           TABLE_NAME_CLOSED: !Sub "YahooAuctionItems-${Environment}"
           TABLE_NAME: !Ref ProductCatalogTable
           BUY_CANDIDATE_TABLE: !Ref YahooAuctionBuyCandidateTable
+          REVIEW_TABLE: !Ref YahooAuctionReviewTable
           SNS_TOPIC_ARN: !Ref YahooAuctionBuyCandidateReminderTopic
           FINAL_CHECK_BEFORE_MINUTES: !Ref FinalCheckBeforeMinutes
           ENVIRONMENT: !Ref Environment
@@ -1150,6 +1199,7 @@ Resources:
           GEMINI_API_KEY: !Ref GeminiApiKey
           DOUBAO_API_KEY: !Ref DoubaoApiKey
           OPENAI_API_KEY: !Ref OpenaiApiKey
+          DEEPSEEK_API_KEY: !Ref DeepseekApiKey
           GEMINI_MODEL: !Ref GeminiModel
           GEMINI_URL: !Ref GeminiUrl
           GEMINI_TIMEOUT: !Ref GeminiTimeout
@@ -1162,6 +1212,10 @@ Resources:
           OPENAI_URL: !Ref OpenaiUrl
           OPENAI_TIMEOUT: !Ref OpenaiTimeout
           OPENAI_MAX_TOKENS: !Ref OpenaiMaxTokens
+          DEEPSEEK_MODEL: !Ref DeepseekModel
+          DEEPSEEK_URL: !Ref DeepseekUrl
+          DEEPSEEK_TIMEOUT: !Ref DeepseekTimeout
+          DEEPSEEK_MAX_TOKENS: !Ref DeepseekMaxTokens
           MIN_COMPARABLE_COUNT: !Ref MinComparableCount
           BUY_MARGIN_THRESHOLD: !Ref BuyMarginThreshold
           REVIEW_MARGIN_THRESHOLD: !Ref ReviewMarginThreshold
@@ -1297,6 +1351,11 @@ Outputs:
   YahooAuctionBuyCandidateTableName:
     Condition: DeployScraperCondition
     Value: !Ref YahooAuctionBuyCandidateTable
+
+  YahooAuctionReviewTableName:
+    Condition: DeployScraperCondition
+    Description: 中文人工审核表（包含 active 商品与 closed 参考信息）
+    Value: !Ref YahooAuctionReviewTable
 
   YahooAuctionBuyCandidateReminderTopicArn:
     Condition: DeployScraperCondition

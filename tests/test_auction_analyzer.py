@@ -38,6 +38,7 @@ from auction_analyzer import (
     scrape_active,
     should_reanalyze_description,
     upsert_buy_candidate,
+    upsert_review_item,
     update_record,
 )
 
@@ -46,6 +47,10 @@ class AiApiKeyEnvironmentTest(unittest.TestCase):
     def test_reads_api_key_injected_from_github_secret(self):
         with patch.dict(os.environ, {"OPENAI_API_KEY": "github-secret-key"}):
             self.assertEqual(_get_key("openai"), "github-secret-key")
+
+    def test_reads_deepseek_key_injected_from_github_secret(self):
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "deepseek-secret"}):
+            self.assertEqual(_get_key("deepseek"), "deepseek-secret")
 
 
 class NormalizePricingKeyTest(unittest.TestCase):
@@ -540,6 +545,38 @@ class LeanAiWorkflowTest(unittest.TestCase):
         self.assertIn(1, values.values())
         samples = next(value for value in values.values() if isinstance(value, list))
         self.assertEqual(samples[0]["itemID"], "closed-1")
+
+    @patch("auction_analyzer.get_record")
+    @patch("auction_analyzer.review_db")
+    def test_review_table_saves_review_regardless_of_confidence_with_both_sources(
+        self, review_db, get_record
+    ):
+        get_record.return_value = {
+            "itemID": "closed-1", "title": "成交参考", "price": 18000,
+            "url": "https://example.test/closed-1",
+        }
+        item = {
+            "itemID": "active-1", "title": "当前拍卖", "price": 10000,
+            "url": "https://example.test/active-1",
+            "models": [{"brand": "Sony", "model": "A1"}],
+        }
+        pricing = {
+            "pricingConfidence": Decimal("0.01"),
+            "estimatedMarketPrice": 18000,
+            "comparableItemIds": ["closed-1"],
+        }
+
+        upsert_review_item("active-1", item, pricing, Recommendation.REVIEW)
+
+        values = review_db.update_item.call_args.kwargs["ExpressionAttributeValues"]
+        self.assertIn("待审核", values.values())
+        self.assertIn("0.01", values.values())
+        active = next(value for value in values.values() if isinstance(value, dict)
+                      and value.get("itemID") == "active-1")
+        closed = next(value for value in values.values() if isinstance(value, list)
+                      and value and value[0].get("itemID") == "closed-1")
+        self.assertEqual(active["title"], "当前拍卖")
+        self.assertEqual(closed[0]["title"], "成交参考")
 
     @patch("auction_analyzer.upsert_scraped_item")
     @patch("auction_analyzer.get_record", return_value=None)

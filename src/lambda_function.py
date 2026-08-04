@@ -44,6 +44,13 @@ OPENAI_URL = os.environ.get("OPENAI_URL", "https://api.openai.com/v1/chat/comple
 OPENAI_TIMEOUT = int(os.environ.get("OPENAI_TIMEOUT", "60"))
 OPENAI_MAX_TOKENS = int(os.environ.get("OPENAI_MAX_TOKENS", "4000"))
 
+# DeepSeek 配置（部署时同样由 GitHub Secret 注入 API Key）
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-flash")
+DEEPSEEK_URL = os.environ.get("DEEPSEEK_URL", "https://api.deepseek.com/chat/completions")
+DEEPSEEK_TIMEOUT = int(os.environ.get("DEEPSEEK_TIMEOUT", "60"))
+DEEPSEEK_MAX_TOKENS = int(os.environ.get("DEEPSEEK_MAX_TOKENS", "4000"))
+
 # 故障切换冷却时间
 AI_FAILOVER_COOLDOWN = int(os.environ.get("AI_FAILOVER_COOLDOWN", "300"))
 
@@ -449,6 +456,11 @@ def get_ai_config(mode: str = None) -> dict:
             "key": DOUBAO_API_KEY,
             "model": DOUBAO_MODEL, "timeout": DOUBAO_TIMEOUT, "max_tokens": DOUBAO_MAX_TOKENS,
         },
+        "deepseek": {
+            "name": "deepseek", "type": "openai_compatible", "url": DEEPSEEK_URL,
+            "key": DEEPSEEK_API_KEY, "model": DEEPSEEK_MODEL,
+            "timeout": DEEPSEEK_TIMEOUT, "max_tokens": DEEPSEEK_MAX_TOKENS,
+        },
         "openai": {
             "name": "openai", "type": "openai_compatible", "url": OPENAI_URL,
             "key": OPENAI_API_KEY,
@@ -475,7 +487,8 @@ def _get_legacy_api_key() -> str:
 
 
 def get_available_ai_config() -> dict:
-    fallback_order = ["gemini", "doubao", "openai"]
+    # 当前首选模式失败后，DeepSeek 固定为第二优先级。
+    fallback_order = ["deepseek", "gemini", "doubao", "openai"]
     ordered_modes = [AI_MODE] + [m for m in fallback_order if m != AI_MODE] if AI_MODE in fallback_order else fallback_order
     now = time.time()
     
