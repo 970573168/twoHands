@@ -10,10 +10,11 @@ from openpyxl import Workbook
 
 TABLES = [
     "AiTokenUsage-dev",
-    "ProductCatalog-dev",
     "YahooAuctionActiveItems-dev",
-    "YahooAuctionBuyCandidates-dev",
     "YahooAuctionItems-dev",
+    "ProductCatalog-dev",
+    "YahooAuctionBuyCandidates-dev",
+    "YahooAuctionReview-dev",
     "YahooAuctionLinks-dev"  # 新增
 ]
 
