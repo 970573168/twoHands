@@ -41,6 +41,15 @@ ALLOWED_LIST3_PREFIX = "/list3/"
 DEFAULT_START_URL = "https://auctions.yahoo.co.jp/"
 MERCARI_START_URL = "https://jp.mercari.com/categories"
 START_URLS = (DEFAULT_START_URL, MERCARI_START_URL)
+START_URL_BY_SOURCE = {
+    YAHOO_SOURCE: DEFAULT_START_URL,
+    MERCARI_SOURCE: MERCARI_START_URL,
+}
+SOURCE_ALIASES = {
+    "YAHOO": YAHOO_SOURCE,
+    "YAHOO_AUCTION": YAHOO_SOURCE,
+    "MERCARI": MERCARI_SOURCE,
+}
 
 # 仅匹配 /list3/.../数字-category.html 的真目录页
 CATEGORY_PAGE_PATTERN = re.compile(
@@ -102,6 +111,16 @@ def website_source_from_url(url: str) -> str:
     if hostname == ALLOWED_HOST:
         return YAHOO_SOURCE
     return ""
+
+
+def normalize_requested_source(source: str | None) -> str | None:
+    """将 event.source 控制参数归一化为网站来源；未指定或 EventBridge source 返回 None。"""
+    if not source or not isinstance(source, str):
+        return None
+    normalized = source.strip().upper().replace("-", "_").replace(" ", "_")
+    if normalized in {"AWS.EVENTS", "AWS_EVENTS"}:
+        return None
+    return SOURCE_ALIASES.get(normalized)
 
 
 def is_allowed_url(url: str) -> bool:
@@ -356,8 +375,8 @@ def enqueue_discovered_link(table, link: dict, root_url: str) -> dict:
     }
 
 
-def get_queued_items(table, limit: int) -> list[dict]:
-    """按 BFS 优先级分页读取最多 ``limit`` 个待处理目录。"""
+def get_queued_items(table, limit: int, website_source: str | None = None) -> list[dict]:
+    """按 BFS 优先级分页读取最多 ``limit`` 个待处理目录，可按网站来源过滤。"""
     if limit <= 0:
         return []
     items, exclusive_start_key = [], None
@@ -372,7 +391,17 @@ def get_queued_items(table, limit: int) -> list[dict]:
         if exclusive_start_key:
             kwargs["ExclusiveStartKey"] = exclusive_start_key
         response = table.query(**kwargs)
-        items.extend(response.get("Items", []))
+        page_items = response.get("Items", [])
+        if website_source:
+            page_items = [
+                item for item in page_items
+                if (
+                    item.get("website_source")
+                    or item.get("source")
+                    or website_source_from_url(item.get("url", ""))
+                ) == website_source
+            ]
+        items.extend(page_items)
         exclusive_start_key = response.get("LastEvaluatedKey")
         if not exclusive_start_key:
             break
@@ -470,8 +499,10 @@ def mark_queue_failed(table, item: dict, error_message: str) -> dict | None:
     return response.get("Attributes")
 
 
-def has_queued_items(table) -> bool:
-    """使用队列 GSI 判断是否至少存在一个 QUEUED 项。"""
+def has_queued_items(table, website_source: str | None = None) -> bool:
+    """使用队列 GSI 判断是否至少存在一个 QUEUED 项，可按网站来源过滤。"""
+    if website_source:
+        return bool(get_queued_items(table, 1, website_source=website_source))
     response = table.query(
         IndexName=QUEUE_INDEX_NAME,
         KeyConditionExpression="queue_status = :queued",
@@ -592,11 +623,12 @@ def _http_session():
 # 播种与队列消费
 # ============================================================
 
-def seed_from_homepage(table) -> int:
-    """队列为空时从 Yahoo 首页和 Mercari 目录页发现并持久化第一层目录。"""
+def seed_from_homepage(table, website_source: str | None = None) -> int:
+    """队列为空时从目标网站首页发现并持久化第一层目录。"""
     session = _http_session()
     added = 0
-    for start_url in START_URLS:
+    start_urls = (START_URL_BY_SOURCE[website_source],) if website_source else START_URLS
+    for start_url in start_urls:
         response = session.get(start_url, timeout=REQUEST_TIMEOUT)
         response.raise_for_status()
         for link in extract_links_from_page(response.text, start_url, depth=0):
@@ -606,7 +638,7 @@ def seed_from_homepage(table) -> int:
 
 
 def crawl_queue(table, max_pages: int | None = None, max_depth: int | None = None,
-                max_links_per_run: int | None = None) -> dict:
+                max_links_per_run: int | None = None, website_source: str | None = None) -> dict:
     """消费 DynamoDB 持久化队列，不依赖进程内存恢复进度。"""
     page_limit = MAX_PAGES if max_pages is None else int(max_pages)
     depth_limit = MAX_DEPTH if max_depth is None else int(max_depth)
@@ -616,7 +648,7 @@ def crawl_queue(table, max_pages: int | None = None, max_depth: int | None = Non
     session = _http_session()
 
     while pages_crawled < page_limit and directories_found < link_limit:
-        queued_items = get_queued_items(table, limit=25)
+        queued_items = get_queued_items(table, limit=25, website_source=website_source)
         if not queued_items:
             break
         claimed_any = False
@@ -638,6 +670,11 @@ def crawl_queue(table, max_pages: int | None = None, max_depth: int | None = Non
                 response.raise_for_status()
                 pages_crawled += 1
                 discovered = extract_links_from_page(response.text, current_url, depth + 1)
+                if website_source:
+                    discovered = [
+                        link for link in discovered
+                        if link.get("website_source") == website_source
+                    ]
                 unique_children = {}
                 for directory in discovered:
                     if directory["url"] != current_url:
@@ -687,8 +724,10 @@ def lambda_handler(event, context):
     - max_depth: 最大爬取深度
     - max_links_per_run: 本次最大处理链接数
     - include_counts: 是否返回全表统计（默认 false，节省 DynamoDB 查询成本）
+    - source: 可选来源控制，Yahoo/YAHOO_AUCTION 只跑 Yahoo，Mercari 只跑 Mercari
     """
     event = event if isinstance(event, dict) else {}
+    requested_source = normalize_requested_source(event.get("source"))
     table = boto3.resource("dynamodb").Table(os.environ["LINK_CRAWLER_TABLE_NAME"])
 
     # 恢复超时任务
@@ -696,8 +735,8 @@ def lambda_handler(event, context):
 
     # 播种：队列为空时从首页发现
     seeded = 0
-    if not has_queued_items(table):
-        seeded = seed_from_homepage(table)
+    if not has_queued_items(table, requested_source):
+        seeded = seed_from_homepage(table, requested_source)
 
     # 消费队列
     result = crawl_queue(
@@ -705,6 +744,7 @@ def lambda_handler(event, context):
         max_pages=event.get("max_pages"),
         max_depth=event.get("max_depth"),
         max_links_per_run=event.get("max_links_per_run"),
+        website_source=requested_source,
     )
 
     response = {
@@ -713,6 +753,7 @@ def lambda_handler(event, context):
         "seeded": seeded,
         "recovered": recovered,
         "metrics": result,
+        "source": requested_source or "ALL",
     }
 
     # 仅手动调试时才统计全表（避免每次 Lambda 执行昂贵的 COUNT 查询）
