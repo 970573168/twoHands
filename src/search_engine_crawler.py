@@ -244,6 +244,26 @@ def extract_mercari_links_from_page(html: str, source_url: str, depth: int) -> l
     if not html:
         return links
     soup = BeautifulSoup(html, "html.parser")
+
+    all_anchors = soup.select("a[href]")
+    category_anchors = soup.select('a[href*="category_id"]')
+    
+    logger.info(
+        "Mercari HTML diagnostic: all_anchors=%s category_anchors=%s "
+        "category_id_occurrences=%s categories_occurrences=%s search_occurrences=%s",
+        len(all_anchors),
+        len(category_anchors),
+        html.count("category_id"),
+        html.count("/categories"),
+        html.count("/search"),
+    )
+    
+    for anchor in category_anchors[:10]:
+        logger.info(
+            "Mercari candidate href=%s text=%s",
+            anchor.get("href"),
+            clean_anchor_text(anchor.get_text(" ", strip=True)),
+        )
     for anchor in soup.select('a[href*="category_id"]'):
         href = anchor.get("href")
         absolute = urljoin(source_url, href or "")
