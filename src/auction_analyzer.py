@@ -949,7 +949,7 @@ def build_description_parse_prompt(items: List[Dict]) -> str:
     }
     return DETAILED_PARSE_PROMPT.replace(
         "{items_json}",
-        json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str),
     )
 
 # ======================================
