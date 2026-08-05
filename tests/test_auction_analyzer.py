@@ -41,7 +41,9 @@ from auction_analyzer import (
     save_closed_model,
     save_model,
     scrape_active,
+    scrape_closed,
     should_reanalyze_description,
+    upsert_scraped_item,
     upsert_buy_candidate,
     upsert_review_item,
     update_record,
@@ -85,6 +87,43 @@ class NormalizePricingKeyTest(unittest.TestCase):
             "NIKONZ5NORMAL",
         )
 
+
+
+    def test_update_record_aliases_all_dynamic_field_names(self):
+        table = Mock()
+
+        update_record(table, "item-1", {"source": "yahoo", "url": "https://example.test", "ttl": 123})
+
+        kwargs = table.update_item.call_args.kwargs
+        self.assertNotIn("source =", kwargs["UpdateExpression"])
+        self.assertNotIn("url =", kwargs["UpdateExpression"])
+        self.assertNotIn("ttl =", kwargs["UpdateExpression"])
+        self.assertEqual(kwargs["ExpressionAttributeNames"]["#f0"], "source")
+        self.assertEqual(kwargs["ExpressionAttributeNames"]["#f1"], "url")
+        self.assertEqual(kwargs["ExpressionAttributeNames"]["#f2"], "ttl")
+        self.assertIn("#f0 = :f0", kwargs["UpdateExpression"])
+
+    def test_upsert_scraped_item_aliases_all_dynamic_field_names_and_keeps_defaults(self):
+        table = Mock()
+
+        upsert_scraped_item(table, "item-1", {"source": "yahoo", "url": "https://example.test"})
+
+        kwargs = table.update_item.call_args.kwargs
+        self.assertNotIn("source =", kwargs["UpdateExpression"])
+        self.assertNotIn("url =", kwargs["UpdateExpression"])
+        self.assertEqual(kwargs["ExpressionAttributeNames"], {"#f0": "source", "#f1": "url"})
+        self.assertIn("modelStatus = if_not_exists(modelStatus, :pending)", kwargs["UpdateExpression"])
+        self.assertIn("pricingStatus = if_not_exists(pricingStatus, :pending)", kwargs["UpdateExpression"])
+
+    def test_upsert_scraped_item_force_overwrites_status_defaults(self):
+        table = Mock()
+
+        upsert_scraped_item(table, "item-1", {"source": "yahoo"}, force=True)
+
+        expression = table.update_item.call_args.kwargs["UpdateExpression"]
+        self.assertIn("modelStatus = :pending", expression)
+        self.assertIn("pricingStatus = :pending", expression)
+        self.assertNotIn("if_not_exists(modelStatus", expression)
 
 class LeanAiWorkflowTest(unittest.TestCase):
     @patch("auction_analyzer.active_db.scan")
@@ -136,6 +175,42 @@ class LeanAiWorkflowTest(unittest.TestCase):
         self.assertEqual(item_ids, ["allowed"])
         upsert_scraped_item.assert_called_once()
         self.assertEqual(upsert_scraped_item.call_args.args[1], "allowed")
+
+
+    @patch("auction_analyzer.get_seller_blacklist", return_value=set())
+    @patch("auction_analyzer.upsert_scraped_item", side_effect=[None, RuntimeError("ddb failed")])
+    @patch("auction_analyzer.get_record", side_effect=[None, None])
+    @patch("auction_analyzer.scrape_auctions")
+    def test_active_scrape_returns_only_successfully_saved_ids(
+        self, scrape_auctions, _get_record, _upsert, _blacklist
+    ):
+        scrape_auctions.return_value = [
+            {"itemId": "saved", "sellerId": "seller-1", "price": 6000},
+            {"itemId": "failed", "sellerId": "seller-2", "price": 7000},
+        ]
+
+        with self.assertLogs("root", level="INFO") as logs:
+            item_ids = scrape_active("camera", 2)
+
+        self.assertEqual(item_ids, ["saved"])
+        self.assertIn("Active save result: scraped=2 saved=1 new=1 failed=1", "\n".join(logs.output))
+
+    @patch("auction_analyzer.upsert_scraped_item", side_effect=[RuntimeError("ddb failed"), None])
+    @patch("auction_analyzer.get_record", side_effect=[None, {"itemID": "existing"}])
+    @patch("auction_analyzer.scrape_auctions")
+    def test_closed_scrape_returns_only_successfully_saved_ids(
+        self, scrape_auctions, _get_record, _upsert
+    ):
+        scrape_auctions.return_value = [
+            {"itemId": "failed", "price": 6000},
+            {"itemId": "existing", "price": 7000},
+        ]
+
+        with self.assertLogs("root", level="INFO") as logs:
+            item_ids = scrape_closed("camera", 2)
+
+        self.assertEqual(item_ids, ["existing"])
+        self.assertIn("Closed save result: scraped=2 saved=1 new=0 failed=1", "\n".join(logs.output))
 
     def test_countdown_active_prompt_extracts_model_without_source_model(self):
         prompt = build_countdown_active_parse_prompt([{
@@ -899,10 +974,14 @@ class LeanAiWorkflowTest(unittest.TestCase):
 
         update_record(table, "a1", {"price": 100})
 
-        values = table.update_item.call_args.kwargs["ExpressionAttributeValues"]
-        self.assertEqual(values[":modifiedIndexPk"], "ALL")
+        kwargs = table.update_item.call_args.kwargs
+        names = kwargs["ExpressionAttributeNames"]
+        values = kwargs["ExpressionAttributeValues"]
+        modified_index_token = next(token for token, name in names.items() if name == "modifiedIndexPk")
+        modified_at_token = next(token for token, name in names.items() if name == "modifiedAt")
+        self.assertEqual(values[modified_index_token.replace("#", ":")], "ALL")
         self.assertRegex(
-            values[":modifiedAt"],
+            values[modified_at_token.replace("#", ":")],
             r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}",
         )
 

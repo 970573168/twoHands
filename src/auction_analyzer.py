@@ -192,33 +192,36 @@ _token_usage_category = ""
 # Repository
 # ======================================
 
+def _build_dynamic_set_parts(fields: Dict, token_prefix: str = "f") -> Tuple[List[str], Dict[str, Any], Dict[str, str]]:
+    """为动态字段构建 DynamoDB SET 片段，所有属性名都使用别名。"""
+    parts: List[str] = []
+    values: Dict[str, Any] = {}
+    names: Dict[str, str] = {}
+
+    for index, (key, value) in enumerate(fields.items()):
+        name_token = f"#{token_prefix}{index}"
+        value_token = f":{token_prefix}{index}"
+        names[name_token] = key
+        values[value_token] = _to_dynamo(value)
+        parts.append(f"{name_token} = {value_token}")
+
+    return parts, values, names
+
 def update_record(table, item_id: str, fields: Dict):
-    """更新 DynamoDB 记录（修复 ExpressionAttributeNames 问题）"""
+    """更新 DynamoDB 记录，动态字段名一律使用别名避免保留字冲突。"""
     fields = {
         **fields,
         "modifiedIndexPk": "ALL",
         "modifiedAt": datetime.now(timezone.utc).isoformat(),
     }
-    parts, values, names = [], {}, {}
-    
-    for k, v in fields.items():
-        attr_name = k
-        # 处理 DynamoDB 保留字
-        if k in ("url", "ttl"):
-            names[f"#{k}"] = k
-            attr_name = f"#{k}"
-        
-        parts.append(f"{attr_name} = :{k}")
-        values[f":{k}"] = _to_dynamo(v)
+    parts, values, names = _build_dynamic_set_parts(fields)
     
     kwargs = {
         "Key": {"itemID": str(item_id)},
         "UpdateExpression": "SET " + ", ".join(parts),
         "ExpressionAttributeValues": values,
+        "ExpressionAttributeNames": names,
     }
-    
-    if names:
-        kwargs["ExpressionAttributeNames"] = names
     
     table.update_item(**kwargs)
 
@@ -232,16 +235,7 @@ def upsert_scraped_item(table, item_id: str, fields: Dict, force: bool = False):
     - force=True：强制重置为 PENDING（用于重新处理）
     """
     now = datetime.now(timezone.utc).isoformat()
-    parts, values, names = [], {}, {}
-    
-    # 基础字段
-    for k, v in fields.items():
-        attr_name = k
-        if k in ("url", "ttl"):
-            names[f"#{k}"] = k
-            attr_name = f"#{k}"
-        parts.append(f"{attr_name} = :{k}")
-        values[f":{k}"] = _to_dynamo(v)
+    parts, values, names = _build_dynamic_set_parts(fields)
     
     # ★ 核心：modelStatus 和 pricingStatus 的初始化
     values[":pending"] = Status.PENDING
@@ -2252,14 +2246,14 @@ def scrape_closed(kw: str, cnt: int, force: bool = False, source_model: Optional
             aliases=(source_model or {}).get("aliases") or (source_model or {}).get("alias") or [],
             website_source=website_source,
         )[:cnt]
+        saved_ids = []
         new_count = 0
+        save_failed = 0
         
         for item in items:
             try:
                 iid = str(item["itemId"])
                 existing = get_record(closed_db, iid)
-                if not existing:
-                    new_count += 1
                 
                 upsert_scraped_item(
                     closed_db, iid,
@@ -2287,13 +2281,20 @@ def scrape_closed(kw: str, cnt: int, force: bool = False, source_model: Optional
                     },
                     force=force
                 )
+                saved_ids.append(iid)
+                if not existing:
+                    new_count += 1
             except Exception as e:
-                logger.error(f"Save closed failed itemId={item.get('itemId')}: {e}")
+                save_failed += 1
+                logger.exception("Save closed failed itemId=%s: %s", item.get("itemId"), e)
         
-        logger.info(f"Scraped {len(items)} closed items, {new_count} new")
-        return [str(i["itemId"]) for i in items]
+        logger.info(
+            "Closed save result: scraped=%s saved=%s new=%s failed=%s",
+            len(items), len(saved_ids), new_count, save_failed,
+        )
+        return saved_ids
     except Exception as e:
-        logger.error(f"Closed scrape: {e}")
+        logger.exception("Closed scrape: %s", e)
         return []
 
 
@@ -2394,14 +2395,14 @@ def scrape_active(kw: str, cnt: int, max_p: int = 0, force: bool = False,
                 len(items),
             )
         items = items[:cnt]
+        saved_ids = []
         new_count = 0
+        save_failed = 0
         
         for item in items:
             try:
                 iid = str(item["itemId"])
                 existing = get_record(active_db, iid)
-                if not existing:
-                    new_count += 1
                 stored_source_model = (existing or {}).get("sourceModel", {}) or {}
                 source_model_changed = stored_source_model != (source_model or {})
                 
@@ -2438,13 +2439,20 @@ def scrape_active(kw: str, cnt: int, max_p: int = 0, force: bool = False,
                     # could be reused for an unrelated product search.
                     force=force or source_model_changed
                 )
+                saved_ids.append(iid)
+                if not existing:
+                    new_count += 1
             except Exception as e:
-                logger.error(f"Save active failed itemId={item.get('itemId')}: {e}")
+                save_failed += 1
+                logger.exception("Save active failed itemId=%s: %s", item.get("itemId"), e)
         
-        logger.info(f"Scraped {len(items)} active items, {new_count} new")
-        return [str(i["itemId"]) for i in items]
+        logger.info(
+            "Active save result: scraped=%s saved=%s new=%s failed=%s",
+            len(items), len(saved_ids), new_count, save_failed,
+        )
+        return saved_ids
     except Exception as e:
-        logger.error(f"Active scrape: {e}")
+        logger.exception("Active scrape: %s", e)
         return []
 
 
