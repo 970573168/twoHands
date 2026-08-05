@@ -2402,6 +2402,73 @@ def scrape_active(kw: str, cnt: int, max_p: int = 0, force: bool = False,
         logger.error(f"Active scrape: {e}")
         return []
 
+
+def inject_test_active_item(test_item: Dict, force: bool = True,
+                            category_id: str = "", category: str = "") -> List[str]:
+    """将测试 active 商品直接注入 Active 表，供倒计时链路复用。"""
+    test_item = test_item or {}
+    now = datetime.now(timezone.utc)
+    jst_now = now.astimezone(timezone(timedelta(hours=9)))
+    iid = str(test_item.get("itemId") or test_item.get("itemID") or f"TEST_ACTIVE_{int(time.time())}")
+    title = norm(test_item.get("title") or "Apple iPhone 13 128GB SIMフリー 中古 動作品")
+    price = si(test_item.get("price", 10000), 10000)
+    buynow_price = si(test_item.get("buynowPrice", 0), 0)
+    end_time = test_item.get("endTime") or (jst_now + timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
+    normalized_category = norm(category or test_item.get("category", ""))
+    source_category_id = category_id or test_item.get("category_id", "")
+
+    fields = {
+        "itemType": test_item.get("itemType", "active"),
+        "title": title,
+        "price": price,
+        "buynowPrice": buynow_price if buynow_price > 0 else None,
+        "endTime": end_time,
+        "url": test_item.get("url", f"https://page.auctions.yahoo.co.jp/jp/auction/{iid}"),
+        "sellerId": str(test_item.get("sellerId") or "test_seller"),
+        "sellerRating": str(test_item.get("sellerRating") or "99.8%"),
+        "sellerType": test_item.get("sellerType", "personal"),
+        "shippingFee": test_item.get("shippingFee", SHIPPING_COST),
+        "shippingText": test_item.get("shippingText", "送料落札者負担"),
+        "isFreeShipping": test_item.get("isFreeShipping", False),
+        "shippingStatus": test_item.get("shippingStatus", ""),
+        "itemCondition": test_item.get("itemCondition", "中古"),
+        "thumbnailUrl": test_item.get("thumbnailUrl", ""),
+        "keyword": test_item.get("keyword", ""),
+        "category": normalized_category,
+        "sourceModel": {
+            "category_id": source_category_id,
+            "category": normalized_category,
+        },
+        "isTestItem": True,
+        "testMode": "test_countdown_active",
+        "testInjectedAt": now.isoformat(),
+    }
+    detail_description = test_item.get("detailDescription") or test_item.get("description")
+    if detail_description:
+        detail_description = str(detail_description)
+        fields.update({
+            "detailDescription": detail_description,
+            "detailDescriptionRaw": detail_description,
+            "detailDescriptionCleaned": detail_description,
+            "detailDescriptionLength": len(detail_description),
+            "detailDescriptionRawLength": len(detail_description),
+            "detailDescriptionCleanedLength": len(detail_description),
+            "detailDescriptionCleanRatio": Decimal("1"),
+            "detailCleanedAt": now.isoformat(),
+            "detailTitle": title,
+            "detailUrl": test_item.get("url", ""),
+            "detailScrapedAt": now.isoformat(),
+            "detailScrapeStatus": "COMPLETED",
+            "detailScrapeError": "",
+            "isTestDetail": True,
+        })
+    upsert_scraped_item(active_db, iid, fields, force=force)
+    logger.info(
+        "Test active item injected: itemID=%s title=%s price=%s hasDetail=%s",
+        iid, title, price, bool(detail_description),
+    )
+    return [iid]
+
 def _first_identified_model(item: Dict) -> Optional[Dict]:
     """返回 active AI 识别出的首个可搜索型号。"""
     if not has_usable_model(item):
@@ -2423,7 +2490,7 @@ def _first_identified_model(item: Dict) -> Optional[Dict]:
 
 
 def execute_countdown_workflow(category_id: str, ac: int, cc: int, force: bool,
-                               category: str = "") -> Dict:
+                               category: str = "", test_active_item: Optional[Dict] = None) -> Dict:
     """从某个分类下即将结束的 active 商品开始分析。
 
     与常规型号工作流不同，本入口先用空关键词按分类抓 active，再由 AI 识别
@@ -2431,14 +2498,20 @@ def execute_countdown_workflow(category_id: str, ac: int, cc: int, force: bool,
     """
     global _start_time
     _start_time = time.time()
-    result = {"mode": "countdown", "keyword": "", "category_id": category_id}
+    mode_name = "test_countdown_active" if test_active_item is not None else "countdown"
+    result = {"mode": mode_name, "keyword": "", "category_id": category_id}
     try:
         check_limits()
-        logger.info("倒计时步骤 13-14：按分类抓取即将结束商品 category_id=%s", category_id)
-        active_ids = scrape_active(
-            "", ac, 0, force,
-            {"category_id": category_id, "category": norm(category)},
-        )
+        if test_active_item is not None:
+            logger.info("测试倒计时 active：注入模拟商品 category_id=%s", category_id)
+            active_ids = inject_test_active_item(test_active_item, force=force, category_id=category_id, category=category)
+        else:
+            logger.info("倒计时步骤 13-14：按分类抓取即将结束商品 category_id=%s", category_id)
+            active_ids = scrape_active(
+                "", ac, 0, force,
+                {"category_id": category_id, "category": norm(category)},
+            )
+        result["active_ids"] = active_ids
         result["active"] = len(active_ids)
         if not active_ids:
             return {**result, "status": "NO_ACTIVE"}
@@ -2462,6 +2535,7 @@ def execute_countdown_workflow(category_id: str, ac: int, cc: int, force: bool,
                 model["category_id"] = category_id
                 key = (model["brand"].casefold(), model["model"].casefold())
                 identified.setdefault(key, model)
+        result["identified"] = list(identified.values())
         result["identified_models"] = len(identified)
         if not identified:
             return {**result, "status": "NO_IDENTIFIED_MODEL"}
@@ -2484,6 +2558,7 @@ def execute_countdown_workflow(category_id: str, ac: int, cc: int, force: bool,
                     SIMPLE_MAX_TOKENS, saver=save_closed_model,
                     resolver=resolve_closed_without_ai,
                 )
+        result["closed_ids"] = closed_ids
         result["closed"] = len(closed_ids)
         if not closed_ids:
             return {**result, "status": "NO_CLOSED"}
@@ -2511,8 +2586,7 @@ def execute_countdown_workflow(category_id: str, ac: int, cc: int, force: bool,
         for aid in review_ids:
             existing = get_record(active_db, aid)
             detail_item = existing if (
-                existing and existing.get("detailScrapeStatus") == "COMPLETED"
-                and str(existing.get("detailDescription", "")).strip()
+                existing and str(existing.get("detailDescription", "")).strip()
             ) else scrape_profitable_active_detail(aid)
             if detail_item and str(detail_item.get("detailDescription", "")).strip():
                 detail_item["closedReferenceSamples"] = build_closed_reference_samples(
@@ -2533,10 +2607,12 @@ def execute_countdown_workflow(category_id: str, ac: int, cc: int, force: bool,
             ):
                 repriced += 1
 
+        final_items = [get_record(active_db, aid) for aid in active_ids] if test_active_item is not None else []
         result.update({
             "priced": priced,
             "detail_reviewed": len(recheck_items),
             "description_repriced": repriced,
+            "final_items": [item for item in final_items if item],
             "status": "COMPLETED",
             "elapsed": round(time.time() - _start_time, 1),
         })
@@ -2728,6 +2804,7 @@ def execute_workflow(kw: str, ac: int, cc: int, force: bool, source_model: Optio
         check_limits()
         logger.info(f"Step 1: Scraping closed auctions for '{kw}'")
         closed_ids = scrape_closed(kw, cc, force, source_model)
+        result["closed_ids"] = closed_ids
         result["closed"] = len(closed_ids)
         if not closed_ids:
             logger.warning("No closed items found")
@@ -2989,6 +3066,22 @@ def lambda_handler(event, context):
         mode = norm(event.get("mode", "")).lower()
         category_id = norm(event.get("category_id", ""))
         kw = norm(event.get("keyword", ""))
+
+        if mode == "test_countdown_active":
+            test_item = event.get("test_active_item") or {}
+            if not isinstance(test_item, dict):
+                return {
+                    "statusCode": 400,
+                    "body": json.dumps({"error": "test_active_item 必须是对象"}, ensure_ascii=False),
+                }
+            _token_usage_category = norm(event.get("category", test_item.get("category", "")))
+            result = execute_countdown_workflow(
+                category_id, ac, cc_val, force, _token_usage_category, test_item
+            )
+            return {
+                "statusCode": 200,
+                "body": json.dumps(result, ensure_ascii=False, default=str),
+            }
 
         if mode == "countdown":
             if not category_id:
