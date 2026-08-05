@@ -30,6 +30,7 @@ from auction_analyzer import (
     execute_workflow,
     get_seller_blacklist,
     inject_test_active_item,
+    inject_test_active_items,
     lambda_handler,
     normalize_pricing_key,
     pricing_key_with_condition,
@@ -240,6 +241,71 @@ class LeanAiWorkflowTest(unittest.TestCase):
         workflow.assert_called_once_with(
             "", 100, 100, False, "", {"itemID": "TEST_ACTIVE_IPHONE13_001"}
         )
+
+
+    @patch("auction_analyzer.inject_test_active_item", side_effect=lambda item, **kwargs: [item["itemID"]])
+    def test_inject_test_active_items_writes_each_input_for_stress_test(self, inject_one):
+        ids = inject_test_active_items([
+            {"itemID": "TEST_ACTIVE_BATCH_001"},
+            {"itemID": "TEST_ACTIVE_BATCH_002"},
+        ], category_id="2084317598", category="スマホ本体")
+
+        self.assertEqual(ids, ["TEST_ACTIVE_BATCH_001", "TEST_ACTIVE_BATCH_002"])
+        self.assertEqual(inject_one.call_count, 2)
+        self.assertEqual(inject_one.call_args.kwargs["category_id"], "2084317598")
+
+    @patch("auction_analyzer.execute_countdown_workflow", return_value={"status": "NO_CLOSED"})
+    def test_lambda_handler_routes_batch_test_countdown_active_items(self, workflow):
+        response = lambda_handler({
+            "mode": "test_countdown_active",
+            "keyword": "",
+            "test_active_items": [
+                {"itemID": "TEST_ACTIVE_BATCH_001"},
+                {"itemID": "TEST_ACTIVE_BATCH_002"},
+            ],
+        }, None)
+
+        self.assertEqual(response["statusCode"], 200)
+        workflow.assert_called_once_with(
+            "", 100, 100, False, "",
+            [{"itemID": "TEST_ACTIVE_BATCH_001"}, {"itemID": "TEST_ACTIVE_BATCH_002"}],
+        )
+
+
+    @patch("auction_analyzer.price_active_item", return_value={"pricingStatus": Status.COMPLETED})
+    @patch("auction_analyzer.build_closed_reference_samples", return_value=[])
+    @patch("auction_analyzer.scrape_profitable_active_detail")
+    @patch("auction_analyzer.build_index", return_value={})
+    @patch("auction_analyzer.batch_parse")
+    @patch("auction_analyzer.scrape_closed", return_value=["c1"])
+    @patch("auction_analyzer.get_record")
+    @patch("auction_analyzer.inject_test_active_items", return_value=["a1", "a2"])
+    @patch("auction_analyzer.check_limits")
+    def test_batch_test_countdown_does_not_send_countdown_email_flow(
+        self, _limits, _inject, get_record, _scrape_closed, _batch_parse, _build_index,
+        scrape_detail, _samples, price_active,
+    ):
+        identified = {
+            "itemID": "a1", "modelStatus": Status.COMPLETED,
+            "pricingStatus": Status.PENDING,
+            "listingType": ListingType.MAIN_PRODUCT,
+            "models": [{"brand": "Apple", "model": "iPhone 13"}],
+            "detailDescription": "動作品。",
+        }
+        get_record.return_value = identified
+
+        result = execute_countdown_workflow("2084317598", 10, 20, False, test_active_item=[
+            {"itemID": "a1"}, {"itemID": "a2"},
+        ])
+
+        self.assertEqual(result["status"], "COMPLETED")
+        scrape_detail.assert_not_called()
+        self.assertTrue(price_active.call_args_list)
+        self.assertTrue(all(
+            call.kwargs.get("countdown_mode") is False
+            for call in price_active.call_args_list
+            if call.kwargs.get("sync_candidate") is True
+        ))
 
     @patch("auction_analyzer.product_catalog_db.update_item")
     @patch("auction_analyzer.execute_workflow", return_value={"status": "COMPLETED"})

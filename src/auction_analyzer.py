@@ -2405,7 +2405,7 @@ def scrape_active(kw: str, cnt: int, max_p: int = 0, force: bool = False,
 
 def inject_test_active_item(test_item: Dict, force: bool = True,
                             category_id: str = "", category: str = "") -> List[str]:
-    """将测试 active 商品直接注入 Active 表，供倒计时链路复用。"""
+    """将单个测试 active 商品直接注入 Active 表，供倒计时链路复用。"""
     test_item = test_item or {}
     now = datetime.now(timezone.utc)
     jst_now = now.astimezone(timezone(timedelta(hours=9)))
@@ -2469,6 +2469,26 @@ def inject_test_active_item(test_item: Dict, force: bool = True,
     )
     return [iid]
 
+def inject_test_active_items(test_items: List[Dict], force: bool = True,
+                             category_id: str = "", category: str = "") -> List[str]:
+    """批量注入测试 active 商品，用于倒计时分析链路压力测试。
+
+    每条测试数据复用单条注入逻辑，保持字段默认值和详情模拟行为一致。
+    """
+    if not isinstance(test_items, list):
+        raise ValueError("test_active_items 必须是数组")
+    item_ids = []
+    for index, test_item in enumerate(test_items):
+        if not isinstance(test_item, dict):
+            raise ValueError(f"test_active_items[{index}] 必须是对象")
+        item_ids.extend(
+            inject_test_active_item(
+                test_item, force=force, category_id=category_id, category=category
+            )
+        )
+    return item_ids
+
+
 def _first_identified_model(item: Dict) -> Optional[Dict]:
     """返回 active AI 识别出的首个可搜索型号。"""
     if not has_usable_model(item):
@@ -2490,7 +2510,8 @@ def _first_identified_model(item: Dict) -> Optional[Dict]:
 
 
 def execute_countdown_workflow(category_id: str, ac: int, cc: int, force: bool,
-                               category: str = "", test_active_item: Optional[Dict] = None) -> Dict:
+                               category: str = "",
+                               test_active_item: Optional[Union[Dict, List[Dict]]] = None) -> Dict:
     """从某个分类下即将结束的 active 商品开始分析。
 
     与常规型号工作流不同，本入口先用空关键词按分类抓 active，再由 AI 识别
@@ -2504,7 +2525,14 @@ def execute_countdown_workflow(category_id: str, ac: int, cc: int, force: bool,
         check_limits()
         if test_active_item is not None:
             logger.info("测试倒计时 active：注入模拟商品 category_id=%s", category_id)
-            active_ids = inject_test_active_item(test_active_item, force=force, category_id=category_id, category=category)
+            if isinstance(test_active_item, list):
+                active_ids = inject_test_active_items(
+                    test_active_item, force=force, category_id=category_id, category=category
+                )
+            else:
+                active_ids = inject_test_active_item(
+                    test_active_item, force=force, category_id=category_id, category=category
+                )
         else:
             logger.info("倒计时步骤 13-14：按分类抓取即将结束商品 category_id=%s", category_id)
             active_ids = scrape_active(
@@ -2603,7 +2631,7 @@ def execute_countdown_workflow(category_id: str, ac: int, cc: int, force: bool,
             aid = str(item.get("itemID", ""))
             current = get_record(active_db, aid) if aid else None
             if current and has_usable_model(current) and price_active_item(
-                aid, idx, sync_candidate=True, countdown_mode=True
+                aid, idx, sync_candidate=True, countdown_mode=(test_active_item is None)
             ):
                 repriced += 1
 
@@ -3068,13 +3096,27 @@ def lambda_handler(event, context):
         kw = norm(event.get("keyword", ""))
 
         if mode == "test_countdown_active":
-            test_item = event.get("test_active_item") or {}
-            if not isinstance(test_item, dict):
+            has_batch_items = "test_active_items" in event
+            test_item = event.get("test_active_items") if has_batch_items else (event.get("test_active_item") or {})
+            if has_batch_items:
+                if not isinstance(test_item, list):
+                    return {
+                        "statusCode": 400,
+                        "body": json.dumps({"error": "test_active_items 必须是数组"}, ensure_ascii=False),
+                    }
+                invalid_index = next((i for i, item in enumerate(test_item) if not isinstance(item, dict)), None)
+                if invalid_index is not None:
+                    return {
+                        "statusCode": 400,
+                        "body": json.dumps({"error": f"test_active_items[{invalid_index}] 必须是对象"}, ensure_ascii=False),
+                    }
+            elif not isinstance(test_item, dict):
                 return {
                     "statusCode": 400,
                     "body": json.dumps({"error": "test_active_item 必须是对象"}, ensure_ascii=False),
                 }
-            _token_usage_category = norm(event.get("category", test_item.get("category", "")))
+            first_test_item = test_item[0] if isinstance(test_item, list) and test_item else test_item
+            _token_usage_category = norm(event.get("category", first_test_item.get("category", "") if isinstance(first_test_item, dict) else ""))
             result = execute_countdown_workflow(
                 category_id, ac, cc_val, force, _token_usage_category, test_item
             )
