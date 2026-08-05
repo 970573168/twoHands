@@ -75,11 +75,27 @@ BAD_ANCHOR_TEXTS = {
     "さらに表示",
 }
 
-# 从环境变量读取配置
+# 从环境变量读取配置 - Yahoo 和 Mercari 分开的 User-Agent
+YAHOO_USER_AGENT = os.getenv(
+    "YAHOO_LINK_CRAWLER_USER_AGENT",
+    "TwoHandsLinkCrawler/1.0 (+https://auctions.yahoo.co.jp/robots.txt)",
+)
+
+MERCARI_USER_AGENT = os.getenv(
+    "MERCARI_LINK_CRAWLER_USER_AGENT",
+    (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/151.0.0.0 Safari/537.36"
+    ),
+)
+
+# 向后兼容：保留旧的通用 UA 变量供非分类页面使用
 USER_AGENT = os.getenv(
     "LINK_CRAWLER_USER_AGENT",
     "TwoHandsLinkCrawler/1.0 (+https://auctions.yahoo.co.jp/robots.txt)",
 )
+
 REQUEST_TIMEOUT = float(os.getenv("LINK_CRAWLER_TIMEOUT", "30"))
 MAX_PAGES = int(os.getenv("LINK_CRAWLER_MAX_PAGES", "20"))
 MAX_DEPTH = int(os.getenv("LINK_CRAWLER_MAX_DEPTH", "5"))
@@ -709,10 +725,10 @@ def seed_from_homepage(table, website_source: str | None = None) -> dict:
         "existing": 0,
         "errors": [],
     }
-    session = _http_session()
     start_urls = (START_URL_BY_SOURCE[website_source],) if website_source else START_URLS
     for start_url in start_urls:
         source = website_source_from_url(start_url)
+        session = _http_session(source)
         try:
             result["pages_requested"] += 1
             response = _get_with_retries(session, start_url)
@@ -759,16 +775,32 @@ def seed_from_homepage(table, website_source: str | None = None) -> dict:
 
 
 # ============================================================
-# HTTP 会话
+# HTTP 会话 - 根据网站来源使用不同的 User-Agent
 # ============================================================
 
-def _http_session():
+def _http_session(website_source: str | None = None):
+    """
+    创建 requests Session，根据目标网站使用不同的 User-Agent。
+    
+    参数:
+        website_source: YAHOO_SOURCE 或 MERCARI_SOURCE
+    """
     session = requests.Session()
+
+    if website_source == MERCARI_SOURCE:
+        user_agent = MERCARI_USER_AGENT
+    else:
+        user_agent = YAHOO_USER_AGENT
+
     session.headers.update({
-        "User-Agent": USER_AGENT,
-        "Accept-Language": "ja,en;q=0.8",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "User-Agent": user_agent,
+        "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.8",
+        "Accept": (
+            "text/html,application/xhtml+xml,"
+            "application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+        ),
     })
+
     return session
 
 
@@ -784,7 +816,6 @@ def crawl_queue(table, max_pages: int | None = None, max_depth: int | None = Non
     link_limit = MAX_LINKS_PER_RUN if max_links_per_run is None else int(max_links_per_run)
     pages_crawled = directories_found = newly_enqueued = 0
     errors = []
-    session = _http_session()
 
     while pages_crawled < page_limit and directories_found < link_limit:
         queued_items = get_queued_items(table, limit=25, website_source=website_source)
@@ -816,6 +847,7 @@ def crawl_queue(table, max_pages: int | None = None, max_depth: int | None = Non
             
             try:
                 source = website_source_from_url(current_url)
+                session = _http_session(source)
                 response = _get_with_retries(session, current_url)
                 html = response.text
                 pages_crawled += 1
