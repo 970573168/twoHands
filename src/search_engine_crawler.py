@@ -1,15 +1,7 @@
 """
-Yahoo! 拍卖 /list3/* 目录链接持久化队列采集 Lambda。
+Yahoo! 拍卖 /list3/* + Mercari 目录链接持久化队列采集 Lambda。
 
-每个目录都是 DynamoDB 队列项。Lambda 通过 GSI 按深度和发现时间消费任务，
-并用条件更新完成 QUEUED -> PROCESSING -> DONE/QUEUED/ERROR 状态流转。
-
-优化内容：
-1. 严格 URL 过滤：仅保留 /list3/数字-category.html，拒绝 leaf/catlist/query
-2. 过滤无效 anchor：空文本、"カテゴリから探す" 等
-3. 统一队列状态：queue_status 同步更新 crawl_status/is_crawled
-4. 统计改为按需：仅 event.include_counts=true 时统计
-5. 优化默认参数：减少单次 Lambda 负载
+Mercari 使用 Selenium 动态渲染，Yahoo 使用 requests 静态爬取。
 """
 
 import hashlib
@@ -17,13 +9,22 @@ import logging
 import os
 import re
 import time
+import json
 from datetime import datetime, timezone
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit, parse_qs
 
 import boto3
 import requests
 from botocore.exceptions import ClientError
 from bs4 import BeautifulSoup
+
+# Selenium 相关导入
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.options import Options
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -88,13 +89,18 @@ USER_AGENT = os.getenv(
     "TwoHandsLinkCrawler/1.0 (+https://auctions.yahoo.co.jp/robots.txt)",
 )
 REQUEST_TIMEOUT = float(os.getenv("LINK_CRAWLER_TIMEOUT", "30"))
-MAX_PAGES = int(os.getenv("LINK_CRAWLER_MAX_PAGES", "20"))  # 降低默认值
+MAX_PAGES = int(os.getenv("LINK_CRAWLER_MAX_PAGES", "20"))
 MAX_DEPTH = int(os.getenv("LINK_CRAWLER_MAX_DEPTH", "5"))
-REQUEST_INTERVAL = float(os.getenv("LINK_CRAWLER_REQUEST_INTERVAL", "0.8"))  # 提高间隔
-MAX_LINKS_PER_RUN = int(os.getenv("LINK_CRAWLER_MAX_LINKS_PER_RUN", "1000"))  # 降低默认值
-GSI_QUERY_PAGE_SIZE = int(os.getenv("LINK_CRAWLER_GSI_PAGE_SIZE", "25"))  # 降低分页大小
+REQUEST_INTERVAL = float(os.getenv("LINK_CRAWLER_REQUEST_INTERVAL", "0.8"))
+MAX_LINKS_PER_RUN = int(os.getenv("LINK_CRAWLER_MAX_LINKS_PER_RUN", "1000"))
+GSI_QUERY_PAGE_SIZE = int(os.getenv("LINK_CRAWLER_GSI_PAGE_SIZE", "25"))
 MAX_ATTEMPTS = int(os.getenv("LINK_CRAWLER_MAX_ATTEMPTS", "3"))
 QUEUE_INDEX_NAME = "queue_status-queue_priority-index"
+
+# Selenium 配置
+SELENIUM_HEADLESS = os.getenv("SELENIUM_HEADLESS", "true").lower() == "true"
+SELENIUM_TIMEOUT = int(os.getenv("SELENIUM_TIMEOUT", "15"))
+MERCARI_MAX_CATEGORY_DEPTH = int(os.getenv("MERCARI_MAX_CATEGORY_DEPTH", "3"))
 
 # ============================================================
 # URL 处理函数
@@ -132,7 +138,7 @@ def is_allowed_url(url: str) -> bool:
     if parsed.scheme not in {"http", "https"} or parsed.hostname not in ALLOWED_HOSTS:
         return False
     if parsed.hostname == MERCARI_HOST:
-        return (parsed.path or "/") == "/categories"
+        return parsed.path == "/categories"
     path = parsed.path or "/"
     return not any(path == rule.rstrip("/") or path.startswith(rule) for rule in DISALLOW)
 
@@ -148,14 +154,23 @@ def canonicalize_category_url(url: str) -> str | None:
         return None
 
     path = parsed.path or "/"
+    
+    # Mercari 处理
     if parsed.hostname == MERCARI_HOST:
-        if path != "/categories" or not parsed.query:
-            return None
-        query_parts = [part for part in parsed.query.split("&") if part.startswith("category_id=")]
-        if not query_parts:
-            return None
-        return urlunsplit(("https", MERCARI_HOST, path, query_parts[0], ""))
+        if path == "/categories":
+            # 提取 category_id
+            query_parts = []
+            for part in parsed.query.split("&"):
+                if part.startswith("category_id="):
+                    query_parts.append(part)
+            if query_parts:
+                return urlunsplit(("https", MERCARI_HOST, path, query_parts[0], ""))
+            else:
+                # 首页
+                return urlunsplit(("https", MERCARI_HOST, path, "", ""))
+        return None
 
+    # Yahoo 处理
     if parsed.hostname != ALLOWED_HOST:
         return None
     if not path.startswith(ALLOWED_LIST3_PREFIX):
@@ -210,12 +225,208 @@ def normalize_url(href: str, source_url: str) -> str | None:
 
 
 def should_crawl(url: str) -> bool:
-    """判断一个 URL 是否应该被递归爬取：仅允许 /list3/数字-category.html。"""
+    """判断一个 URL 是否应该被递归爬取。"""
     return canonicalize_category_url(url) is not None
 
 
 # ============================================================
-# 链接提取
+# Selenium 浏览器管理
+# ============================================================
+
+def create_selenium_driver():
+    """创建 Selenium WebDriver 实例。"""
+    chrome_options = Options()
+    
+    if SELENIUM_HEADLESS:
+        chrome_options.add_argument('--headless')
+    
+    chrome_options.add_argument('--no-sandbox')
+    chrome_options.add_argument('--disable-dev-shm-usage')
+    chrome_options.add_argument('--disable-gpu')
+    chrome_options.add_argument('--window-size=1920,1080')
+    chrome_options.add_argument(f'--user-agent={USER_AGENT}')
+    chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+    chrome_options.add_experimental_option('excludeSwitches', ['enable-automation'])
+    chrome_options.add_experimental_option('useAutomationExtension', False)
+    
+    driver = webdriver.Chrome(options=chrome_options)
+    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+    
+    return driver
+
+
+# ============================================================
+# Mercari 链接提取（使用 Selenium）
+# ============================================================
+
+def extract_mercari_links_with_selenium(url: str, depth: int, 
+                                        max_depth: int = MERCARI_MAX_CATEGORY_DEPTH) -> list[dict]:
+    """
+    使用 Selenium 动态渲染 Mercari 页面，提取所有目录链接。
+    
+    参数:
+        url: Mercari 目录页 URL
+        depth: 当前深度
+        max_depth: 最大爬取深度
+    
+    返回:
+        目录链接列表
+    """
+    if depth > max_depth:
+        return []
+    
+    driver = None
+    try:
+        driver = create_selenium_driver()
+        logger.info(f"正在加载 Mercari 页面: {url}")
+        driver.get(url)
+        
+        # 等待页面加载完成
+        WebDriverWait(driver, SELENIUM_TIMEOUT).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, 'a[href*="category_id"], div[data-testid="category-list"]'))
+        )
+        
+        # 等待可能的动态内容加载
+        time.sleep(2)
+        
+        links = []
+        seen_urls = set()
+        
+        # 查找所有目录链接
+        # Mercari 的目录链接可能在多个位置
+        selectors = [
+            'a[href*="category_id"]',
+            'div[data-testid="category-list"] a',
+            'div.merListItem a',
+            'a[data-location*="category"]'
+        ]
+        
+        for selector in selectors:
+            elements = driver.find_elements(By.CSS_SELECTOR, selector)
+            for elem in elements:
+                try:
+                    href = elem.get_attribute('href')
+                    if not href:
+                        continue
+                    
+                    # 提取 category_id
+                    category_id = extract_category_id(href)
+                    if not category_id:
+                        continue
+                    
+                    # 获取文本
+                    text = elem.text.strip()
+                    if not text:
+                        # 尝试从 aria-label 获取
+                        aria_label = elem.get_attribute('aria-label')
+                        if aria_label:
+                            text = aria_label.strip()
+                    
+                    if not text:
+                        continue
+                    
+                    # 过滤无效文本
+                    if text in BAD_ANCHOR_TEXTS:
+                        continue
+                    
+                    # 去重
+                    canonical_url = canonicalize_category_url(href)
+                    if not canonical_url or canonical_url in seen_urls:
+                        continue
+                    
+                    seen_urls.add(canonical_url)
+                    
+                    links.append({
+                        'url': canonical_url,
+                        'category_id': category_id,
+                        'category_name': text,
+                        'anchor_text': text,
+                        'source_url': url,
+                        'website_source': MERCARI_SOURCE,
+                        'source': MERCARI_SOURCE,
+                        'depth': depth + 1,
+                        'link_type': 'mercari_directory'
+                    })
+                except Exception as e:
+                    logger.warning(f"提取单个 Mercari 链接失败: {e}")
+                    continue
+        
+        # 如果找到了链接，也尝试从 JavaScript 数据中提取
+        if not links:
+            # 尝试从 __NEXT_DATA__ 提取
+            try:
+                script = driver.find_element(By.CSS_SELECTOR, 'script#__NEXT_DATA__')
+                if script:
+                    data = json.loads(script.get_attribute('innerHTML'))
+                    js_links = extract_categories_from_next_data(data, url, depth + 1)
+                    for link in js_links:
+                        if link['url'] not in seen_urls:
+                            seen_urls.add(link['url'])
+                            links.append(link)
+            except (NoSuchElementException, json.JSONDecodeError) as e:
+                logger.debug(f"从 __NEXT_DATA__ 提取失败: {e}")
+        
+        logger.info(f"Mercari 页面 {url} 提取到 {len(links)} 个目录链接")
+        return links
+        
+    except TimeoutException as e:
+        logger.error(f"Mercari 页面加载超时: {url}, 错误: {e}")
+        return []
+    except Exception as e:
+        logger.error(f"Mercari 页面提取失败: {url}, 错误: {e}")
+        return []
+    finally:
+        if driver:
+            driver.quit()
+
+
+def extract_categories_from_next_data(data: dict, source_url: str, depth: int) -> list[dict]:
+    """从 __NEXT_DATA__ JSON 中递归提取 Mercari 目录。"""
+    links = []
+    seen = set()
+    
+    def extract(obj, current_depth=0):
+        if current_depth > 10:  # 防止无限递归
+            return
+        
+        if isinstance(obj, dict):
+            # 查找 categories 数据
+            if 'categories' in obj and isinstance(obj['categories'], list):
+                for cat in obj['categories']:
+                    if isinstance(cat, dict):
+                        cat_id = str(cat.get('id') or cat.get('category_id', ''))
+                        cat_name = cat.get('name') or cat.get('category_name', '')
+                        
+                        if cat_id and cat_name:
+                            url = f'https://jp.mercari.com/categories?category_id={cat_id}'
+                            if url not in seen:
+                                seen.add(url)
+                                links.append({
+                                    'url': url,
+                                    'category_id': cat_id,
+                                    'category_name': cat_name,
+                                    'anchor_text': cat_name,
+                                    'source_url': source_url,
+                                    'website_source': MERCARI_SOURCE,
+                                    'source': MERCARI_SOURCE,
+                                    'depth': depth,
+                                    'link_type': 'mercari_directory'
+                                })
+            
+            # 递归搜索所有值
+            for value in obj.values():
+                extract(value, current_depth + 1)
+        
+        elif isinstance(obj, list):
+            for item in obj:
+                extract(item, current_depth + 1)
+    
+    extract(data)
+    return links
+
+
+# ============================================================
+# Yahoo 链接提取（使用 requests/BeautifulSoup）
 # ============================================================
 
 def clean_anchor_text(text: str) -> str:
@@ -223,17 +434,9 @@ def clean_anchor_text(text: str) -> str:
     return " ".join((text or "").split())[:500]
 
 
-def extract_links_from_page(html: str, source_url: str, depth: int) -> list[dict]:
+def extract_yahoo_links_from_page(html: str, source_url: str, depth: int) -> list[dict]:
     """
-    从 HTML 中提取 /list3/* 目录链接。
-    
-    过滤规则：
-    - 仅保留 /list3/数字-category.html 格式
-    - 拒绝空文本和无效 anchor
-    - 去重（基于归一化 URL）
-    
-    返回:
-        - list3_links: /list3/* 目录链接列表
+    从 Yahoo 页面提取 /list3/* 目录链接。
     """
     list3_links = []
     seen = set()
@@ -262,7 +465,7 @@ def extract_links_from_page(html: str, source_url: str, depth: int) -> list[dict
         seen.add(url)
 
         website_source = website_source_from_url(url)
-        link_type = "mercari_directory" if website_source == MERCARI_SOURCE else "list3_directory"
+        link_type = "list3_directory"
         list3_links.append({
             "url": url,
             "category_id": category_id,
@@ -276,6 +479,52 @@ def extract_links_from_page(html: str, source_url: str, depth: int) -> list[dict
         })
 
     return list3_links
+
+
+def extract_links_from_page(html: str, source_url: str, depth: int) -> list[dict]:
+    """
+    从页面提取链接，根据来源自动选择提取方式。
+    """
+    if not html:
+        return []
+    
+    # 判断是否是 Yahoo 页面
+    if 'auctions.yahoo.co.jp' in source_url:
+        return extract_yahoo_links_from_page(html, source_url, depth)
+    
+    # Mercari 通过 Selenium 提取，这里返回空列表
+    return []
+
+
+# ============================================================
+# 统一的链接提取入口
+# ============================================================
+
+def extract_links_by_source(url: str, html: str, depth: int, 
+                            use_selenium: bool = True) -> list[dict]:
+    """
+    根据 URL 来源使用不同的提取策略。
+    
+    参数:
+        url: 当前页面 URL
+        html: 页面 HTML 内容（对 Yahoo 有效）
+        depth: 当前深度
+        use_selenium: 是否使用 Selenium（Mercari 需要）
+    
+    返回:
+        目录链接列表
+    """
+    source = website_source_from_url(url)
+    
+    if source == MERCARI_SOURCE and use_selenium:
+        # Mercari 使用 Selenium
+        return extract_mercari_links_with_selenium(url, depth)
+    elif source == YAHOO_SOURCE:
+        # Yahoo 使用静态 HTML
+        return extract_yahoo_links_from_page(html, url, depth)
+    else:
+        logger.warning(f"未知的网站来源: {url}")
+        return []
 
 
 # ============================================================
@@ -342,13 +591,12 @@ def enqueue_discovered_link(table, link: dict, root_url: str) -> dict:
                 anchor_text = if_not_exists(anchor_text, :anchor_text),
                 source_url = if_not_exists(source_url, :source_url),
                 website_source = if_not_exists(website_source, :website_source),
-                #source = if_not_exists(#source, :website_source),
                 crawl_status = if_not_exists(crawl_status, :discovered)
         """,
-        ExpressionAttributeNames={"#url": "url", "#depth": "depth", "#source": "source"},
+        ExpressionAttributeNames={"#url": "url", "#depth": "depth"},
         ExpressionAttributeValues={
             ":url": url,
-            ":link_type": link.get("link_type") or ("mercari_directory" if link.get("website_source") == MERCARI_SOURCE else "list3_directory"),
+            ":link_type": link.get("link_type") or "mercari_directory" if link.get("website_source") == MERCARI_SOURCE else "list3_directory",
             ":queued": "QUEUED",
             ":priority": make_queue_priority(depth, now, crawl_id),
             ":depth": depth,
@@ -438,10 +686,7 @@ def claim_queue_item(table, crawl_id: str) -> dict | None:
 
 def mark_queue_done(table, crawl_id: str, child_count: int,
                     new_child_count: int, is_terminal: bool) -> dict | None:
-    """
-    将当前 PROCESSING 任务标记为 DONE。
-    同时同步更新旧字段：crawl_status, is_crawled, is_terminal, is_exhausted。
-    """
+    """将当前 PROCESSING 任务标记为 DONE。"""
     now = utc_now()
     crawl_status = "TERMINAL" if is_terminal else "CRAWLED"
 
@@ -532,7 +777,7 @@ def count_queue_status(table, status: str) -> int:
 
 
 def recover_stale_processing_items(table, stale_seconds: int = 900) -> int:
-    """简易扫描恢复超时任务；生产环境建议使用 queue_status-claimed_at-index。"""
+    """简易扫描恢复超时任务。"""
     cutoff = datetime.fromtimestamp(time.time() - stale_seconds, timezone.utc).strftime(
         "%Y-%m-%dT%H:%M:%S.%fZ"
     )
@@ -568,42 +813,34 @@ def recover_stale_processing_items(table, stale_seconds: int = 900) -> int:
             return recovered
 
 
+def seed_from_homepage(table, website_source: str | None = None) -> int:
+    """队列为空时从目标网站首页发现并持久化第一层目录。"""
+    added = 0
+    
+    if website_source == MERCARI_SOURCE:
+        # Mercari 使用 Selenium 爬取首页
+        links = extract_mercari_links_with_selenium(MERCARI_START_URL, depth=0, max_depth=1)
+        for link in links:
+            result = enqueue_discovered_link(table, link, root_url=link["url"])
+            added += int(result["is_new"])
+        return added
+    
+    # Yahoo 使用 requests
+    session = _http_session()
+    start_urls = (START_URL_BY_SOURCE[website_source],) if website_source else START_URLS
+    for start_url in start_urls:
+        if website_source_from_url(start_url) == MERCARI_SOURCE:
+            continue  # Mercari 已单独处理
+        try:
+            response = session.get(start_url, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+            for link in extract_yahoo_links_from_page(response.text, start_url, depth=0):
+                result = enqueue_discovered_link(table, link, root_url=link["url"])
+                added += int(result["is_new"])
+        except Exception as e:
+            logger.error(f"播种失败 {start_url}: {e}")
+    return added
 
-
-def extract_links(html: str, source_url: str, limit: int | None = None) -> list[dict]:
-    """兼容旧版通用链接提取测试：仅清洗、去重并返回允许访问的链接。"""
-    soup = BeautifulSoup(html or "", "html.parser")
-    links, seen = [], set()
-    for anchor in soup.select("a[href]"):
-        href = anchor.get("href")
-        if not href or href.startswith(("#", "javascript:", "mailto:", "tel:", "data:")):
-            continue
-        parsed = urlsplit(urljoin(source_url, href.strip()))
-        normalized = urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path or "/", parsed.query, ""))
-        if normalized in seen or not is_allowed_url(normalized):
-            continue
-        seen.add(normalized)
-        links.append({"url": normalized, "anchor_text": clean_anchor_text(anchor.get_text(" ", strip=True)), "source_url": source_url})
-        if limit is not None and len(links) >= limit:
-            break
-    return links
-
-
-def save_discovered_link(table, link: dict) -> dict:
-    """兼容旧接口，转发到队列写入函数。"""
-    return enqueue_discovered_link(table, link, link.get("source_url") or link.get("url", ""))
-
-
-def get_next_unvisited_url(table) -> str | None:
-    """兼容旧接口，按队列索引返回下一条未访问 URL。"""
-    for item in get_queued_items(table, 1):
-        return item.get("url")
-    return None
-
-
-def count_remaining_unvisited(table) -> int:
-    """兼容旧接口，统计 QUEUED 项。"""
-    return count_queue_status(table, "QUEUED")
 
 # ============================================================
 # HTTP 会话
@@ -620,26 +857,12 @@ def _http_session():
 
 
 # ============================================================
-# 播种与队列消费
+# 队列消费
 # ============================================================
-
-def seed_from_homepage(table, website_source: str | None = None) -> int:
-    """队列为空时从目标网站首页发现并持久化第一层目录。"""
-    session = _http_session()
-    added = 0
-    start_urls = (START_URL_BY_SOURCE[website_source],) if website_source else START_URLS
-    for start_url in start_urls:
-        response = session.get(start_url, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
-        for link in extract_links_from_page(response.text, start_url, depth=0):
-            result = enqueue_discovered_link(table, link, root_url=link["url"])
-            added += int(result["is_new"])
-    return added
-
 
 def crawl_queue(table, max_pages: int | None = None, max_depth: int | None = None,
                 max_links_per_run: int | None = None, website_source: str | None = None) -> dict:
-    """消费 DynamoDB 持久化队列，不依赖进程内存恢复进度。"""
+    """消费 DynamoDB 持久化队列。"""
     page_limit = MAX_PAGES if max_pages is None else int(max_pages)
     depth_limit = MAX_DEPTH if max_depth is None else int(max_depth)
     link_limit = MAX_LINKS_PER_RUN if max_links_per_run is None else int(max_links_per_run)
@@ -662,23 +885,39 @@ def crawl_queue(table, max_pages: int | None = None, max_depth: int | None = Non
             current_url = claimed["url"]
             depth = int(claimed.get("depth", 0))
             root_url = claimed.get("root_url") or current_url
+            
             if depth > depth_limit or not should_crawl(current_url):
                 mark_queue_done(table, claimed["crawl_id"], 0, 0, False)
                 continue
+            
             try:
-                response = session.get(current_url, timeout=REQUEST_TIMEOUT)
-                response.raise_for_status()
-                pages_crawled += 1
-                discovered = extract_links_from_page(response.text, current_url, depth + 1)
+                source = website_source_from_url(current_url)
+                
+                if source == MERCARI_SOURCE:
+                    # Mercari 使用 Selenium
+                    discovered = extract_mercari_links_with_selenium(
+                        current_url, depth, max_depth=depth_limit
+                    )
+                    html = ""  # Mercari 不需要 HTML
+                else:
+                    # Yahoo 使用 requests
+                    response = session.get(current_url, timeout=REQUEST_TIMEOUT)
+                    response.raise_for_status()
+                    html = response.text
+                    discovered = extract_yahoo_links_from_page(html, current_url, depth + 1)
+                    pages_crawled += 1
+                
                 if website_source:
                     discovered = [
                         link for link in discovered
                         if link.get("website_source") == website_source
                     ]
+                
                 unique_children = {}
                 for directory in discovered:
                     if directory["url"] != current_url:
                         unique_children.setdefault(directory["url"], directory)
+                
                 page_new = 0
                 for directory in unique_children.values():
                     result = enqueue_discovered_link(table, directory, root_url)
@@ -686,13 +925,16 @@ def crawl_queue(table, max_pages: int | None = None, max_depth: int | None = Non
                     if result["is_new"]:
                         page_new += 1
                         newly_enqueued += 1
+                
                 child_count = len(unique_children)
                 mark_queue_done(
                     table, claimed["crawl_id"], child_count, page_new,
                     is_terminal=child_count == 0,
                 )
+                
                 if REQUEST_INTERVAL:
                     time.sleep(REQUEST_INTERVAL)
+                    
             except Exception as exc:
                 message = f"处理失败 {current_url}: {exc}"
                 logger.exception(message)
@@ -701,8 +943,10 @@ def crawl_queue(table, max_pages: int | None = None, max_depth: int | None = Non
                     mark_queue_failed(table, claimed, message)
                 except Exception:
                     logger.exception("更新失败队列状态失败: %s", current_url)
+        
         if not claimed_any:
             break
+            
     return {
         "pages_crawled": pages_crawled,
         "directories_found": directories_found,
@@ -719,12 +963,12 @@ def lambda_handler(event, context):
     """
     EventBridge 入口：恢复、播种并消费 DynamoDB 持久化目录队列。
     
-    可选 event 参数：
-    - max_pages: 本次最大爬取页数
-    - max_depth: 最大爬取深度
-    - max_links_per_run: 本次最大处理链接数
-    - include_counts: 是否返回全表统计（默认 false，节省 DynamoDB 查询成本）
-    - source: 可选来源控制，Yahoo/YAHOO_AUCTION 只跑 Yahoo，Mercari 只跑 Mercari
+    event 参数:
+        - max_pages: 本次最大爬取页数
+        - max_depth: 最大爬取深度
+        - max_links_per_run: 本次最大处理链接数
+        - include_counts: 是否返回全表统计
+        - source: 可选来源控制 (YAHOO_AUCTION / MERCARI)
     """
     event = event if isinstance(event, dict) else {}
     requested_source = normalize_requested_source(event.get("source"))
@@ -749,14 +993,14 @@ def lambda_handler(event, context):
 
     response = {
         "statusCode": 200,
-        "message": "队列式 /list3/* 目录采集完成",
+        "message": "队列式目录采集完成",
         "seeded": seeded,
         "recovered": recovered,
         "metrics": result,
         "source": requested_source or "ALL",
     }
 
-    # 仅手动调试时才统计全表（避免每次 Lambda 执行昂贵的 COUNT 查询）
+    # 仅手动调试时才统计全表
     if event.get("include_counts"):
         response["queue"] = {
             "queued": count_queue_status(table, "QUEUED"),
