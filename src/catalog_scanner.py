@@ -73,7 +73,7 @@ def _scan_directories() -> List[Dict]:
         params = {
             "FilterExpression": "attribute_exists(category_id) AND category_id <> :empty",
             "ExpressionAttributeValues": {":empty": ""},
-            "ProjectionExpression": ("crawl_id, category_id, category_name, anchor_text, "
+            "ProjectionExpression": ("crawl_id, category_id, category_name, anchor_text, website_source, link_type, is_leaf, "
                                      "countdown_scan_profile, countdown_scan_enabled"),
         }
         if start_key:
@@ -89,6 +89,14 @@ def _category_name(item: Dict) -> str:
     return str(item.get("category_name") or item.get("anchor_text") or "").strip()
 
 
+def is_scannable_catalog(item: Dict) -> bool:
+    """Mercari 只有最终 search leaf 可进入商品扫描；Yahoo 保持兼容。"""
+    website_source = str(item.get("website_source") or item.get("source") or "YAHOO_AUCTION").strip().upper()
+    if website_source == "MERCARI":
+        return item.get("link_type") == "mercari_search_leaf" and bool(item.get("is_leaf"))
+    return True
+
+
 def configure_profiles(event: Dict, now: int = None) -> Dict:
     """按分类名字批量设置 OFF/SLOW/MEDIUM/FAST；空配置返回当前运行配置。"""
     profiles = event.get("profiles")
@@ -96,7 +104,7 @@ def configure_profiles(event: Dict, now: int = None) -> Dict:
         profiles = {}
     if not isinstance(profiles, dict):
         raise ValueError("profiles 必须是分类名字到挡位的对象")
-    directories = _scan_directories()
+    directories = [item for item in _scan_directories() if is_scannable_catalog(item)]
     if not profiles:
         current = {}
         for item in directories:
@@ -179,7 +187,7 @@ def find_due_catalogs(now: int, limit: int = MAX_MODELS_PER_RUN) -> List[Dict]:
             "ExpressionAttributeNames": {"#source": "source"},
             "ProjectionExpression": ("crawl_id, category_id, category_name, anchor_text, website_source, #source, "
                                      "countdown_active_count, countdown_closed_count, "
-                                     "countdown_interval_minutes, countdown_next_scan_at"),
+                                     "countdown_interval_minutes, countdown_next_scan_at, link_type, is_leaf"),
             "Limit": 100,
         }
         if start_key:
@@ -190,6 +198,7 @@ def find_due_catalogs(now: int, limit: int = MAX_MODELS_PER_RUN) -> List[Dict]:
         if not start_key:
             break
     due.sort(key=lambda item: int(item.get("countdown_next_scan_at", 0)))
+    due = [item for item in due if is_scannable_catalog(item)]
     return due[:limit]
 
 

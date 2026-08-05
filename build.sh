@@ -57,8 +57,13 @@ if grep -n '_ai_state' "$LAMBDA_DIR/auction_analyzer.py"; then
 fi
 
 echo ""
-echo "🧪 Running automatic tests (including countdown scheduler and reminder checks)..."
-python -m unittest tests.test_catalog_scanner tests.test_final_check_reminder
+echo "🧪 Running automatic tests before packaging..."
+python -m unittest \
+  tests.test_search_engine_crawler \
+  tests.test_catalog_scanner \
+  tests.test_final_check_reminder \
+  tests.test_yahoo_auction_scraper_filter \
+  tests.test_auction_analyzer
 
 echo ""
 echo "📦 Installing dependencies into build directory..."

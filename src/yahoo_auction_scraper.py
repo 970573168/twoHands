@@ -7,7 +7,7 @@ import ipaddress
 import unicodedata
 from decimal import Decimal
 from datetime import datetime, timezone, timedelta
-from urllib.parse import urlencode, quote
+from urllib.parse import urlencode, quote, urljoin
 
 import boto3
 import requests
@@ -1002,8 +1002,10 @@ def lambda_handler(event, context):
         
         logger.info(f"Scraping for keyword: '{keyword}', type: '{search_type}'")
         
+        category_id = str(event.get("category_id", "")).strip()
         items = scrape_auctions(keyword, search_type, include_paypay,
                                 exclude_keywords, include_keywords, min_price,
+                                category_id=category_id,
                                 website_source=website_source,
                                 **_search_context_kwargs(event))
         
@@ -1161,8 +1163,10 @@ def lambda_handler(event, context):
         include_paypay = event.get("include_paypay", INCLUDE_PAYPAY)
         exclude_keywords, include_keywords = get_filter_keywords(event)
         
+        category_id = str(event.get("category_id", "")).strip()
         items = scrape_auctions(keyword, search_type, include_paypay,
                                 exclude_keywords, include_keywords, event.get("min_price"),
+                                category_id=category_id,
                                 website_source=website_source,
                                 **_search_context_kwargs(event))
         
@@ -1211,49 +1215,63 @@ def lambda_handler(event, context):
 # 搜索和解析函数
 # ======================================
 
+def extract_mercari_next_url(html: str, current_url: str) -> str | None:
+    """从 Mercari 公开 HTML 中读取真实下一页链接。"""
+    soup = BeautifulSoup(html or "", "html.parser")
+    rel_next = soup.find("link", rel=lambda value: value and "next" in value)
+    if rel_next and rel_next.get("href"):
+        return urljoin(current_url, rel_next["href"])
+    for anchor in soup.select("a[href]"):
+        text = anchor.get_text(" ", strip=True)
+        aria = anchor.get("aria-label", "")
+        rel = " ".join(anchor.get("rel", [])) if isinstance(anchor.get("rel"), list) else str(anchor.get("rel", ""))
+        data_testid = str(anchor.get("data-testid", ""))
+        if text == "次へ" or "次へ" in aria or "next" in rel.lower() or "next" in data_testid.lower():
+            return urljoin(current_url, anchor["href"])
+    return None
+
 def scrape_auctions(keyword, search_type, include_paypay=True,
                     exclude_keywords="", include_keywords="", min_price=None,
                     scrape_details=None, category="", brand="", model="", aliases=None, category_id="",
                     enable_local_title_filter=None,
                     local_title_filter_strict=None,
                     website_source=YAHOO_AUCTION_SOURCE):
-    """抓取列表页；支持 Yahoo Auction 与 Mercari（二手煤炉）来源。"""
+    """抓取列表页；Yahoo 继续按 page/b offset，Mercari 按真实 next URL 翻页。"""
     if scrape_details is None:
         scrape_details = ENABLE_DETAIL_SCRAPE_ON_SEARCH
+    if website_source == MERCARI_SOURCE and scrape_details:
+        logger.info("Mercari detail scrape skipped: dedicated Mercari detail scraper not implemented")
+        scrape_details = False
     if enable_local_title_filter is None:
         enable_local_title_filter = ENABLE_LOCAL_TITLE_FILTER
     if local_title_filter_strict is None:
         local_title_filter_strict = LOCAL_TITLE_FILTER_STRICT
-
     if not include_keywords:
         include_keywords = DEFAULT_INCLUDE_KEYWORDS
 
     all_items = []
+    seen_item_ids = set()
+    seen_page_urls = set()
+    next_url = build_url(keyword, 1, search_type, exclude_keywords, include_keywords, min_price, category_id, website_source)
 
     for page in range(1, MAX_PAGES + 1):
-        url = build_url(keyword, page, search_type, exclude_keywords, include_keywords, min_price, category_id, website_source)
+        url = next_url if website_source == MERCARI_SOURCE else build_url(keyword, page, search_type, exclude_keywords, include_keywords, min_price, category_id, website_source)
+        if website_source == MERCARI_SOURCE:
+            if not url or url in seen_page_urls:
+                break
+            seen_page_urls.add(url)
         logger.info(f"Fetching page {page}: {url}")
 
         try:
             resp = requests.get(url, timeout=REQUEST_TIMEOUT, headers={"User-Agent": USER_AGENT})
             resp.raise_for_status()
         except requests.exceptions.HTTPError as e:
-            if e.response is not None and e.response.status_code == 404:
+            if website_source != MERCARI_SOURCE and e.response is not None and e.response.status_code == 404:
                 simplified = simplify_search_keyword(keyword)
                 if simplified:
-                    retry_url = build_url(
-                        simplified, page, search_type, exclude_keywords,
-                        include_keywords, min_price, category_id, website_source,
-                    )
-                    logger.warning(
-                        "Search returned 404; retrying once: original=%s simplified=%s",
-                        keyword, simplified,
-                    )
+                    retry_url = build_url(simplified, page, search_type, exclude_keywords, include_keywords, min_price, category_id, website_source)
                     try:
-                        resp = requests.get(
-                            retry_url, timeout=REQUEST_TIMEOUT,
-                            headers={"User-Agent": USER_AGENT},
-                        )
+                        resp = requests.get(retry_url, timeout=REQUEST_TIMEOUT, headers={"User-Agent": USER_AGENT})
                         resp.raise_for_status()
                     except requests.exceptions.RequestException as retry_error:
                         logger.error("Simplified search retry failed for page %s: %s", page, retry_error)
@@ -1269,78 +1287,62 @@ def scrape_auctions(keyword, search_type, include_paypay=True,
             continue
 
         items = parse_html(resp.text, search_type, include_paypay, website_source)
+        parsed_item_count = len(items)
         if not items:
             break
-        parsed_item_count = len(items)
 
         if enable_local_title_filter:
             context = detect_target_context(keyword, category, brand, model, aliases)
-            before = len(items)
-            kept, removed = [], []
+            kept = []
             for item in items:
-                should_filter, reason = should_filter_item_by_context(
-                    item, context, strict=local_title_filter_strict, search_type=search_type,
-                )
+                should_filter, reason = should_filter_item_by_context(item, context, strict=local_title_filter_strict, search_type=search_type)
                 item["localFilterReason"] = reason
-                if reason == "ATTACHED_ACCESSORY_KEPT":
-                    logger.info(
-                        "Local filter kept attached accessory title: keyword=%s title=%s",
-                        keyword, item.get("title", "")[:160],
-                    )
-                (removed if should_filter else kept).append(item)
-            logger.info(
-                "Local title filter: keyword=%s before=%s after=%s removed=%s",
-                keyword, before, len(kept), len(removed),
-            )
-            for item in removed[:10]:
-                reason = str(item.get("localFilterReason", ""))
-                if reason.startswith("STRONG_EXCLUSION_"):
-                    log_message = "Local filter strong excluded: type=%s reason=%s title=%s"
-                elif reason == "NO_CORE_MODEL_KEYWORD":
-                    log_message = "Local filter no core model keyword: type=%s reason=%s title=%s"
-                else:
-                    log_message = "Local filter excluded: type=%s reason=%s title=%s"
-                logger.info(
-                    log_message,
-                    item.get("localListingType"), item.get("localFilterReason"),
-                    item.get("title", "")[:160],
-                )
+                if not should_filter:
+                    kept.append(item)
             items = kept
 
-        # 普通爬虫可同步抓详情；分析工作流会显式关闭并按利润延迟抓取
+        page_new_items = []
+        for item in items:
+            item_id = str(item.get("itemId") or item.get("itemID") or item.get("url") or "")
+            if website_source == MERCARI_SOURCE and item_id in seen_item_ids:
+                continue
+            if item_id:
+                seen_item_ids.add(item_id)
+            page_new_items.append(item)
+        items = page_new_items
+
         if scrape_details:
             enriched_items = []
             for index, item in enumerate(items):
                 try:
-                    enriched_item = enrich_item_with_detail(item)
-                    enriched_items.append(enriched_item)
+                    enriched_items.append(enrich_item_with_detail(item))
                 except Exception as e:
                     logger.error(f"详情补充失败 itemId={item.get('itemId')}: {e}")
                     item["detailScrapeStatus"] = "FAILED"
                     item["detailScrapeError"] = str(e)[:500]
                     item["detailScrapedAt"] = datetime.now(timezone.utc).isoformat()
                     enriched_items.append(item)
-
-                # 请求间隔
                 if index < len(items) - 1:
                     time.sleep(DETAIL_REQUEST_INTERVAL)
-
             items = enriched_items
 
-        # 将调用方已知的分类名称附到每件商品上，入库后可直接查看分类。
         for item in items:
             item["category"] = str(category or "").strip()
             item["websiteSource"] = website_source
             item["source"] = website_source
-
         all_items.extend(items)
 
-        if parsed_item_count < ITEMS_PER_PAGE:
+        if website_source == MERCARI_SOURCE:
+            next_url = extract_mercari_next_url(resp.text, url)
+            has_next = bool(next_url and next_url not in seen_page_urls)
+            logger.info("Mercari page: category_id=%s search_type=%s page_index=%s current_url=%s parsed_count=%s new_item_count=%s total_unique_count=%s has_next_page=%s", category_id, search_type, page, url, parsed_item_count, len(items), len(seen_item_ids), has_next)
+            if not has_next or not items:
+                break
+        elif parsed_item_count < ITEMS_PER_PAGE:
             break
 
     logger.info(f"Total items scraped: {len(all_items)}")
     return all_items
-
 
 
 def _parse_price_to_int(price_text):

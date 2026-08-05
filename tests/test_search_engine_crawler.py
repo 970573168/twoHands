@@ -17,8 +17,8 @@ from search_engine_crawler import (
     claim_queue_item, count_queue_status, enqueue_discovered_link,
     get_queued_items, lambda_handler, mark_queue_done, mark_queue_failed,
     count_remaining_unvisited,
-    extract_category_id, extract_links, extract_links_from_page,
-    get_next_unvisited_url, is_allowed_url, normalize_requested_source, normalize_url,
+    canonicalize_category_url, classify_mercari_category_url, crawl_queue, extract_category_id, extract_links, extract_links_from_page,
+    get_next_unvisited_url, is_allowed_url, normalize_requested_source, normalize_url, should_crawl,
     save_discovered_link, website_source_from_url,
 )
 
@@ -285,6 +285,55 @@ class SearchEngineCrawlerTest(unittest.TestCase):
         )
         self.assertEqual(links[0]["category_id"], "2084317598")
         self.assertEqual(links[0]["category_name"], "スマートフォン本体")
+
+    def test_mercari_directory_classification_and_crawl_decision(self):
+        url = "https://jp.mercari.com/categories?category_id=840"
+        info = classify_mercari_category_url(url)
+        self.assertEqual(extract_category_id(url), "840")
+        self.assertEqual(info["link_type"], "mercari_directory")
+        self.assertFalse(info["is_leaf"])
+        self.assertTrue(should_crawl(url))
+
+    def test_mercari_search_leaf_classification_and_terminal_decision(self):
+        url = "https://jp.mercari.com/search?category_id=3702"
+        info = classify_mercari_category_url(url)
+        self.assertEqual(extract_category_id(url), "3702")
+        self.assertEqual(info["link_type"], "mercari_search_leaf")
+        self.assertTrue(info["is_leaf"])
+        self.assertFalse(should_crawl(url))
+
+    def test_mercari_html_extracts_directory_and_search_leaf(self):
+        html = '<a href="/categories?category_id=840">ノートPC</a><a href="/search?category_id=3702">MacBook本体</a>'
+        links = extract_links_from_page(html, "https://jp.mercari.com/categories?category_id=7", 2)
+        by_id = {link["category_id"]: link for link in links}
+        self.assertEqual(by_id["840"]["link_type"], "mercari_directory")
+        self.assertFalse(by_id["840"]["is_leaf"])
+        self.assertEqual(by_id["3702"]["link_type"], "mercari_search_leaf")
+        self.assertTrue(by_id["3702"]["is_leaf"])
+        self.assertEqual(by_id["3702"]["category_name"], "MacBook本体")
+
+    def test_mercari_canonicalization_keeps_only_category_id(self):
+        self.assertEqual(canonicalize_category_url("https://jp.mercari.com/categories?category_id=840&foo=bar"), "https://jp.mercari.com/categories?category_id=840")
+        self.assertEqual(canonicalize_category_url("https://jp.mercari.com/search?category_id=3702&foo=bar"), "https://jp.mercari.com/search?category_id=3702")
+
+    @patch("search_engine_crawler.time.sleep", return_value=None)
+    @patch("search_engine_crawler._get_with_retries")
+    def test_mercari_http_crawl_increments_pages_crawled(self, get_with_retries, _sleep):
+        table = Mock()
+        table.query.return_value = {"Items": [{"crawl_id": "id", "website_source": "MERCARI"}]}
+        table.update_item.side_effect = [
+            {"Attributes": {"crawl_id": "id", "url": "https://jp.mercari.com/categories?category_id=840", "depth": 0, "queue_status": "PROCESSING", "website_source": "MERCARI"}},
+            {}, {},
+        ]
+        get_with_retries.return_value = Mock(text='<a href="/search?category_id=3702">MacBook本体</a>')
+        result = crawl_queue(table, max_pages=1, website_source="MERCARI")
+        self.assertEqual(result["pages_crawled"], 1)
+
+    def test_engine_has_no_selenium_webdriver_call(self):
+        with open(os.path.join(os.path.dirname(__file__), "..", "src", "search_engine_crawler.py"), encoding="utf-8") as f:
+            source = f.read()
+        self.assertNotIn("webdriver.Chrome", source)
+        self.assertNotIn("from selenium", source)
 
 
 if __name__ == "__main__":
