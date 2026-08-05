@@ -15,11 +15,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from search_engine_crawler import (
     claim_queue_item, count_queue_status, enqueue_discovered_link,
-    get_queued_items, lambda_handler, mark_queue_done, mark_queue_failed,
+    get_queued_items, has_queued_items, lambda_handler, mark_queue_done, mark_queue_failed,
     count_remaining_unvisited,
     canonicalize_category_url, classify_mercari_category_url, crawl_queue, extract_category_id, extract_links, extract_links_from_page,
     get_next_unvisited_url, is_allowed_url, normalize_requested_source, normalize_url, should_crawl,
-    save_discovered_link, website_source_from_url,
+    save_discovered_link, seed_from_homepage, website_source_from_url,
 )
 
 
@@ -132,7 +132,7 @@ class SearchEngineCrawlerTest(unittest.TestCase):
 
     @patch("search_engine_crawler.count_queue_status", return_value=0)
     @patch("search_engine_crawler.crawl_queue", return_value={"pages_crawled": 0})
-    @patch("search_engine_crawler.seed_from_homepage", return_value=2)
+    @patch("search_engine_crawler.seed_from_homepage", return_value={"pages_requested": 1, "http_status": 200, "html_length": 10, "links_found": 2, "inserted": 2, "existing": 0, "errors": []})
     @patch("search_engine_crawler.has_queued_items", return_value=False)
     @patch("search_engine_crawler.recover_stale_processing_items", return_value=0)
     @patch("search_engine_crawler.boto3.resource")
@@ -152,7 +152,7 @@ class SearchEngineCrawlerTest(unittest.TestCase):
 
 
     @patch("search_engine_crawler.crawl_queue", return_value={"pages_crawled": 0})
-    @patch("search_engine_crawler.seed_from_homepage", return_value=1)
+    @patch("search_engine_crawler.seed_from_homepage", return_value={"pages_requested": 1, "http_status": 200, "html_length": 10, "links_found": 1, "inserted": 1, "existing": 0, "errors": []})
     @patch("search_engine_crawler.has_queued_items", return_value=False)
     @patch("search_engine_crawler.recover_stale_processing_items", return_value=0)
     @patch("search_engine_crawler.boto3.resource")
@@ -166,6 +166,20 @@ class SearchEngineCrawlerTest(unittest.TestCase):
         seed.assert_called_once_with(table, "MERCARI")
         self.assertEqual(crawl.call_args.kwargs["website_source"], "MERCARI")
         self.assertEqual(result["source"], "MERCARI")
+
+
+    @patch("search_engine_crawler.count_queue_status", return_value=0)
+    @patch("search_engine_crawler.crawl_queue", return_value={"pages_crawled": 0})
+    @patch("search_engine_crawler.seed_from_homepage", return_value={"pages_requested": 1, "http_status": 200, "html_length": 10, "links_found": 1, "inserted": 1, "existing": 0, "errors": []})
+    @patch("search_engine_crawler.has_queued_items", return_value=False)
+    @patch("search_engine_crawler.recover_stale_processing_items", return_value=0)
+    @patch("search_engine_crawler.boto3.resource")
+    def test_lambda_include_counts_returns_environment_table_name(
+        self, resource, recover, has_items, seed, crawl, count
+    ):
+        with patch.dict(os.environ, {"LINK_CRAWLER_TABLE_NAME": "debug-table"}):
+            result = lambda_handler({"source": "Mercari", "include_counts": True}, None)
+        self.assertEqual(result["table_name"], "debug-table")
 
     def test_next_unvisited_url_continues_after_empty_filtered_page(self):
         table = Mock()
@@ -241,6 +255,81 @@ class SearchEngineCrawlerTest(unittest.TestCase):
         links = extract_links(html, "https://auctions.yahoo.co.jp/", limit=1)
         self.assertEqual([link["anchor_text"] for link in links], ["一"])
 
+
+
+    def test_mercari_root_html_extracts_two_directory_links(self):
+        html = """
+        <a href="https://jp.mercari.com/categories?category_id=3088">ファッション</a>
+        <a href="https://jp.mercari.com/categories?category_id=7">スマホ・タブレット・パソコン</a>
+        """
+        links = extract_links_from_page(html, "https://jp.mercari.com/categories", 0)
+        self.assertEqual([link["category_id"] for link in links], ["3088", "7"])
+        self.assertTrue(all(link["link_type"] == "mercari_directory" for link in links))
+        self.assertTrue(all(link["is_leaf"] is False for link in links))
+
+    def test_mercari_leaf_html_extracts_search_leaf(self):
+        links = extract_links_from_page(
+            '<a href="/search?category_id=3702">MacBook本体</a>',
+            "https://jp.mercari.com/categories?category_id=7",
+            1,
+        )
+        self.assertEqual(len(links), 1)
+        self.assertEqual(links[0]["category_id"], "3702")
+        self.assertEqual(links[0]["link_type"], "mercari_search_leaf")
+        self.assertTrue(links[0]["is_leaf"])
+
+    def test_has_queued_items_returns_false_for_empty_table(self):
+        table = Mock()
+        table.query.return_value = {"Items": []}
+        self.assertFalse(has_queued_items(table, "MERCARI"))
+
+
+    def test_has_queued_items_finds_mercari_after_yahoo_page(self):
+        table = Mock()
+        table.query.side_effect = [
+            {
+                "Items": [{"crawl_id": "y", "website_source": "YAHOO_AUCTION"}],
+                "LastEvaluatedKey": {"crawl_id": "y"},
+            },
+            {"Items": [{"crawl_id": "m", "website_source": "MERCARI"}]},
+        ]
+        self.assertTrue(has_queued_items(table, "MERCARI"))
+
+    @patch("search_engine_crawler._get_with_retries")
+    def test_seed_from_homepage_reports_success_details(self, get_with_retries):
+        table = Mock()
+        table.update_item.return_value = {}
+        response = Mock(
+            text='<a href="https://jp.mercari.com/categories?category_id=3088">ファッション</a><a href="/categories?category_id=7">スマホ・タブレット・パソコン</a>',
+            status_code=200,
+            headers={"Content-Type": "text/html"},
+            url="https://jp.mercari.com/categories",
+        )
+        get_with_retries.return_value = response
+        result = seed_from_homepage(table, "MERCARI")
+        self.assertEqual(result["pages_requested"], 1)
+        self.assertEqual(result["http_status"], 200)
+        self.assertEqual(result["links_found"], 2)
+        self.assertEqual(result["inserted"], 2)
+        self.assertEqual(result["existing"], 0)
+        self.assertEqual(result["errors"], [])
+
+    @patch("search_engine_crawler._get_with_retries")
+    def test_seed_from_homepage_continues_and_reports_dynamodb_write_error(self, get_with_retries):
+        table = Mock()
+        table.update_item.side_effect = [Exception("write denied"), {}]
+        get_with_retries.return_value = Mock(
+            text='<a href="/categories?category_id=3088">ファッション</a><a href="/categories?category_id=7">スマホ・タブレット・パソコン</a>',
+            status_code=200,
+            headers={"Content-Type": "text/html"},
+            url="https://jp.mercari.com/categories",
+        )
+        result = seed_from_homepage(table, "MERCARI")
+        self.assertEqual(result["links_found"], 2)
+        self.assertEqual(result["inserted"], 1)
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertIn("category_id=3088", result["errors"][0])
+        self.assertIn("write denied", result["errors"][0])
 
     def test_extracts_mercari_category_links_with_site_source(self):
         html = """

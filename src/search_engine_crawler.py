@@ -678,21 +678,64 @@ def _get_with_retries(session, url: str):
     response.raise_for_status()
     return response
 
-def seed_from_homepage(table, website_source: str | None = None) -> int:
-    """队列为空时从目标网站首页发现并持久化第一层目录。"""
-    added = 0
+def seed_from_homepage(table, website_source: str | None = None) -> dict:
+    """队列为空时从目标网站首页发现并持久化第一层目录，并返回可观测结果。"""
+    result = {
+        "pages_requested": 0,
+        "http_status": None,
+        "html_length": 0,
+        "links_found": 0,
+        "inserted": 0,
+        "existing": 0,
+        "errors": [],
+    }
     session = _http_session()
     start_urls = (START_URL_BY_SOURCE[website_source],) if website_source else START_URLS
     for start_url in start_urls:
+        source = website_source_from_url(start_url)
         try:
+            result["pages_requested"] += 1
             response = _get_with_retries(session, start_url)
-            extractor = extract_mercari_links_from_page if website_source_from_url(start_url) == MERCARI_SOURCE else extract_yahoo_links_from_page
-            for link in extractor(response.text, start_url, depth=1):
-                result = enqueue_discovered_link(table, link, root_url=start_url)
-                added += int(result["is_new"])
-        except Exception as e:
-            logger.error(f"播种失败 {start_url}: {e}")
-    return added
+            html = response.text or ""
+            content_type = response.headers.get("Content-Type", "")
+            final_url = getattr(response, "url", start_url) or start_url
+            status_code = getattr(response, "status_code", None)
+            result["http_status"] = status_code
+            result["html_length"] += len(html)
+            if source == MERCARI_SOURCE:
+                logger.info(
+                    "Mercari seed HTTP: website_source=%s requested_url=%s final_url=%s status=%s html_length=%s content_type=%s",
+                    source, start_url, final_url, status_code, len(html), content_type,
+                )
+            extractor = extract_mercari_links_from_page if source == MERCARI_SOURCE else extract_yahoo_links_from_page
+            links = extractor(html, final_url, depth=1)
+            result["links_found"] += len(links)
+            if source == MERCARI_SOURCE:
+                logger.info("Mercari seed parse: website_source=%s links_found=%s", source, len(links))
+        except Exception as exc:
+            message = f"seed page failed url={start_url}: {exc}"
+            logger.exception(message)
+            result["errors"].append(message)
+            continue
+
+        for link in links:
+            try:
+                write_result = enqueue_discovered_link(table, link, root_url=start_url)
+                if write_result["is_new"]:
+                    result["inserted"] += 1
+                else:
+                    result["existing"] += 1
+            except Exception as exc:
+                message = (
+                    "seed DynamoDB write failed "
+                    f"category_id={link.get('category_id', '')} "
+                    f"category_name={link.get('category_name', '')} "
+                    f"url={link.get('url', '')}: {exc}"
+                )
+                logger.exception(message)
+                result["errors"].append(message)
+                continue
+    return result
 
 
 # ============================================================
@@ -827,15 +870,18 @@ def lambda_handler(event, context):
     """
     event = event if isinstance(event, dict) else {}
     requested_source = normalize_requested_source(event.get("source"))
-    table = boto3.resource("dynamodb").Table(os.environ["LINK_CRAWLER_TABLE_NAME"])
+    table_name = os.environ["LINK_CRAWLER_TABLE_NAME"]
+    logger.info("Link crawler table: %s", table_name)
+    table = boto3.resource("dynamodb").Table(table_name)
 
     # 恢复超时任务
     recovered = recover_stale_processing_items(table)
 
     # 播种：队列为空时从首页发现
-    seeded = 0
+    seed = {"pages_requested": 0, "http_status": None, "html_length": 0, "links_found": 0, "inserted": 0, "existing": 0, "errors": []}
     if not has_queued_items(table, requested_source):
-        seeded = seed_from_homepage(table, requested_source)
+        seed = seed_from_homepage(table, requested_source)
+    seeded = int(seed.get("inserted", 0))
 
     # 消费队列
     result = crawl_queue(
@@ -850,6 +896,7 @@ def lambda_handler(event, context):
         "statusCode": 200,
         "message": "队列式目录采集完成",
         "seeded": seeded,
+        "seed": seed,
         "recovered": recovered,
         "metrics": result,
         "source": requested_source or "ALL",
@@ -857,6 +904,7 @@ def lambda_handler(event, context):
 
     # 仅手动调试时才统计全表
     if event.get("include_counts"):
+        response["table_name"] = table_name
         response["queue"] = {
             "queued": count_queue_status(table, "QUEUED"),
             "processing": count_queue_status(table, "PROCESSING"),
