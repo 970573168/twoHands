@@ -128,6 +128,19 @@ class CatalogScannerTest(unittest.TestCase):
         self.assertNotIn("product_pk", payload)
         self.assertEqual(payload["active_count"], 30)
         self.assertEqual(payload["closed_count"], 80)
+        self.assertEqual(payload["website_source"], "YAHOO_AUCTION")
+
+    def test_dispatch_passes_mercari_source_to_analyzer(self):
+        self.lambda_client.invoke.return_value = {"StatusCode": 202}
+        item = {
+            "crawl_id": "link-1", "category_id": "859", "category_name": "煤炉相机",
+            "website_source": "MERCARI", "countdown_active_count": 20,
+            "countdown_closed_count": 10,
+        }
+        self.assertTrue(catalog_scanner.dispatch_to_analyzer(item))
+        payload = json.loads(self.lambda_client.invoke.call_args.kwargs["Payload"])
+        self.assertEqual(payload["category_id"], "859")
+        self.assertEqual(payload["website_source"], "MERCARI")
 
     def test_dispatch_failure_releases_lock_and_retries_next_minute(self):
         catalog_scanner.mark_dispatch_failed("link-1", 1000)

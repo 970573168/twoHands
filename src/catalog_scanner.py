@@ -57,7 +57,8 @@ def _find_directory(directory_id: str) -> Dict:
     response = table.scan(
         FilterExpression="category_id = :directory_id AND attribute_exists(crawl_id)",
         ExpressionAttributeValues={":directory_id": directory_id},
-        ProjectionExpression="crawl_id, category_id, category_name, anchor_text",
+        ExpressionAttributeNames={"#source": "source"},
+        ProjectionExpression="crawl_id, category_id, category_name, anchor_text, website_source, #source",
     )
     items = response.get("Items", [])
     if not items:
@@ -175,7 +176,8 @@ def find_due_catalogs(now: int, limit: int = MAX_MODELS_PER_RUN) -> List[Dict]:
                                  "AND countdown_scan_enabled = :enabled AND "
                                  "(attribute_not_exists(countdown_next_scan_at) OR countdown_next_scan_at <= :now)"),
             "ExpressionAttributeValues": {":empty": "", ":enabled": True, ":now": now},
-            "ProjectionExpression": ("crawl_id, category_id, category_name, anchor_text, "
+            "ExpressionAttributeNames": {"#source": "source"},
+            "ProjectionExpression": ("crawl_id, category_id, category_name, anchor_text, website_source, #source, "
                                      "countdown_active_count, countdown_closed_count, "
                                      "countdown_interval_minutes, countdown_next_scan_at"),
             "Limit": 100,
@@ -214,7 +216,9 @@ def claim_catalog(item: Dict, now: int) -> bool:
 def dispatch_to_analyzer(item: Dict) -> bool:
     active_count = _integer(item.get("countdown_active_count"), "countdown_active_count", 1, 1000)
     closed_count = _integer(item.get("countdown_closed_count"), "countdown_closed_count", 1, 1000)
+    website_source = str(item.get("website_source") or item.get("source") or "YAHOO_AUCTION").strip()
     payload = {"mode": "countdown", "source": "countdown_directory_scanner",
+               "website_source": website_source, "websiteSource": website_source,
                "category_id": str(item["category_id"]),
                "category": str(item.get("category_name") or item.get("anchor_text") or "").strip(),
                "active_count": active_count,

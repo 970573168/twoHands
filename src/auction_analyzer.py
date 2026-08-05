@@ -22,7 +22,7 @@ from collections import OrderedDict
 
 import boto3
 from token_usage import record_token_usage
-from yahoo_auction_scraper import scrape_auctions, scrape_item_detail
+from yahoo_auction_scraper import MERCARI_SOURCE, YAHOO_AUCTION_SOURCE, scrape_auctions, scrape_item_detail
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -2241,7 +2241,7 @@ def scrape_profitable_active_detail(item_id: str) -> Optional[Dict]:
 # Workflow
 # ======================================
 
-def scrape_closed(kw: str, cnt: int, force: bool = False, source_model: Optional[Dict] = None) -> List[str]:
+def scrape_closed(kw: str, cnt: int, force: bool = False, source_model: Optional[Dict] = None, website_source: str = YAHOO_AUCTION_SOURCE) -> List[str]:
     """抓取已结束商品，新商品自动设为 PENDING"""
     try:
         items = scrape_auctions(
@@ -2250,6 +2250,7 @@ def scrape_closed(kw: str, cnt: int, force: bool = False, source_model: Optional
             model=(source_model or {}).get("model", ""),
             category_id=(source_model or {}).get("category_id", ""),
             aliases=(source_model or {}).get("aliases") or (source_model or {}).get("alias") or [],
+            website_source=website_source,
         )[:cnt]
         new_count = 0
         
@@ -2281,6 +2282,8 @@ def scrape_closed(kw: str, cnt: int, force: bool = False, source_model: Optional
                         "category_name": norm((source_model or {}).get("category_name") or (source_model or {}).get("category", "")),
                         "category": norm((source_model or {}).get("category_name") or (source_model or {}).get("category", "")),
                         "sourceModel": source_model or {},
+                        "websiteSource": website_source,
+                        "source": website_source,
                     },
                     force=force
                 )
@@ -2339,7 +2342,7 @@ def get_seller_blacklist() -> Set[str]:
     return blacklist
 
 def scrape_active(kw: str, cnt: int, max_p: int = 0, force: bool = False,
-                  source_model: Optional[Dict] = None) -> List[str]:
+                  source_model: Optional[Dict] = None, website_source: str = YAHOO_AUCTION_SOURCE) -> List[str]:
     """抓取活跃商品，新商品自动设为 PENDING"""
     try:
         items = scrape_auctions(
@@ -2352,6 +2355,7 @@ def scrape_active(kw: str, cnt: int, max_p: int = 0, force: bool = False,
             model=(source_model or {}).get("model", ""),
             category_id=(source_model or {}).get("category_id", ""),
             aliases=(source_model or {}).get("aliases") or (source_model or {}).get("alias") or [],
+            website_source=website_source,
         )
         seller_blacklist = get_seller_blacklist()
         if seller_blacklist:
@@ -2425,6 +2429,8 @@ def scrape_active(kw: str, cnt: int, max_p: int = 0, force: bool = False,
                         "category_name": norm((source_model or {}).get("category_name") or (source_model or {}).get("category", "")),
                         "category": norm((source_model or {}).get("category_name") or (source_model or {}).get("category", "")),
                         "sourceModel": source_model or {},
+                        "websiteSource": website_source,
+                        "source": website_source,
                     },
                     # Active records are global by auction ID.  Re-run model
                     # matching whenever this auction is viewed under a new
@@ -2551,7 +2557,7 @@ def _first_identified_model(item: Dict) -> Optional[Dict]:
 
 
 def execute_countdown_workflow(category_id: str, ac: int, cc: int, force: bool,
-                               category: str = "",
+                               category: str = "", website_source: str = YAHOO_AUCTION_SOURCE,
                                test_active_item: Optional[Union[Dict, List[Dict]]] = None) -> Dict:
     """从某个分类下即将结束的 active 商品开始分析。
 
@@ -2561,7 +2567,7 @@ def execute_countdown_workflow(category_id: str, ac: int, cc: int, force: bool,
     global _start_time
     _start_time = time.time()
     mode_name = "test_countdown_active" if test_active_item is not None else "countdown"
-    result = {"mode": mode_name, "keyword": "", "category_id": category_id}
+    result = {"mode": mode_name, "keyword": "", "category_id": category_id, "websiteSource": website_source}
     try:
         check_limits()
         if test_active_item is not None:
@@ -2576,10 +2582,11 @@ def execute_countdown_workflow(category_id: str, ac: int, cc: int, force: bool,
                 )
         else:
             logger.info("倒计时步骤 13-14：按分类抓取即将结束商品 category_id=%s", category_id)
-            active_ids = scrape_active(
-                "", ac, 0, force,
-                {"category_id": category_id, "category": norm(category)},
-            )
+            active_source_model = {"category_id": category_id, "category": norm(category)}
+            if website_source == YAHOO_AUCTION_SOURCE:
+                active_ids = scrape_active("", ac, 0, force, active_source_model)
+            else:
+                active_ids = scrape_active("", ac, 0, force, active_source_model, website_source)
         result["active_ids"] = active_ids
         result["active"] = len(active_ids)
         if not active_ids:
@@ -2614,7 +2621,7 @@ def execute_countdown_workflow(category_id: str, ac: int, cc: int, force: bool,
         for model in identified.values():
             check_limits()
             keyword = f'{model["brand"]} {model["model"]}'.strip()
-            model_closed_ids = scrape_closed(keyword, cc, force, model)
+            model_closed_ids = (scrape_closed(keyword, cc, force, model) if website_source == YAHOO_AUCTION_SOURCE else scrape_closed(keyword, cc, force, model, website_source))
             closed_ids.extend(iid for iid in model_closed_ids if iid not in closed_ids)
             closed_items = [get_record(closed_db, iid) for iid in model_closed_ids]
             pending_closed = [
@@ -3158,9 +3165,16 @@ def lambda_handler(event, context):
                 }
             first_test_item = test_item[0] if isinstance(test_item, list) and test_item else test_item
             _token_usage_category = norm(event.get("category", first_test_item.get("category", "") if isinstance(first_test_item, dict) else ""))
-            result = execute_countdown_workflow(
-                category_id, ac, cc_val, force, _token_usage_category, test_item
-            )
+            requested_source = norm(event.get("website_source") or event.get("websiteSource") or "")
+            if requested_source:
+                result = execute_countdown_workflow(
+                    category_id, ac, cc_val, force, category=_token_usage_category,
+                    website_source=requested_source, test_active_item=test_item,
+                )
+            else:
+                result = execute_countdown_workflow(
+                    category_id, ac, cc_val, force, _token_usage_category, test_item
+                )
             return {
                 "statusCode": 200,
                 "body": json.dumps(result, ensure_ascii=False, default=str),
@@ -3173,9 +3187,14 @@ def lambda_handler(event, context):
                     "body": json.dumps({"error": "倒计时模式需要 category_id"}, ensure_ascii=False),
                 }
             _token_usage_category = norm(event.get("category", ""))
-            result = execute_countdown_workflow(
-                category_id, ac, cc_val, force, _token_usage_category
-            )
+            requested_source = norm(event.get("website_source") or event.get("websiteSource") or "")
+            if requested_source:
+                result = execute_countdown_workflow(
+                    category_id, ac, cc_val, force, category=_token_usage_category,
+                    website_source=requested_source,
+                )
+            else:
+                result = execute_countdown_workflow(category_id, ac, cc_val, force, _token_usage_category)
             return {
                 "statusCode": 200,
                 "body": json.dumps(result, ensure_ascii=False, default=str),
