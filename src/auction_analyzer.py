@@ -142,6 +142,7 @@ logger.info(
 BUY_MARGIN = _env("BUY_MARGIN_THRESHOLD", Decimal("0.20"), Decimal)
 REVIEW_MARGIN = _env("REVIEW_MARGIN_THRESHOLD", Decimal("0.10"), Decimal)
 MIN_REVIEW_PROFIT = _env("MIN_REVIEW_PROFIT", Decimal("5000"), Decimal)
+MIN_ACTIVE_ITEM_PRICE = _env("MIN_ACTIVE_ITEM_PRICE", Decimal("5000"), Decimal)
 MIN_COMPARABLE = _env("MIN_COMPARABLE_COUNT", 3, int)
 HIGH_CONF = _env("HIGH_CONFIDENCE_COUNT", 10, int)
 MED_CONF = _env("MEDIUM_CONFIDENCE_COUNT", 5, int)
@@ -1726,6 +1727,8 @@ def calc_final_recommendation(item: Dict, pricing: Dict) -> str:
     program_price_reasonable = price_assessment.get("programMarketPriceReasonable")
     price_judgement = norm(price_assessment.get("priceJudgement", "")).upper()
 
+    if pricing_status == Status.INSUFFICIENT_DATA:
+        return Recommendation.AVOID
     if pricing_status != Status.COMPLETED:
         return Recommendation.REVIEW
     if contamination:
@@ -2187,12 +2190,13 @@ def price_active_item(item_id: str, idx: Dict[str,List[Dict]],
 def should_reanalyze_description(item: Dict, pricing: Dict) -> bool:
     """所有初判 BUY_CANDIDATE/REVIEW 都必须经过详情复核。"""
     pricing_status = pricing.get("pricingStatus")
-    if pricing_status == Status.INSUFFICIENT_DATA:
-        return sd(pricing.get("netProfitAtCurrentBid", 0)) > 0
     if pricing_status != Status.COMPLETED:
         return False
+    net_profit = sd(pricing.get("netProfitAtCurrentBid", 0))
+    if net_profit < MIN_REVIEW_PROFIT:
+        return False
     recommendation = calc_decision(
-        sd(pricing.get("netProfitAtCurrentBid", 0)),
+        net_profit,
         sd(pricing.get("profitMarginAtCurrentBid", 0)),
     )
     return recommendation in (Recommendation.BUY_CANDIDATE, Recommendation.REVIEW)
@@ -2342,6 +2346,7 @@ def scrape_active(kw: str, cnt: int, max_p: int = 0, force: bool = False,
             kw,
             "active",
             False,
+            min_price=int(MIN_ACTIVE_ITEM_PRICE),
             scrape_details=False,
             brand=(source_model or {}).get("brand", ""),
             model=(source_model or {}).get("model", ""),
@@ -2361,11 +2366,22 @@ def scrape_active(kw: str, cnt: int, max_p: int = 0, force: bool = False,
                 len(items),
                 before_count - len(items),
             )
+        before_count = len(items)
+        items = [
+            item for item in items
+            if si(item.get("price", 0)) >= MIN_ACTIVE_ITEM_PRICE
+        ]
+        logger.info(
+            "Active minimum price filter applied: min_price=%s before=%s after=%s",
+            MIN_ACTIVE_ITEM_PRICE,
+            before_count,
+            len(items),
+        )
         if max_p > 0:
             before_count = len(items)
             items = [
                 item for item in items
-                if 0 < si(item.get("price", 0)) <= max_p
+                if si(item.get("price", 0)) <= max_p
             ]
             logger.info(
                 "Active price upper filter applied: max_price=%s before=%s after=%s",

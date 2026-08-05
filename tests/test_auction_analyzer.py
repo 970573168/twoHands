@@ -127,8 +127,8 @@ class LeanAiWorkflowTest(unittest.TestCase):
         self, scrape_auctions, _get_record, upsert_scraped_item, _blacklist
     ):
         scrape_auctions.return_value = [
-            {"itemId": "blocked", "sellerId": "blocked-seller", "price": 10},
-            {"itemId": "allowed", "sellerId": "good-seller", "price": 20},
+            {"itemId": "blocked", "sellerId": "blocked-seller", "price": 6000},
+            {"itemId": "allowed", "sellerId": "good-seller", "price": 7000},
         ]
 
         item_ids = scrape_active("camera", 1)
@@ -401,9 +401,14 @@ class LeanAiWorkflowTest(unittest.TestCase):
             "netProfitAtCurrentBid": -1,
             "profitMarginAtCurrentBid": Decimal("0.50"),
         }))
-        self.assertTrue(should_reanalyze_description({}, {
+        self.assertFalse(should_reanalyze_description({}, {
             **base, "pricingStatus": Status.INSUFFICIENT_DATA,
             "profitMarginAtCurrentBid": Decimal("0.30"),
+        }))
+        self.assertFalse(should_reanalyze_description({}, {
+            "pricingStatus": Status.COMPLETED,
+            "netProfitAtCurrentBid": 4999,
+            "profitMarginAtCurrentBid": Decimal("0.50"),
         }))
 
     @patch("auction_analyzer.deactivate_buy_candidate")
@@ -756,18 +761,18 @@ class LeanAiWorkflowTest(unittest.TestCase):
     ):
         scrape_auctions.return_value = [
             {"itemId": "invalid", "price": 0, "buynowPrice": 10},
-            {"itemId": "cheap", "price": 80, "buynowPrice": 200},
-            {"itemId": "limit", "price": 100},
-            {"itemId": "expensive", "price": 101},
+            {"itemId": "cheap", "price": 4999, "buynowPrice": 200},
+            {"itemId": "limit", "price": 10000},
+            {"itemId": "expensive", "price": 10001},
         ]
 
         source_model = {"category": "游戏机", "brand": "Sony", "model": "PlayStation 5"}
-        item_ids = scrape_active("camera", 10, max_p=100, source_model=source_model)
+        item_ids = scrape_active("camera", 10, max_p=10000, source_model=source_model)
 
-        self.assertEqual(item_ids, ["cheap", "limit"])
-        self.assertNotIn("min_price", scrape_auctions.call_args.kwargs)
+        self.assertEqual(item_ids, ["limit"])
+        self.assertEqual(scrape_auctions.call_args.kwargs["min_price"], 5000)
         saved_ids = [call.args[1] for call in upsert_scraped_item.call_args_list]
-        self.assertEqual(saved_ids, ["cheap", "limit"])
+        self.assertEqual(saved_ids, ["limit"])
         for call in upsert_scraped_item.call_args_list:
             self.assertEqual(call.args[2]["category"], "游戏机")
             self.assertEqual(call.args[2]["sourceModel"], source_model)
@@ -1120,6 +1125,15 @@ class LeanAiWorkflowTest(unittest.TestCase):
         self.assertEqual(calc_decision(Decimal("4999"), Decimal("0.50")), Recommendation.AVOID)
         self.assertEqual(calc_decision(Decimal("5000"), Decimal("0.20")), Recommendation.BUY_CANDIDATE)
         self.assertEqual(calc_decision(Decimal("5000"), Decimal("0.199")), Recommendation.REVIEW)
+
+    def test_final_recommendation_discards_insufficient_data(self):
+        pricing = {
+            "pricingStatus": Status.INSUFFICIENT_DATA,
+            "netProfitAtCurrentBid": 10000,
+            "profitMarginAtCurrentBid": Decimal("0.30"),
+        }
+
+        self.assertEqual(calc_final_recommendation({}, pricing), Recommendation.AVOID)
 
     def test_final_recommendation_blocks_contaminated_ai_audit(self):
         pricing = {
