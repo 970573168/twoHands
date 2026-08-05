@@ -18,7 +18,7 @@ from search_engine_crawler import (
     get_queued_items, lambda_handler, mark_queue_done, mark_queue_failed,
     count_remaining_unvisited,
     extract_category_id, extract_links, extract_links_from_page,
-    get_next_unvisited_url, is_allowed_url, normalize_url,
+    get_next_unvisited_url, is_allowed_url, normalize_requested_source, normalize_url,
     save_discovered_link, website_source_from_url,
 )
 
@@ -59,6 +59,22 @@ class SearchEngineCrawlerTest(unittest.TestCase):
         self.assertEqual(first.kwargs["IndexName"], "queue_status-queue_priority-index")
         self.assertTrue(first.kwargs["ScanIndexForward"])
         self.assertEqual(second.kwargs["ExclusiveStartKey"], {"crawl_id": "one"})
+
+
+    def test_normalize_requested_source_accepts_yahoo_and_mercari(self):
+        self.assertEqual(normalize_requested_source("Yahoo"), "YAHOO_AUCTION")
+        self.assertEqual(normalize_requested_source("Mercari"), "MERCARI")
+        self.assertIsNone(normalize_requested_source("aws.events"))
+
+    def test_get_queued_items_can_filter_by_website_source(self):
+        table = Mock()
+        table.query.return_value = {"Items": [
+            {"crawl_id": "y", "website_source": "YAHOO_AUCTION"},
+            {"crawl_id": "m", "website_source": "MERCARI"},
+        ]}
+        self.assertEqual(get_queued_items(table, 2, website_source="MERCARI"), [
+            {"crawl_id": "m", "website_source": "MERCARI"},
+        ])
 
     def test_claim_queue_item_moves_queued_to_processing(self):
         table = Mock()
@@ -127,10 +143,29 @@ class SearchEngineCrawlerTest(unittest.TestCase):
         with patch.dict(os.environ, {"LINK_CRAWLER_TABLE_NAME": "links"}):
             result = lambda_handler({}, None)
         old_start.assert_not_called()
-        seed.assert_called_once_with(resource.return_value.Table.return_value)
+        has_items.assert_called_once_with(resource.return_value.Table.return_value, None)
+        seed.assert_called_once_with(resource.return_value.Table.return_value, None)
         crawl.assert_called_once()
         self.assertNotIn("start_url", result)
         self.assertEqual(result["seeded"], 2)
+        self.assertEqual(result["source"], "ALL")
+
+
+    @patch("search_engine_crawler.crawl_queue", return_value={"pages_crawled": 0})
+    @patch("search_engine_crawler.seed_from_homepage", return_value=1)
+    @patch("search_engine_crawler.has_queued_items", return_value=False)
+    @patch("search_engine_crawler.recover_stale_processing_items", return_value=0)
+    @patch("search_engine_crawler.boto3.resource")
+    def test_lambda_source_limits_seed_and_crawl_to_mercari(
+        self, resource, recover, has_items, seed, crawl
+    ):
+        with patch.dict(os.environ, {"LINK_CRAWLER_TABLE_NAME": "links"}):
+            result = lambda_handler({"source": "Mercari"}, None)
+        table = resource.return_value.Table.return_value
+        has_items.assert_called_once_with(table, "MERCARI")
+        seed.assert_called_once_with(table, "MERCARI")
+        self.assertEqual(crawl.call_args.kwargs["website_source"], "MERCARI")
+        self.assertEqual(result["source"], "MERCARI")
 
     def test_next_unvisited_url_continues_after_empty_filtered_page(self):
         table = Mock()
