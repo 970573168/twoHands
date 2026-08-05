@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import unittest
@@ -28,6 +29,7 @@ from auction_analyzer import (
     execute_countdown_workflow,
     execute_workflow,
     get_seller_blacklist,
+    inject_test_active_item,
     lambda_handler,
     normalize_pricing_key,
     pricing_key_with_condition,
@@ -204,6 +206,39 @@ class LeanAiWorkflowTest(unittest.TestCase):
         self.assertIs(
             batch_parse_mock.call_args_list[0].args[2],
             build_countdown_active_parse_prompt,
+        )
+
+    @patch("auction_analyzer.upsert_scraped_item")
+    def test_inject_test_active_item_writes_detail_and_defaults(self, upsert):
+        ids = inject_test_active_item({
+            "itemID": "TEST_ACTIVE_IPHONE13_001",
+            "title": "Apple iPhone 13 128GB SIMフリー",
+            "price": 10000,
+            "detailDescription": "バッテリー良好。動作品。",
+        }, category_id="2084317598", category="スマホ本体")
+
+        self.assertEqual(ids, ["TEST_ACTIVE_IPHONE13_001"])
+        table, item_id, fields = upsert.call_args.args[:3]
+        self.assertEqual(item_id, "TEST_ACTIVE_IPHONE13_001")
+        self.assertEqual(fields["testMode"], "test_countdown_active")
+        self.assertTrue(fields["isTestItem"])
+        self.assertTrue(fields["isTestDetail"])
+        self.assertEqual(fields["detailScrapeStatus"], "COMPLETED")
+        self.assertEqual(fields["sourceModel"]["category_id"], "2084317598")
+        self.assertTrue(upsert.call_args.kwargs["force"])
+
+    @patch("auction_analyzer.execute_countdown_workflow", return_value={"status": "NO_CLOSED"})
+    def test_lambda_handler_routes_test_countdown_without_keyword_or_category(self, workflow):
+        response = lambda_handler({
+            "mode": "test_countdown_active",
+            "keyword": "",
+            "test_active_item": {"itemID": "TEST_ACTIVE_IPHONE13_001"},
+        }, None)
+
+        self.assertEqual(response["statusCode"], 200)
+        self.assertEqual(json.loads(response["body"])["status"], "NO_CLOSED")
+        workflow.assert_called_once_with(
+            "", 100, 100, False, "", {"itemID": "TEST_ACTIVE_IPHONE13_001"}
         )
 
     @patch("auction_analyzer.product_catalog_db.update_item")

@@ -8,6 +8,8 @@ set -euo pipefail
 BUILD_DIR="build"
 LAMBDA_DIR="src"
 PACKAGE_FILE="lambda.zip"
+LAMBDA_CODE_S3_BUCKET="${LAMBDA_CODE_S3_BUCKET:-}"
+LAMBDA_CODE_S3_KEY="${LAMBDA_CODE_S3_KEY:-productcatalog/lambda.zip}"
 
 echo "=========================================="
 echo "🔨 Lambda build started"
@@ -132,6 +134,13 @@ echo ""
 echo "🔐 Calculating local CodeSha256..."
 LOCAL_CODE_SHA=$(openssl dgst -sha256 -binary "$PACKAGE_FILE" | openssl base64)
 echo "Local lambda.zip CodeSha256: $LOCAL_CODE_SHA"
+
+if [ -n "$LAMBDA_CODE_S3_BUCKET" ]; then
+  echo ""
+  echo "☁️ Uploading package to S3 without keeping previous backup..."
+  aws s3 rm "s3://$LAMBDA_CODE_S3_BUCKET/$LAMBDA_CODE_S3_KEY" || true
+  aws s3 cp "$PACKAGE_FILE" "s3://$LAMBDA_CODE_S3_BUCKET/$LAMBDA_CODE_S3_KEY"
+fi
 
 echo ""
 echo "✅ Build complete: $PACKAGE_FILE"

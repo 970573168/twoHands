@@ -136,6 +136,21 @@ class CatalogScannerTest(unittest.TestCase):
         self.assertEqual(kwargs["ExpressionAttributeValues"][":retry"], 1060)
         self.assertEqual(kwargs["ExpressionAttributeValues"][":failed"], "DISPATCH_FAILED")
 
+    def test_schedule_closes_outside_jst_17_to_24(self):
+        # 2026-08-05 07:59:59 UTC = 2026-08-05 16:59:59 JST
+        result = catalog_scanner.run_schedule({}, now=1785916799)
+
+        self.assertEqual(result["状态"], "扫描关闭")
+        self.table.scan.assert_not_called()
+
+    def test_schedule_runs_during_jst_17_to_24(self):
+        self.table.scan.return_value = {"Items": []}
+        # 2026-08-05 08:00:00 UTC = 2026-08-05 17:00:00 JST
+        result = catalog_scanner.run_schedule({}, now=1785916800)
+
+        self.assertEqual(result["状态"], "扫描完成")
+        self.table.scan.assert_called()
+
     def test_lambda_rejects_unknown_mode_in_chinese(self):
         response = catalog_scanner.lambda_handler({"mode": "unknown"}, None)
         self.assertEqual(response["statusCode"], 400)

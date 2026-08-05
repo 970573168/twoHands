@@ -7,7 +7,7 @@
 import json
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List
 
 import boto3
@@ -34,6 +34,13 @@ def log(level: str, message: str, **fields):
                       "timestamp": datetime.now(timezone.utc).isoformat(), **fields},
                      ensure_ascii=False, default=str))
 
+
+
+def is_countdown_active_window(now: int = None) -> bool:
+    """倒计时定时扫描只在日本时间 17:00（含）到 24:00（不含）运行。"""
+    timestamp = int(now if now is not None else time.time())
+    jst = datetime.fromtimestamp(timestamp, timezone.utc).astimezone(timezone(timedelta(hours=9)))
+    return 17 <= jst.hour < 24
 
 def _integer(value, name: str, minimum: int, maximum: int) -> int:
     try:
@@ -230,6 +237,8 @@ def mark_dispatch_failed(crawl_id: str, now: int):
 
 def run_schedule(event: Dict, now: int = None) -> Dict:
     now = int(now if now is not None else time.time())
+    if not is_countdown_active_window(now):
+        return {"状态": "扫描关闭", "原因": "倒计时定时扫描仅在日本时间 17:00-24:00 运行", "到期数量": 0, "结果": []}
     limit = _integer(event.get("max_models", MAX_MODELS_PER_RUN), "max_models", 1, 100)
     results = []
     for item in find_due_catalogs(now, limit):
