@@ -13,6 +13,48 @@ import boto3
 
 logger = logging.getLogger(__name__)
 
+_TOKEN_TOTALS = {"calls": 0, "input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+_RECENT_TOKEN_CALLS = []
+MAX_RECENT_TOKEN_CALLS = int(os.environ.get("TOKEN_USAGE_RECENT_LIMIT", "100"))
+TOKEN_DETAIL_EVERY = int(os.environ.get("TOKEN_USAGE_DETAIL_EVERY", "100"))
+
+
+def _compact_call(item):
+    return {
+        "call_id": item["call_id"],
+        "occurred_at": item["occurred_at"],
+        "provider": item["provider"],
+        "model": item["model"],
+        "task_type": item["task_type"],
+        "category_name": item["category_name"],
+        "input_tokens": item["input_tokens"],
+        "output_tokens": item["output_tokens"],
+        "total_tokens": item["total_tokens"],
+    }
+
+
+def _build_summary(item):
+    _TOKEN_TOTALS["calls"] += 1
+    _TOKEN_TOTALS["input_tokens"] += item["input_tokens"]
+    _TOKEN_TOTALS["output_tokens"] += item["output_tokens"]
+    _TOKEN_TOTALS["total_tokens"] += item["total_tokens"]
+    _RECENT_TOKEN_CALLS.append(_compact_call(item))
+    del _RECENT_TOKEN_CALLS[:-MAX_RECENT_TOKEN_CALLS]
+    return {
+        "call_id": "SUMMARY",
+        "record_type": "SUMMARY",
+        "updated_at": item["occurred_at"],
+        "function_name": item["function_name"],
+        **_TOKEN_TOTALS,
+        "recent_limit": MAX_RECENT_TOKEN_CALLS,
+        "recent_calls": list(_RECENT_TOKEN_CALLS),
+    }
+
+
+def _to_dynamo_item(item):
+    return {key: Decimal(str(value)) if isinstance(value, float) else value
+            for key, value in item.items()}
+
 
 def record_token_usage(provider, model, usage, *, prompt="", task_type="",
                        category_name="", table=None):
@@ -48,9 +90,11 @@ def record_token_usage(provider, model, usage, *, prompt="", task_type="",
 
     try:
         target = table or boto3.resource("dynamodb").Table(table_name)
-        # Decimal 可避免未来 usage 中出现浮点值时违反 DynamoDB 类型约束。
-        target.put_item(Item={key: Decimal(str(value)) if isinstance(value, float) else value
-                              for key, value in item.items()})
+        # 主记录只保留加总和最近 100 条；明细每 100 次额外落一条检查点，避免无用数据无限增长。
+        target.put_item(Item=_to_dynamo_item(_build_summary(item)))
+        if _TOKEN_TOTALS["calls"] % max(1, TOKEN_DETAIL_EVERY) == 0:
+            checkpoint = {**item, "record_type": "CHECKPOINT"}
+            target.put_item(Item=_to_dynamo_item(checkpoint))
         return True
     except Exception as error:
         logger.exception("Token 用量记录写入失败: %s", error)

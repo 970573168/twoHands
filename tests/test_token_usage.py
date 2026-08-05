@@ -12,7 +12,7 @@ from token_usage import record_token_usage
 class TokenUsageTest(unittest.TestCase):
     @patch("token_usage.uuid.uuid4")
     @patch("token_usage.time.time", return_value=1234)
-    def test_writes_one_detailed_record_per_call(self, _time, uuid4):
+    def test_writes_summary_with_latest_token_call(self, _time, uuid4):
         uuid4.return_value.hex = "abc"
         table = Mock()
 
@@ -28,15 +28,22 @@ class TokenUsageTest(unittest.TestCase):
 
         self.assertTrue(saved)
         item = table.put_item.call_args.kwargs["Item"]
-        self.assertEqual(item["provider"], "gemini")
-        self.assertEqual(item["model"], "gemini-test")
-        self.assertEqual(item["input_tokens"], 12)
-        self.assertEqual(item["output_tokens"], 8)
-        self.assertEqual(item["total_tokens"], 20)
-        self.assertEqual(item["prompt_chars"], 4)
-        self.assertEqual(item["task_type"], "DISCOVER_MODELS")
-        self.assertEqual(item["category_name"], "デジタルカメラ")
-        self.assertTrue(item["call_id"].endswith("#abc"))
+        self.assertEqual(item["call_id"], "SUMMARY")
+        self.assertEqual(item["record_type"], "SUMMARY")
+        self.assertGreaterEqual(item["calls"], 1)
+        self.assertGreaterEqual(item["input_tokens"], 12)
+        self.assertGreaterEqual(item["output_tokens"], 8)
+        self.assertGreaterEqual(item["total_tokens"], 20)
+        self.assertEqual(item["recent_limit"], 100)
+        latest = item["recent_calls"][-1]
+        self.assertEqual(latest["provider"], "gemini")
+        self.assertEqual(latest["model"], "gemini-test")
+        self.assertEqual(latest["input_tokens"], 12)
+        self.assertEqual(latest["output_tokens"], 8)
+        self.assertEqual(latest["total_tokens"], 20)
+        self.assertEqual(latest["task_type"], "DISCOVER_MODELS")
+        self.assertEqual(latest["category_name"], "デジタルカメラ")
+        self.assertTrue(latest["call_id"].endswith("#abc"))
 
     def test_storage_failure_does_not_break_ai_workflow(self):
         table = Mock()
