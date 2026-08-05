@@ -1,6 +1,7 @@
 import os
 import sys
 import unittest
+from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlsplit
 
 
@@ -15,7 +16,9 @@ from yahoo_auction_scraper import (
     LocalListingType,
     build_contextual_exclude_keywords,
     build_url,
+    lambda_handler,
     parse_html,
+    scrape_auctions,
     MERCARI_SOURCE,
     classify_listing_type_by_title,
     detect_target_context,
@@ -291,6 +294,72 @@ class LocalTitleFilterTest(unittest.TestCase):
             simplify_search_keyword("Keysight Technologies FieldFox Handheld RF Analyzer N9935B"),
             "Keysight N9935B",
         )
+
+    @patch("yahoo_auction_scraper.log_public_egress_ip", return_value=None)
+    @patch("yahoo_auction_scraper.save_items", return_value=0)
+    @patch("yahoo_auction_scraper.get_target_table")
+    @patch("yahoo_auction_scraper.scrape_auctions", return_value=[])
+    def test_mercari_search_event_passes_category_id(self, scraper, _table, _save, _ip):
+        event = {"action": "search", "website_source": "MERCARI", "category_id": "3702", "keyword": "", "search_type": "active"}
+        lambda_handler(event, None)
+        self.assertEqual(scraper.call_args.kwargs["category_id"], "3702")
+
+    def _mercari_page(self, ids, next_href=""):
+        cells = "".join(
+            f'<li data-testid="item-cell" data-item-id="{item_id}"><a href="/item/{item_id}"><div class="merItemThumbnail" aria-label="Item {item_id} 1,000円の画像"><span class="merPrice">¥1,000</span><img src="/img/{item_id}.jpg" /></div></a></li>'
+            for item_id in ids
+        )
+        next_link = f'<a href="{next_href}">次へ</a>' if next_href else ""
+        return f"<html><body><ul>{cells}</ul>{next_link}</body></html>"
+
+    @patch("yahoo_auction_scraper.MAX_PAGES", 5)
+    @patch("yahoo_auction_scraper.requests.get")
+    def test_mercari_pagination_uses_real_next_url(self, get):
+        responses = [
+            Mock(text=self._mercari_page(["A", "B"], "/search?category_id=3702&page_token=v1%3A1")),
+            Mock(text=self._mercari_page(["C", "D"])),
+        ]
+        for r in responses:
+            r.raise_for_status.return_value = None
+        get.side_effect = responses
+        items = scrape_auctions("", "active", category_id="3702", website_source=MERCARI_SOURCE, scrape_details=True, enable_local_title_filter=False)
+        self.assertEqual([item["itemId"] for item in items], ["A", "B", "C", "D"])
+        requested = [call.args[0] for call in get.call_args_list]
+        self.assertEqual(len(requested), 2)
+        self.assertNotEqual(requested[0], requested[1])
+        self.assertIn("page_token=v1%3A1", requested[1])
+
+    @patch("yahoo_auction_scraper.MAX_PAGES", 5)
+    @patch("yahoo_auction_scraper.requests.get")
+    def test_mercari_stops_on_repeated_next_url_and_duplicate_items(self, get):
+        first = Mock(text=self._mercari_page(["A", "B"], "/search?category_id=3702&page_token=v1%3A1"))
+        second = Mock(text=self._mercari_page(["A", "B"], "/search?category_id=3702&page_token=v1%3A1"))
+        first.raise_for_status.return_value = None
+        second.raise_for_status.return_value = None
+        get.side_effect = [first, second]
+        items = scrape_auctions("", "active", category_id="3702", website_source=MERCARI_SOURCE, scrape_details=False, enable_local_title_filter=False)
+        self.assertEqual([item["itemId"] for item in items], ["A", "B"])
+        self.assertEqual(get.call_count, 2)
+
+    @patch("yahoo_auction_scraper.MAX_PAGES", 3)
+    @patch("yahoo_auction_scraper.requests.get")
+    def test_mercari_deduplicates_item_ids_across_pages(self, get):
+        first = Mock(text=self._mercari_page(["A", "B"], "/search?category_id=3702&page_token=v1%3A1"))
+        second = Mock(text=self._mercari_page(["B", "C"]))
+        first.raise_for_status.return_value = None
+        second.raise_for_status.return_value = None
+        get.side_effect = [first, second]
+        items = scrape_auctions("", "active", category_id="3702", website_source=MERCARI_SOURCE, scrape_details=False, enable_local_title_filter=False)
+        self.assertEqual([item["itemId"] for item in items], ["A", "B", "C"])
+
+    @patch("yahoo_auction_scraper.scrape_item_detail")
+    @patch("yahoo_auction_scraper.requests.get")
+    def test_mercari_does_not_call_yahoo_detail_scraper(self, get, detail):
+        response = Mock(text=self._mercari_page(["A"]))
+        response.raise_for_status.return_value = None
+        get.return_value = response
+        scrape_auctions("", "active", category_id="3702", website_source=MERCARI_SOURCE, scrape_details=True, enable_local_title_filter=False)
+        detail.assert_not_called()
 
 
 if __name__ == "__main__":

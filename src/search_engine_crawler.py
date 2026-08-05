@@ -1,7 +1,7 @@
 """
 Yahoo! 拍卖 /list3/* + Mercari 目录链接持久化队列采集 Lambda。
 
-Mercari 使用 Selenium 动态渲染，Yahoo 使用 requests 静态爬取。
+Mercari 与 Yahoo 都使用 requests 静态爬取；Mercari 目录仅解析公开 HTML。
 """
 
 import hashlib
@@ -17,14 +17,6 @@ import boto3
 import requests
 from botocore.exceptions import ClientError
 from bs4 import BeautifulSoup
-
-# Selenium 相关导入
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.options import Options
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -97,11 +89,6 @@ GSI_QUERY_PAGE_SIZE = int(os.getenv("LINK_CRAWLER_GSI_PAGE_SIZE", "25"))
 MAX_ATTEMPTS = int(os.getenv("LINK_CRAWLER_MAX_ATTEMPTS", "3"))
 QUEUE_INDEX_NAME = "queue_status-queue_priority-index"
 
-# Selenium 配置
-SELENIUM_HEADLESS = os.getenv("SELENIUM_HEADLESS", "true").lower() == "true"
-SELENIUM_TIMEOUT = int(os.getenv("SELENIUM_TIMEOUT", "15"))
-MERCARI_MAX_CATEGORY_DEPTH = int(os.getenv("MERCARI_MAX_CATEGORY_DEPTH", "3"))
-
 # ============================================================
 # URL 处理函数
 # ============================================================
@@ -138,13 +125,13 @@ def is_allowed_url(url: str) -> bool:
     if parsed.scheme not in {"http", "https"} or parsed.hostname not in ALLOWED_HOSTS:
         return False
     if parsed.hostname == MERCARI_HOST:
-        return parsed.path == "/categories"
+        return canonicalize_mercari_category_url(url) is not None
     path = parsed.path or "/"
     return not any(path == rule.rstrip("/") or path.startswith(rule) for rule in DISALLOW)
 
 
 def canonicalize_category_url(url: str) -> str | None:
-    """只保留支持网站的目录页，并归一化为标准 URL。"""
+    """只保留支持网站的目录/叶子分类页，并归一化为标准 URL。"""
     try:
         parsed = urlsplit(url)
     except (TypeError, ValueError):
@@ -152,25 +139,10 @@ def canonicalize_category_url(url: str) -> str | None:
 
     if parsed.scheme not in {"http", "https"}:
         return None
+    if parsed.hostname == MERCARI_HOST:
+        return canonicalize_mercari_category_url(url)
 
     path = parsed.path or "/"
-    
-    # Mercari 处理
-    if parsed.hostname == MERCARI_HOST:
-        if path == "/categories":
-            # 提取 category_id
-            query_parts = []
-            for part in parsed.query.split("&"):
-                if part.startswith("category_id="):
-                    query_parts.append(part)
-            if query_parts:
-                return urlunsplit(("https", MERCARI_HOST, path, query_parts[0], ""))
-            else:
-                # 首页
-                return urlunsplit(("https", MERCARI_HOST, path, "", ""))
-        return None
-
-    # Yahoo 处理
     if parsed.hostname != ALLOWED_HOST:
         return None
     if not path.startswith(ALLOWED_LIST3_PREFIX):
@@ -181,7 +153,6 @@ def canonicalize_category_url(url: str) -> str | None:
     if not match:
         return None
     return urlunsplit(("https", ALLOWED_HOST, path, "", ""))
-
 
 def is_list3_page(url: str) -> bool:
     """判断是否为真正的 list3 目录页（非 leaf、非 catlist、无 query）。"""
@@ -195,10 +166,7 @@ def extract_category_id(url: str) -> str | None:
         return None
     parsed = urlsplit(canonical)
     if parsed.hostname == MERCARI_HOST:
-        for part in parsed.query.split("&"):
-            if part.startswith("category_id="):
-                return part.split("=", 1)[1]
-        return None
+        return (parse_qs(parsed.query).get("category_id") or [None])[0]
     match = CATEGORY_PAGE_PATTERN.match(parsed.path)
     return match.group(1) if match else None
 
@@ -225,203 +193,73 @@ def normalize_url(href: str, source_url: str) -> str | None:
 
 
 def should_crawl(url: str) -> bool:
-    """判断一个 URL 是否应该被递归爬取。"""
+    """判断一个 URL 是否应该被递归爬取；Mercari search leaf 只保存不递归。"""
+    if website_source_from_url(url) == MERCARI_SOURCE:
+        return is_mercari_directory_url(url)
     return canonicalize_category_url(url) is not None
 
 
 # ============================================================
-# Selenium 浏览器管理
+# Mercari 静态目录链接提取（requests + BeautifulSoup）
 # ============================================================
 
-def create_selenium_driver():
-    """创建 Selenium WebDriver 实例。"""
-    chrome_options = Options()
-    
-    if SELENIUM_HEADLESS:
-        chrome_options.add_argument('--headless')
-    
-    chrome_options.add_argument('--no-sandbox')
-    chrome_options.add_argument('--disable-dev-shm-usage')
-    chrome_options.add_argument('--disable-gpu')
-    chrome_options.add_argument('--window-size=1920,1080')
-    chrome_options.add_argument(f'--user-agent={USER_AGENT}')
-    chrome_options.add_argument('--disable-blink-features=AutomationControlled')
-    chrome_options.add_experimental_option('excludeSwitches', ['enable-automation'])
-    chrome_options.add_experimental_option('useAutomationExtension', False)
-    
-    driver = webdriver.Chrome(options=chrome_options)
-    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-    
-    return driver
-
-
-# ============================================================
-# Mercari 链接提取（使用 Selenium）
-# ============================================================
-
-def extract_mercari_links_with_selenium(url: str, depth: int, 
-                                        max_depth: int = MERCARI_MAX_CATEGORY_DEPTH) -> list[dict]:
-    """
-    使用 Selenium 动态渲染 Mercari 页面，提取所有目录链接。
-    
-    参数:
-        url: Mercari 目录页 URL
-        depth: 当前深度
-        max_depth: 最大爬取深度
-    
-    返回:
-        目录链接列表
-    """
-    if depth > max_depth:
-        return []
-    
-    driver = None
+def canonicalize_mercari_category_url(url: str) -> str | None:
     try:
-        driver = create_selenium_driver()
-        logger.info(f"正在加载 Mercari 页面: {url}")
-        driver.get(url)
-        
-        # 等待页面加载完成
-        WebDriverWait(driver, SELENIUM_TIMEOUT).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, 'a[href*="category_id"], div[data-testid="category-list"]'))
-        )
-        
-        # 等待可能的动态内容加载
-        time.sleep(2)
-        
-        links = []
-        seen_urls = set()
-        
-        # 查找所有目录链接
-        # Mercari 的目录链接可能在多个位置
-        selectors = [
-            'a[href*="category_id"]',
-            'div[data-testid="category-list"] a',
-            'div.merListItem a',
-            'a[data-location*="category"]'
-        ]
-        
-        for selector in selectors:
-            elements = driver.find_elements(By.CSS_SELECTOR, selector)
-            for elem in elements:
-                try:
-                    href = elem.get_attribute('href')
-                    if not href:
-                        continue
-                    
-                    # 提取 category_id
-                    category_id = extract_category_id(href)
-                    if not category_id:
-                        continue
-                    
-                    # 获取文本
-                    text = elem.text.strip()
-                    if not text:
-                        # 尝试从 aria-label 获取
-                        aria_label = elem.get_attribute('aria-label')
-                        if aria_label:
-                            text = aria_label.strip()
-                    
-                    if not text:
-                        continue
-                    
-                    # 过滤无效文本
-                    if text in BAD_ANCHOR_TEXTS:
-                        continue
-                    
-                    # 去重
-                    canonical_url = canonicalize_category_url(href)
-                    if not canonical_url or canonical_url in seen_urls:
-                        continue
-                    
-                    seen_urls.add(canonical_url)
-                    
-                    links.append({
-                        'url': canonical_url,
-                        'category_id': category_id,
-                        'category_name': text,
-                        'anchor_text': text,
-                        'source_url': url,
-                        'website_source': MERCARI_SOURCE,
-                        'source': MERCARI_SOURCE,
-                        'depth': depth + 1,
-                        'link_type': 'mercari_directory'
-                    })
-                except Exception as e:
-                    logger.warning(f"提取单个 Mercari 链接失败: {e}")
-                    continue
-        
-        # 如果找到了链接，也尝试从 JavaScript 数据中提取
-        if not links:
-            # 尝试从 __NEXT_DATA__ 提取
-            try:
-                script = driver.find_element(By.CSS_SELECTOR, 'script#__NEXT_DATA__')
-                if script:
-                    data = json.loads(script.get_attribute('innerHTML'))
-                    js_links = extract_categories_from_next_data(data, url, depth + 1)
-                    for link in js_links:
-                        if link['url'] not in seen_urls:
-                            seen_urls.add(link['url'])
-                            links.append(link)
-            except (NoSuchElementException, json.JSONDecodeError) as e:
-                logger.debug(f"从 __NEXT_DATA__ 提取失败: {e}")
-        
-        logger.info(f"Mercari 页面 {url} 提取到 {len(links)} 个目录链接")
+        parsed = urlsplit(url)
+    except (TypeError, ValueError):
+        return None
+    if parsed.scheme not in {"http", "https"} or parsed.hostname != MERCARI_HOST:
+        return None
+    path = parsed.path or "/"
+    if path not in {"/categories", "/search"}:
+        return None
+    category_id = (parse_qs(parsed.query).get("category_id") or [""])[0].strip()
+    if path == "/categories" and not category_id:
+        return urlunsplit(("https", MERCARI_HOST, "/categories", "", ""))
+    if not category_id:
+        return None
+    return urlunsplit(("https", MERCARI_HOST, path, f"category_id={category_id}", ""))
+
+def classify_mercari_category_url(url: str) -> dict | None:
+    canonical = canonicalize_mercari_category_url(url)
+    if not canonical:
+        return None
+    parsed = urlsplit(canonical)
+    if parsed.path == "/categories":
+        return {"url": canonical, "link_type": "mercari_directory", "is_leaf": False}
+    if parsed.path == "/search":
+        return {"url": canonical, "link_type": "mercari_search_leaf", "is_leaf": True}
+    return None
+
+def is_mercari_directory_url(url: str) -> bool:
+    info = classify_mercari_category_url(url)
+    return bool(info and info["link_type"] == "mercari_directory")
+
+def is_mercari_leaf_url(url: str) -> bool:
+    info = classify_mercari_category_url(url)
+    return bool(info and info["link_type"] == "mercari_search_leaf")
+
+def extract_mercari_links_from_page(html: str, source_url: str, depth: int) -> list[dict]:
+    links, seen = [], set()
+    if not html:
         return links
-        
-    except TimeoutException as e:
-        logger.error(f"Mercari 页面加载超时: {url}, 错误: {e}")
-        return []
-    except Exception as e:
-        logger.error(f"Mercari 页面提取失败: {url}, 错误: {e}")
-        return []
-    finally:
-        if driver:
-            driver.quit()
-
-
-def extract_categories_from_next_data(data: dict, source_url: str, depth: int) -> list[dict]:
-    """从 __NEXT_DATA__ JSON 中递归提取 Mercari 目录。"""
-    links = []
-    seen = set()
-    
-    def extract(obj, current_depth=0):
-        if current_depth > 10:  # 防止无限递归
-            return
-        
-        if isinstance(obj, dict):
-            # 查找 categories 数据
-            if 'categories' in obj and isinstance(obj['categories'], list):
-                for cat in obj['categories']:
-                    if isinstance(cat, dict):
-                        cat_id = str(cat.get('id') or cat.get('category_id', ''))
-                        cat_name = cat.get('name') or cat.get('category_name', '')
-                        
-                        if cat_id and cat_name:
-                            url = f'https://jp.mercari.com/categories?category_id={cat_id}'
-                            if url not in seen:
-                                seen.add(url)
-                                links.append({
-                                    'url': url,
-                                    'category_id': cat_id,
-                                    'category_name': cat_name,
-                                    'anchor_text': cat_name,
-                                    'source_url': source_url,
-                                    'website_source': MERCARI_SOURCE,
-                                    'source': MERCARI_SOURCE,
-                                    'depth': depth,
-                                    'link_type': 'mercari_directory'
-                                })
-            
-            # 递归搜索所有值
-            for value in obj.values():
-                extract(value, current_depth + 1)
-        
-        elif isinstance(obj, list):
-            for item in obj:
-                extract(item, current_depth + 1)
-    
-    extract(data)
+    soup = BeautifulSoup(html, "html.parser")
+    for anchor in soup.select('a[href*="category_id"]'):
+        href = anchor.get("href")
+        absolute = urljoin(source_url, href or "")
+        info = classify_mercari_category_url(absolute)
+        if not info or info["url"] in seen:
+            continue
+        text = clean_anchor_text(anchor.get_text(" ", strip=True))
+        if text in BAD_ANCHOR_TEXTS:
+            continue
+        seen.add(info["url"])
+        links.append({
+            "url": info["url"], "category_id": extract_category_id(info["url"]) or "",
+            "category_name": text, "anchor_text": text, "source_url": source_url,
+            "website_source": MERCARI_SOURCE, "source": MERCARI_SOURCE,
+            "depth": depth, "link_type": info["link_type"], "is_leaf": info["is_leaf"],
+        })
     return links
 
 
@@ -492,7 +330,8 @@ def extract_links_from_page(html: str, source_url: str, depth: int) -> list[dict
     if 'auctions.yahoo.co.jp' in source_url:
         return extract_yahoo_links_from_page(html, source_url, depth)
     
-    # Mercari 通过 Selenium 提取，这里返回空列表
+    if MERCARI_HOST in source_url:
+        return extract_mercari_links_from_page(html, source_url, depth)
     return []
 
 
@@ -501,7 +340,7 @@ def extract_links_from_page(html: str, source_url: str, depth: int) -> list[dict
 # ============================================================
 
 def extract_links_by_source(url: str, html: str, depth: int, 
-                            use_selenium: bool = True) -> list[dict]:
+                            use_selenium: bool = False) -> list[dict]:
     """
     根据 URL 来源使用不同的提取策略。
     
@@ -509,16 +348,15 @@ def extract_links_by_source(url: str, html: str, depth: int,
         url: 当前页面 URL
         html: 页面 HTML 内容（对 Yahoo 有效）
         depth: 当前深度
-        use_selenium: 是否使用 Selenium（Mercari 需要）
+        use_selenium: 旧参数，已忽略；Mercari 不再使用浏览器驱动
     
     返回:
         目录链接列表
     """
     source = website_source_from_url(url)
     
-    if source == MERCARI_SOURCE and use_selenium:
-        # Mercari 使用 Selenium
-        return extract_mercari_links_with_selenium(url, depth)
+    if source == MERCARI_SOURCE:
+        return extract_mercari_links_from_page(html, url, depth)
     elif source == YAHOO_SOURCE:
         # Yahoo 使用静态 HTML
         return extract_yahoo_links_from_page(html, url, depth)
@@ -585,18 +423,20 @@ def enqueue_discovered_link(table, link: dict, root_url: str) -> dict:
                 attempt_count = if_not_exists(attempt_count, :zero),
                 is_crawled = if_not_exists(is_crawled, :false_value),
                 is_terminal = if_not_exists(is_terminal, :false_value),
+                is_leaf = if_not_exists(is_leaf, :is_leaf),
                 is_exhausted = if_not_exists(is_exhausted, :false_value),
                 category_id = if_not_exists(category_id, :category_id),
                 category_name = if_not_exists(category_name, :category_name),
                 anchor_text = if_not_exists(anchor_text, :anchor_text),
                 source_url = if_not_exists(source_url, :source_url),
                 website_source = if_not_exists(website_source, :website_source),
+                #source = if_not_exists(#source, :website_source),
                 crawl_status = if_not_exists(crawl_status, :discovered)
         """,
-        ExpressionAttributeNames={"#url": "url", "#depth": "depth"},
+        ExpressionAttributeNames={"#url": "url", "#depth": "depth", "#source": "source"},
         ExpressionAttributeValues={
             ":url": url,
-            ":link_type": link.get("link_type") or "mercari_directory" if link.get("website_source") == MERCARI_SOURCE else "list3_directory",
+            ":link_type": link.get("link_type") or ("mercari_directory" if link.get("website_source") == MERCARI_SOURCE else "list3_directory"),
             ":queued": "QUEUED",
             ":priority": make_queue_priority(depth, now, crawl_id),
             ":depth": depth,
@@ -605,6 +445,7 @@ def enqueue_discovered_link(table, link: dict, root_url: str) -> dict:
             ":now": now,
             ":zero": 0,
             ":false_value": False,
+            ":is_leaf": bool(link.get("is_leaf", False)),
             ":category_id": link.get("category_id") or extract_category_id(url) or "",
             ":category_name": link.get("category_name") or link.get("anchor_text", ""),
             ":anchor_text": link.get("anchor_text", ""),
@@ -813,29 +654,41 @@ def recover_stale_processing_items(table, stale_seconds: int = 900) -> int:
             return recovered
 
 
+def _get_with_retries(session, url: str):
+    last_exc = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            response = session.get(url, timeout=REQUEST_TIMEOUT)
+            if response.status_code == 429 or 500 <= response.status_code < 600:
+                retry_after = response.headers.get("Retry-After")
+                delay = float(retry_after) if retry_after and retry_after.isdigit() else REQUEST_INTERVAL * attempt
+                logger.warning("HTTP retryable status: url=%s status=%s attempt=%s retry_after=%s", url, response.status_code, attempt, retry_after)
+                if attempt < MAX_ATTEMPTS:
+                    time.sleep(max(delay, REQUEST_INTERVAL))
+                    continue
+            response.raise_for_status()
+            return response
+        except requests.exceptions.RequestException as exc:
+            last_exc = exc
+            logger.warning("HTTP request failed: url=%s attempt=%s error=%s", url, attempt, exc)
+            if attempt < MAX_ATTEMPTS:
+                time.sleep(REQUEST_INTERVAL * attempt)
+    if last_exc:
+        raise last_exc
+    response.raise_for_status()
+    return response
+
 def seed_from_homepage(table, website_source: str | None = None) -> int:
     """队列为空时从目标网站首页发现并持久化第一层目录。"""
     added = 0
-    
-    if website_source == MERCARI_SOURCE:
-        # Mercari 使用 Selenium 爬取首页
-        links = extract_mercari_links_with_selenium(MERCARI_START_URL, depth=0, max_depth=1)
-        for link in links:
-            result = enqueue_discovered_link(table, link, root_url=link["url"])
-            added += int(result["is_new"])
-        return added
-    
-    # Yahoo 使用 requests
     session = _http_session()
     start_urls = (START_URL_BY_SOURCE[website_source],) if website_source else START_URLS
     for start_url in start_urls:
-        if website_source_from_url(start_url) == MERCARI_SOURCE:
-            continue  # Mercari 已单独处理
         try:
-            response = session.get(start_url, timeout=REQUEST_TIMEOUT)
-            response.raise_for_status()
-            for link in extract_yahoo_links_from_page(response.text, start_url, depth=0):
-                result = enqueue_discovered_link(table, link, root_url=link["url"])
+            response = _get_with_retries(session, start_url)
+            extractor = extract_mercari_links_from_page if website_source_from_url(start_url) == MERCARI_SOURCE else extract_yahoo_links_from_page
+            for link in extractor(response.text, start_url, depth=1):
+                result = enqueue_discovered_link(table, link, root_url=start_url)
                 added += int(result["is_new"])
         except Exception as e:
             logger.error(f"播种失败 {start_url}: {e}")
@@ -886,26 +739,27 @@ def crawl_queue(table, max_pages: int | None = None, max_depth: int | None = Non
             depth = int(claimed.get("depth", 0))
             root_url = claimed.get("root_url") or current_url
             
-            if depth > depth_limit or not should_crawl(current_url):
+            link_type = claimed.get("link_type") or (classify_mercari_category_url(current_url) or {}).get("link_type")
+            if link_type == "mercari_search_leaf" or is_mercari_leaf_url(current_url):
+                logger.info("Mercari terminal leaf: website_source=%s current_url=%s category_id=%s link_type=%s depth=%s", MERCARI_SOURCE, current_url, extract_category_id(current_url), "mercari_search_leaf", depth)
+                mark_queue_done(table, claimed["crawl_id"], 0, 0, True)
+                continue
+            if depth > depth_limit:
+                mark_queue_done(table, claimed["crawl_id"], 0, 0, True)
+                continue
+            if not should_crawl(current_url):
                 mark_queue_done(table, claimed["crawl_id"], 0, 0, False)
                 continue
             
             try:
                 source = website_source_from_url(current_url)
-                
+                response = _get_with_retries(session, current_url)
+                html = response.text
+                pages_crawled += 1
                 if source == MERCARI_SOURCE:
-                    # Mercari 使用 Selenium
-                    discovered = extract_mercari_links_with_selenium(
-                        current_url, depth, max_depth=depth_limit
-                    )
-                    html = ""  # Mercari 不需要 HTML
+                    discovered = extract_mercari_links_from_page(html, current_url, depth + 1)
                 else:
-                    # Yahoo 使用 requests
-                    response = session.get(current_url, timeout=REQUEST_TIMEOUT)
-                    response.raise_for_status()
-                    html = response.text
                     discovered = extract_yahoo_links_from_page(html, current_url, depth + 1)
-                    pages_crawled += 1
                 
                 if website_source:
                     discovered = [
@@ -927,6 +781,7 @@ def crawl_queue(table, max_pages: int | None = None, max_depth: int | None = Non
                         newly_enqueued += 1
                 
                 child_count = len(unique_children)
+                logger.info("Directory crawl page: website_source=%s current_url=%s category_id=%s link_type=%s depth=%s discovered_count=%s new_count=%s pages_crawled=%s", source, current_url, extract_category_id(current_url), link_type or "list3_directory", depth, child_count, page_new, pages_crawled)
                 mark_queue_done(
                     table, claimed["crawl_id"], child_count, page_new,
                     is_terminal=child_count == 0,
@@ -1010,3 +865,44 @@ def lambda_handler(event, context):
         }
 
     return response
+
+# ============================================================
+# 旧测试/运行时代码兼容 wrapper
+# ============================================================
+
+def extract_links(html: str, source_url: str, limit: int | None = None) -> list[dict]:
+    """兼容旧 API：提取同站普通链接，不影响正式目录 crawler。"""
+    if not html:
+        return []
+    soup = BeautifulSoup(html, "html.parser")
+    links, seen = [], set()
+    for anchor in soup.select("a[href]"):
+        href = anchor.get("href")
+        if not href or href.startswith(("#", "javascript:", "mailto:", "tel:", "data:")):
+            continue
+        absolute = urljoin(source_url, href.strip())
+        try:
+            parsed = urlsplit(absolute)
+            normalized = urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path or "/", parsed.query, ""))
+        except ValueError:
+            continue
+        if not is_allowed_url(normalized) or normalized in seen:
+            continue
+        seen.add(normalized)
+        links.append({"url": normalized, "anchor_text": clean_anchor_text(anchor.get_text(" ", strip=True)), "source_url": source_url})
+        if limit is not None and len(links) >= limit:
+            break
+    return links
+
+
+def save_discovered_link(table, link: dict, root_url: str | None = None) -> dict:
+    return enqueue_discovered_link(table, link, root_url or link.get("source_url") or link["url"])
+
+
+def count_remaining_unvisited(table) -> int:
+    return count_queue_status(table, "QUEUED")
+
+
+def get_next_unvisited_url(table) -> str | None:
+    items = get_queued_items(table, 1)
+    return items[0].get("url") if items else None
