@@ -32,9 +32,15 @@ logger.setLevel(logging.INFO)
 # 常量配置
 # ============================================================
 
+YAHOO_SOURCE = "YAHOO_AUCTION"
+MERCARI_SOURCE = "MERCARI"
 ALLOWED_HOST = "auctions.yahoo.co.jp"
+MERCARI_HOST = "jp.mercari.com"
+ALLOWED_HOSTS = {ALLOWED_HOST, MERCARI_HOST}
 ALLOWED_LIST3_PREFIX = "/list3/"
 DEFAULT_START_URL = "https://auctions.yahoo.co.jp/"
+MERCARI_START_URL = "https://jp.mercari.com/categories"
+START_URLS = (DEFAULT_START_URL, MERCARI_START_URL)
 
 # 仅匹配 /list3/.../数字-category.html 的真目录页
 CATEGORY_PAGE_PATTERN = re.compile(
@@ -85,24 +91,35 @@ QUEUE_INDEX_NAME = "queue_status-queue_priority-index"
 # URL 处理函数
 # ============================================================
 
+def website_source_from_url(url: str) -> str:
+    """根据 URL 域名返回网站来源字段。"""
+    try:
+        hostname = urlsplit(url).hostname
+    except (TypeError, ValueError):
+        return ""
+    if hostname == MERCARI_HOST:
+        return MERCARI_SOURCE
+    if hostname == ALLOWED_HOST:
+        return YAHOO_SOURCE
+    return ""
+
+
 def is_allowed_url(url: str) -> bool:
     """仅允许目标站点的公开 HTTP(S) 页面，并应用指定的 robots 路径规则。"""
     try:
         parsed = urlsplit(url)
     except (TypeError, ValueError):
         return False
-    if parsed.scheme not in {"http", "https"} or parsed.hostname != ALLOWED_HOST:
+    if parsed.scheme not in {"http", "https"} or parsed.hostname not in ALLOWED_HOSTS:
         return False
+    if parsed.hostname == MERCARI_HOST:
+        return (parsed.path or "/") == "/categories"
     path = parsed.path or "/"
     return not any(path == rule.rstrip("/") or path.startswith(rule) for rule in DISALLOW)
 
 
 def canonicalize_category_url(url: str) -> str | None:
-    """
-    只保留真正的 Yahoo 拍卖 list3 目录页。
-    拒绝 leaf、catlist、带 query 的筛选列表页。
-    返回归一化后的标准 URL（https://auctions.yahoo.co.jp/list3/数字-category.html）。
-    """
+    """只保留支持网站的目录页，并归一化为标准 URL。"""
     try:
         parsed = urlsplit(url)
     except (TypeError, ValueError):
@@ -111,33 +128,25 @@ def canonicalize_category_url(url: str) -> str | None:
     if parsed.scheme not in {"http", "https"}:
         return None
 
+    path = parsed.path or "/"
+    if parsed.hostname == MERCARI_HOST:
+        if path != "/categories" or not parsed.query:
+            return None
+        query_parts = [part for part in parsed.query.split("&") if part.startswith("category_id=")]
+        if not query_parts:
+            return None
+        return urlunsplit(("https", MERCARI_HOST, path, query_parts[0], ""))
+
     if parsed.hostname != ALLOWED_HOST:
         return None
-
-    path = parsed.path or "/"
-
     if not path.startswith(ALLOWED_LIST3_PREFIX):
         return None
-
-    # 明确拒绝无用页
-    if path.endswith("-catlist.html") or "-category-leaf.html" in path:
+    if path.endswith("-catlist.html") or "-category-leaf.html" in path or parsed.query:
         return None
-
-    # 拒绝筛选、排序、翻页等 query，避免同一目录产生大量重复 URL
-    if parsed.query:
-        return None
-
     match = CATEGORY_PAGE_PATTERN.match(path)
     if not match:
         return None
-
-    return urlunsplit((
-        "https",
-        ALLOWED_HOST,
-        path,
-        "",
-        "",
-    ))
+    return urlunsplit(("https", ALLOWED_HOST, path, "", ""))
 
 
 def is_list3_page(url: str) -> bool:
@@ -146,11 +155,17 @@ def is_list3_page(url: str) -> bool:
 
 
 def extract_category_id(url: str) -> str | None:
-    """从 Yahoo ``/list3/.../<数字>-category.html`` URL 提取品类 ID。"""
+    """从 Yahoo 或 Mercari 目录 URL 提取品类 ID。"""
     canonical = canonicalize_category_url(url)
     if not canonical:
         return None
-    match = CATEGORY_PAGE_PATTERN.match(urlsplit(canonical).path)
+    parsed = urlsplit(canonical)
+    if parsed.hostname == MERCARI_HOST:
+        for part in parsed.query.split("&"):
+            if part.startswith("category_id="):
+                return part.split("=", 1)[1]
+        return None
+    match = CATEGORY_PAGE_PATTERN.match(parsed.path)
     return match.group(1) if match else None
 
 
@@ -227,14 +242,18 @@ def extract_links_from_page(html: str, source_url: str, depth: int) -> list[dict
 
         seen.add(url)
 
+        website_source = website_source_from_url(url)
+        link_type = "mercari_directory" if website_source == MERCARI_SOURCE else "list3_directory"
         list3_links.append({
             "url": url,
             "category_id": category_id,
             "category_name": anchor_text,
             "anchor_text": anchor_text,
             "source_url": source_url,
+            "website_source": website_source,
+            "source": website_source,
             "depth": depth,
-            "link_type": "list3_directory",
+            "link_type": link_type,
         })
 
     return list3_links
@@ -303,12 +322,14 @@ def enqueue_discovered_link(table, link: dict, root_url: str) -> dict:
                 category_name = if_not_exists(category_name, :category_name),
                 anchor_text = if_not_exists(anchor_text, :anchor_text),
                 source_url = if_not_exists(source_url, :source_url),
+                website_source = if_not_exists(website_source, :website_source),
+                #source = if_not_exists(#source, :website_source),
                 crawl_status = if_not_exists(crawl_status, :discovered)
         """,
-        ExpressionAttributeNames={"#url": "url", "#depth": "depth"},
+        ExpressionAttributeNames={"#url": "url", "#depth": "depth", "#source": "source"},
         ExpressionAttributeValues={
             ":url": url,
-            ":link_type": "list3_directory",
+            ":link_type": link.get("link_type") or ("mercari_directory" if link.get("website_source") == MERCARI_SOURCE else "list3_directory"),
             ":queued": "QUEUED",
             ":priority": make_queue_priority(depth, now, crawl_id),
             ":depth": depth,
@@ -321,6 +342,7 @@ def enqueue_discovered_link(table, link: dict, root_url: str) -> dict:
             ":category_name": link.get("category_name") or link.get("anchor_text", ""),
             ":anchor_text": link.get("anchor_text", ""),
             ":source_url": link.get("source_url", ""),
+            ":website_source": link.get("website_source") or link.get("source") or website_source_from_url(url),
             ":discovered": "DISCOVERED",
         },
         ReturnValues="ALL_OLD",
@@ -515,6 +537,43 @@ def recover_stale_processing_items(table, stale_seconds: int = 900) -> int:
             return recovered
 
 
+
+
+def extract_links(html: str, source_url: str, limit: int | None = None) -> list[dict]:
+    """兼容旧版通用链接提取测试：仅清洗、去重并返回允许访问的链接。"""
+    soup = BeautifulSoup(html or "", "html.parser")
+    links, seen = [], set()
+    for anchor in soup.select("a[href]"):
+        href = anchor.get("href")
+        if not href or href.startswith(("#", "javascript:", "mailto:", "tel:", "data:")):
+            continue
+        parsed = urlsplit(urljoin(source_url, href.strip()))
+        normalized = urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path or "/", parsed.query, ""))
+        if normalized in seen or not is_allowed_url(normalized):
+            continue
+        seen.add(normalized)
+        links.append({"url": normalized, "anchor_text": clean_anchor_text(anchor.get_text(" ", strip=True)), "source_url": source_url})
+        if limit is not None and len(links) >= limit:
+            break
+    return links
+
+
+def save_discovered_link(table, link: dict) -> dict:
+    """兼容旧接口，转发到队列写入函数。"""
+    return enqueue_discovered_link(table, link, link.get("source_url") or link.get("url", ""))
+
+
+def get_next_unvisited_url(table) -> str | None:
+    """兼容旧接口，按队列索引返回下一条未访问 URL。"""
+    for item in get_queued_items(table, 1):
+        return item.get("url")
+    return None
+
+
+def count_remaining_unvisited(table) -> int:
+    """兼容旧接口，统计 QUEUED 项。"""
+    return count_queue_status(table, "QUEUED")
+
 # ============================================================
 # HTTP 会话
 # ============================================================
@@ -534,13 +593,15 @@ def _http_session():
 # ============================================================
 
 def seed_from_homepage(table) -> int:
-    """队列为空时从 Yahoo 首页发现并持久化第一层目录。"""
-    response = _http_session().get(DEFAULT_START_URL, timeout=REQUEST_TIMEOUT)
-    response.raise_for_status()
+    """队列为空时从 Yahoo 首页和 Mercari 目录页发现并持久化第一层目录。"""
+    session = _http_session()
     added = 0
-    for link in extract_links_from_page(response.text, DEFAULT_START_URL, depth=0):
-        result = enqueue_discovered_link(table, link, root_url=link["url"])
-        added += int(result["is_new"])
+    for start_url in START_URLS:
+        response = session.get(start_url, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        for link in extract_links_from_page(response.text, start_url, depth=0):
+            result = enqueue_discovered_link(table, link, root_url=link["url"])
+            added += int(result["is_new"])
     return added
 
 

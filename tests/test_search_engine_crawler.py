@@ -19,7 +19,7 @@ from search_engine_crawler import (
     count_remaining_unvisited,
     extract_category_id, extract_links, extract_links_from_page,
     get_next_unvisited_url, is_allowed_url, normalize_url,
-    save_discovered_link,
+    save_discovered_link, website_source_from_url,
 )
 
 
@@ -205,6 +205,41 @@ class SearchEngineCrawlerTest(unittest.TestCase):
         html = '<a href="/alert/a">禁用</a><a href="/a">一</a><a href="/b">二</a>'
         links = extract_links(html, "https://auctions.yahoo.co.jp/", limit=1)
         self.assertEqual([link["anchor_text"] for link in links], ["一"])
+
+
+    def test_extracts_mercari_category_links_with_site_source(self):
+        html = """
+        <div class="merListItem"><a href="/categories?category_id=3088">ファッション</a></div>
+        <div class="merListItem"><a href="https://jp.mercari.com/categories?category_id=5&foo=bar">本・雑誌・漫画</a></div>
+        """
+
+        links = extract_links_from_page(html, "https://jp.mercari.com/categories", 0)
+
+        self.assertEqual(links[0]["url"], "https://jp.mercari.com/categories?category_id=3088")
+        self.assertEqual(links[0]["category_id"], "3088")
+        self.assertEqual(links[0]["category_name"], "ファッション")
+        self.assertEqual(links[0]["website_source"], "MERCARI")
+        self.assertEqual(links[0]["source"], "MERCARI")
+        self.assertEqual(links[0]["link_type"], "mercari_directory")
+        self.assertEqual(links[1]["url"], "https://jp.mercari.com/categories?category_id=5")
+
+    def test_enqueue_discovered_link_persists_website_source(self):
+        table = Mock()
+        table.update_item.return_value = {}
+        enqueue_discovered_link(table, {
+            "url": "https://jp.mercari.com/categories?category_id=3088",
+            "category_name": "ファッション",
+            "anchor_text": "ファッション",
+            "website_source": "MERCARI",
+            "link_type": "mercari_directory",
+        }, "https://jp.mercari.com/categories?category_id=3088")
+
+        kwargs = table.update_item.call_args.kwargs
+        self.assertIn("website_source", kwargs["UpdateExpression"])
+        self.assertIn("#source", kwargs["UpdateExpression"])
+        self.assertEqual(kwargs["ExpressionAttributeValues"][":website_source"], "MERCARI")
+        self.assertEqual(kwargs["ExpressionAttributeValues"][":link_type"], "mercari_directory")
+        self.assertEqual(website_source_from_url("https://jp.mercari.com/categories"), "MERCARI")
 
     def test_directory_link_contains_yahoo_category_id(self):
         url = "https://auctions.yahoo.co.jp/list3/2084317598-category.html"
