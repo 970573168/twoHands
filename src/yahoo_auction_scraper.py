@@ -31,6 +31,10 @@ USER_AGENT = os.getenv("USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) 
 DEBUG_LOG_HTML = os.getenv("DEBUG_LOG_HTML", "false").lower() == "true"
 ITEMS_PER_PAGE = int(os.getenv("ITEMS_PER_PAGE", "50"))
 INCLUDE_PAYPAY = os.getenv("INCLUDE_PAYPAY", "true").lower() == "true"
+YAHOO_AUCTION_SOURCE = "YAHOO_AUCTION"
+MERCARI_SOURCE = "MERCARI"
+MERCARI_BASE_URL = os.getenv("MERCARI_BASE_URL", "https://jp.mercari.com/search")
+
 #限定STORE以及AUCTION用于限定拍卖
 AUCTION_ABATCH = os.getenv("AUCTION_ABATCH", "1,2")
 
@@ -132,8 +136,8 @@ def log_public_egress_ip(action="", request_id=""):
         return None
 
 
-def get_target_table(search_type: str):
-    """根据搜索类型返回对应的 DynamoDB 表"""
+def get_target_table(search_type: str, website_source: str = YAHOO_AUCTION_SOURCE):
+    """根据搜索类型返回对应的共用 DynamoDB 表；website_source 写入记录用于区分来源。"""
     if search_type == "active":
         return dynamodb.Table(TABLE_NAME_ACTIVE)
     return dynamodb.Table(TABLE_NAME_CLOSED)
@@ -149,7 +153,6 @@ def get_auction_params():
             if val:
                 params[param_name] = val
     return params
-
 
 def normalize_title_for_filter(title: str) -> str:
     """统一全半角、大小写和空白，同时保留日文、英文、数字及型号符号。"""
@@ -520,8 +523,18 @@ def get_filter_keywords(event):
     return exclude_keywords, include_keywords
 
 
-def build_url(keyword, page, search_type, exclude_keywords="", include_keywords="", min_price=None, category_id=""):
+def build_url(keyword, page, search_type, exclude_keywords="", include_keywords="", min_price=None, category_id="", website_source=YAHOO_AUCTION_SOURCE):
     """构建请求 URL"""
+    if website_source == MERCARI_SOURCE:
+        params = {"status": "on_sale", "sort": "created_time", "order": "desc"}
+        if search_type == "closed":
+            params["status"] = "sold_out|trading"
+        if str(category_id or "").strip():
+            params["category_id"] = str(category_id).strip()
+        if str(keyword or "").strip():
+            params["keyword"] = str(keyword).strip()
+        return f"{MERCARI_BASE_URL}?{urlencode(params)}"
+
     params = {}
     
     if search_type == "active":
@@ -968,8 +981,9 @@ def lambda_handler(event, context):
     
     # ========== 模式1：搜索商品（含详情） ==========
     if action == "search":
-        keyword = event.get("keyword")
-        if not keyword:
+        keyword = event.get("keyword", "")
+        website_source = event.get("website_source") or event.get("websiteSource") or YAHOO_AUCTION_SOURCE
+        if not keyword and not (website_source == MERCARI_SOURCE and event.get("category_id")):
             return {
                 "statusCode": 400,
                 "body": json.dumps({"error": "Missing keyword"}, ensure_ascii=False)
@@ -990,6 +1004,7 @@ def lambda_handler(event, context):
         
         items = scrape_auctions(keyword, search_type, include_paypay,
                                 exclude_keywords, include_keywords, min_price,
+                                website_source=website_source,
                                 **_search_context_kwargs(event))
         
         if not items:
@@ -1134,8 +1149,9 @@ def lambda_handler(event, context):
     
     # ========== 模式4：搜索 + 详情爬取一体化 ==========
     elif action == "scrape_and_parse":
-        keyword = event.get("keyword")
-        if not keyword:
+        keyword = event.get("keyword", "")
+        website_source = event.get("website_source") or event.get("websiteSource") or YAHOO_AUCTION_SOURCE
+        if not keyword and not (website_source == MERCARI_SOURCE and event.get("category_id")):
             return {
                 "statusCode": 400,
                 "body": json.dumps({"error": "Missing keyword"}, ensure_ascii=False)
@@ -1147,6 +1163,7 @@ def lambda_handler(event, context):
         
         items = scrape_auctions(keyword, search_type, include_paypay,
                                 exclude_keywords, include_keywords, event.get("min_price"),
+                                website_source=website_source,
                                 **_search_context_kwargs(event))
         
         if not items:
@@ -1198,8 +1215,9 @@ def scrape_auctions(keyword, search_type, include_paypay=True,
                     exclude_keywords="", include_keywords="", min_price=None,
                     scrape_details=None, category="", brand="", model="", aliases=None, category_id="",
                     enable_local_title_filter=None,
-                    local_title_filter_strict=None):
-    """抓取列表页；scrape_details 可显式控制是否同步抓取详情。"""
+                    local_title_filter_strict=None,
+                    website_source=YAHOO_AUCTION_SOURCE):
+    """抓取列表页；支持 Yahoo Auction 与 Mercari（二手煤炉）来源。"""
     if scrape_details is None:
         scrape_details = ENABLE_DETAIL_SCRAPE_ON_SEARCH
     if enable_local_title_filter is None:
@@ -1213,7 +1231,7 @@ def scrape_auctions(keyword, search_type, include_paypay=True,
     all_items = []
 
     for page in range(1, MAX_PAGES + 1):
-        url = build_url(keyword, page, search_type, exclude_keywords, include_keywords, min_price, category_id)
+        url = build_url(keyword, page, search_type, exclude_keywords, include_keywords, min_price, category_id, website_source)
         logger.info(f"Fetching page {page}: {url}")
 
         try:
@@ -1225,7 +1243,7 @@ def scrape_auctions(keyword, search_type, include_paypay=True,
                 if simplified:
                     retry_url = build_url(
                         simplified, page, search_type, exclude_keywords,
-                        include_keywords, min_price, category_id,
+                        include_keywords, min_price, category_id, website_source,
                     )
                     logger.warning(
                         "Search returned 404; retrying once: original=%s simplified=%s",
@@ -1250,7 +1268,7 @@ def scrape_auctions(keyword, search_type, include_paypay=True,
             logger.error(f"Request failed for page {page}: {e}")
             continue
 
-        items = parse_html(resp.text, search_type, include_paypay)
+        items = parse_html(resp.text, search_type, include_paypay, website_source)
         if not items:
             break
         parsed_item_count = len(items)
@@ -1312,6 +1330,8 @@ def scrape_auctions(keyword, search_type, include_paypay=True,
         # 将调用方已知的分类名称附到每件商品上，入库后可直接查看分类。
         for item in items:
             item["category"] = str(category or "").strip()
+            item["websiteSource"] = website_source
+            item["source"] = website_source
 
         all_items.extend(items)
 
@@ -1322,8 +1342,71 @@ def scrape_auctions(keyword, search_type, include_paypay=True,
     return all_items
 
 
-def parse_html(html, search_type, include_paypay=True):
+
+def _parse_price_to_int(price_text):
+    match = re.search(r"[\d,]+", str(price_text or ""))
+    return int(match.group(0).replace(",", "")) if match else 0
+
+
+def parse_mercari_html(html, search_type="active"):
+    """解析 Mercari 搜索页普通商品卡片（li[data-testid=item-cell]）。"""
+    soup = BeautifulSoup(html or "", "html.parser")
+    items, seen_urls = [], set()
+    for cell in soup.find_all("li", {"data-testid": "item-cell"}):
+        if cell.find("div", class_="merSkeleton") and not cell.find("a", href=True):
+            continue
+        link_tag = cell.find("a", href=True)
+        thumbnail = cell.find("div", class_="merItemThumbnail")
+        if not link_tag or not thumbnail:
+            continue
+        href = link_tag.get("href") or ""
+        if href.startswith("/"):
+            href = "https://jp.mercari.com" + href
+        if not href or href in seen_urls:
+            continue
+        item_id = cell.get("data-item-id") or ""
+        if not item_id:
+            match = re.search(r"/item/([^/?#]+)", href)
+            item_id = match.group(1) if match else href.rsplit("/", 1)[-1]
+        aria_label = thumbnail.get("aria-label", "")
+        title = ""
+        if "の画像" in aria_label:
+            title = aria_label.split("の画像", 1)[0].strip()
+            title = re.sub(r"\s*[\d,]+円$", "", title).strip()
+        if not title:
+            img_for_title = thumbnail.find("img")
+            title = (img_for_title.get("alt", "") if img_for_title else "").replace("のサムネイル", "").strip()
+        name_element = cell.find("span", {"data-testid": "thumbnail-item-name"})
+        if (not title or title == "未知商品") and name_element:
+            title = name_element.get_text(strip=True)
+        price_element = thumbnail.find("span", class_="merPrice")
+        price_text = price_element.get_text(strip=True) if price_element else ""
+        image = thumbnail.find("img")
+        image_url = image.get("src") if image else ""
+        if image_url and image_url.startswith("/"):
+            image_url = "https://jp.mercari.com" + image_url
+        sold = any("売り切れ" in node.get_text(strip=True) for node in thumbnail.find_all("div"))
+        seen_urls.add(href)
+        items.append({
+            "itemId": item_id, "itemType": "mercari", "title": title or "未知商品",
+            "localListingType": classify_listing_type_by_title(title or ""),
+            "localFilterReason": "", "price": _parse_price_to_int(price_text),
+            "buynowPrice": None, "shippingFee": None, "shippingText": "",
+            "isFreeShipping": False, "bidCount": 0, "endTime": "unknown",
+            "sellerId": "", "sellerRating": "", "sellerType": "personal",
+            "prefecture": None, "itemCondition": None, "url": href,
+            "thumbnailUrl": image_url, "isSoldOut": sold or search_type == "closed",
+            "websiteSource": MERCARI_SOURCE, "source": MERCARI_SOURCE,
+            "scrapedAt": datetime.now(timezone.utc).isoformat(),
+        })
+    logger.info("Parsed %s Mercari items", len(items))
+    return items
+
+def parse_html(html, search_type, include_paypay=True, website_source=YAHOO_AUCTION_SOURCE):
     """解析 HTML，提取商品列表"""
+    if website_source == MERCARI_SOURCE:
+        return parse_mercari_html(html, search_type)
+
     soup = BeautifulSoup(html, "html.parser")
     items = []
 
@@ -1787,6 +1870,8 @@ def save_items(items, table):
                     "itemType": item.get("itemType", "unknown"),
                     "title": item.get("title", ""),
                     "category": item.get("category", ""),
+                    "websiteSource": item.get("websiteSource", YAHOO_AUCTION_SOURCE),
+                    "source": item.get("source", item.get("websiteSource", YAHOO_AUCTION_SOURCE)),
                     "localListingType": item.get("localListingType", LocalListingType.UNKNOWN),
                     "localFilterReason": item.get("localFilterReason", ""),
                     "price": item.get("price", 0),

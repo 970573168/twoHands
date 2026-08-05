@@ -15,6 +15,8 @@ from yahoo_auction_scraper import (
     LocalListingType,
     build_contextual_exclude_keywords,
     build_url,
+    parse_html,
+    MERCARI_SOURCE,
     classify_listing_type_by_title,
     detect_target_context,
     get_filter_keywords,
@@ -32,6 +34,33 @@ class LocalTitleFilterTest(unittest.TestCase):
         params = parse_qs(urlsplit(url).query)
         self.assertEqual(params["auccat"], ["2084317598"])
         self.assertEqual(params["p"], ["iphone"])
+
+
+    def test_mercari_latest_category_url_uses_empty_keyword_and_source(self):
+        url = build_url("", 1, "active", category_id="859", website_source=MERCARI_SOURCE)
+        parsed = urlsplit(url)
+        params = parse_qs(parsed.query)
+        self.assertEqual(parsed.netloc, "jp.mercari.com")
+        self.assertEqual(params["category_id"], ["859"])
+        self.assertEqual(params["status"], ["on_sale"])
+        self.assertEqual(params["sort"], ["created_time"])
+        self.assertNotIn("keyword", params)
+
+    def test_mercari_parser_extracts_regular_item_cards(self):
+        html = """
+        <ul><li data-testid="item-cell" data-item-id="m123">
+          <a href="/item/m123"><div class="merItemThumbnail" aria-label="SONY カメラ 34,800円の画像">
+            <span class="merPrice">¥34,800</span><img src="https://example.com/img.jpg" alt="SONY カメラのサムネイル"/>
+          </div></a>
+        </li></ul>
+        """
+        items = parse_html(html, "active", website_source=MERCARI_SOURCE)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["itemId"], "m123")
+        self.assertEqual(items[0]["title"], "SONY カメラ")
+        self.assertEqual(items[0]["price"], 34800)
+        self.assertEqual(items[0]["url"], "https://jp.mercari.com/item/m123")
+        self.assertEqual(items[0]["websiteSource"], MERCARI_SOURCE)
 
     def test_clear_main_products_remain_main_products(self):
         titles = (
