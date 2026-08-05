@@ -24,6 +24,7 @@ from auction_analyzer import (
     build_closed_reference_samples,
     calc_market_price,
     calc_decision,
+    calc_final_recommendation,
     execute_countdown_workflow,
     execute_workflow,
     get_seller_blacklist,
@@ -299,7 +300,7 @@ class LeanAiWorkflowTest(unittest.TestCase):
             "netProfitAtCurrentBid": -1,
             "profitMarginAtCurrentBid": Decimal("0.50"),
         }))
-        self.assertFalse(should_reanalyze_description({}, {
+        self.assertTrue(should_reanalyze_description({}, {
             **base, "pricingStatus": Status.INSUFFICIENT_DATA,
             "profitMarginAtCurrentBid": Decimal("0.30"),
         }))
@@ -381,8 +382,9 @@ class LeanAiWorkflowTest(unittest.TestCase):
             ],
         }])
 
+        self.assertIn('"programPricingResult":{"pricingStatus":""', prompt)
         self.assertIn(
-            '"closedReferences":[{"title":"iPhone 15 Pro 256GB 落札品","price":118000}]',
+            '"closedReferences":[{"itemID":"","title":"iPhone 15 Pro 256GB 落札品","price":118000,"listingType":"","conditionClass":""}]',
             prompt,
         )
         self.assertNotIn("価格なし", prompt)
@@ -1010,6 +1012,34 @@ class LeanAiWorkflowTest(unittest.TestCase):
         self.assertEqual(calc_decision(Decimal("4999"), Decimal("0.50")), Recommendation.AVOID)
         self.assertEqual(calc_decision(Decimal("5000"), Decimal("0.20")), Recommendation.BUY_CANDIDATE)
         self.assertEqual(calc_decision(Decimal("5000"), Decimal("0.199")), Recommendation.REVIEW)
+
+    def test_final_recommendation_blocks_contaminated_ai_audit(self):
+        pricing = {
+            "pricingStatus": Status.COMPLETED,
+            "netProfitAtCurrentBid": 10000,
+            "profitMarginAtCurrentBid": Decimal("0.30"),
+        }
+        item = {
+            "closedReferenceAssessment": {"contaminationDetected": True},
+            "priceAssessment": {"programMarketPriceReasonable": True},
+            "aiPurchaseAdvice": {"recommendation": Recommendation.BUY_CANDIDATE},
+        }
+
+        self.assertEqual(calc_final_recommendation(item, pricing), Recommendation.REVIEW)
+
+    def test_final_recommendation_requires_ai_buy_to_pass_profit_rules(self):
+        pricing = {
+            "pricingStatus": Status.COMPLETED,
+            "netProfitAtCurrentBid": 5000,
+            "profitMarginAtCurrentBid": Decimal("0.199"),
+        }
+        item = {
+            "closedReferenceAssessment": {"isComparableSetValid": True},
+            "priceAssessment": {"programMarketPriceReasonable": True},
+            "aiPurchaseAdvice": {"recommendation": Recommendation.BUY_CANDIDATE},
+        }
+
+        self.assertEqual(calc_final_recommendation(item, pricing), Recommendation.REVIEW)
 
     @patch("auction_analyzer.review_db")
     def test_low_profit_is_not_written_to_review_table(self, review_db):

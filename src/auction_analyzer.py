@@ -795,7 +795,37 @@ condition: NEW/USED/BROKEN/UNKNOWN
 19. shortSummary は100字以内で、sourceModelとの一致、商品状態、付属品、価格面の概要を簡潔に含めてください
 20. riskSummary は説明文から読み取れる注意点だけを書き、推測しないでください
 21. conditionRisk は LOW/MEDIUM/HIGH のいずれかです。LOW=明確な不具合なし・動作確認済み、MEDIUM=傷・使用感・限定的確認・返品不可、HIGH=故障・動作未確認・ジャンク・部品取り・重要機能不良
-22. closedReferences は同一モデルとして採用された終了オークションの title と落札 price です。商品同一性、付属品差、状態差、現在価格の妥当性を判断する参考にしてください。ただし、Active商品の title/description と矛盾する仕様を転記しないでください"""
+22. closedReferences は同一モデルとして採用された終了オークションの title と落札 price です。商品同一性、付属品差、状態差、現在価格の妥当性を判断する参考にしてください。ただし、Active商品の title/description と矛盾する仕様を転記しないでください
+
+追加重要タスク：Closed成交样本审计と価格妥当性判断
+
+あなたは Active 商品だけでなく、closedReferences に含まれる終了オークションが
+本当に Active 商品と同一モデル・同等構成・同等状態の価格比較対象として妥当かを必ず評価してください。
+
+closedReferences の評価ルール:
+1. Active 商品の brand/model/variant/storage/accessories/condition と異なる終了商品は無効サンプルです。
+2. 型番違いは無効です。例:
+   - EOS M と EOS M2/M3/M5/M6/M100/M200/EOS Kiss M は同一モデルではありません。
+   - iPad Air 第4世代 と 第5世代、第3世代は同一モデルではありません。
+   - iPhone 13 と iPhone 13 Pro/Pro Max/mini は同一モデルではありません。
+   - Pixel 7 と Pixel 7 Pro/7a は同一モデルではありません。
+3. アクセサリ、マウントアダプター、レンズ単体、箱のみ、部品取りは無効です。
+4. ジャンク品・故障品は、Active商品が正常品の場合は無効または大幅減額対象です。
+5. レンズセット、ボディのみ、ダブルレンズキットなど付属品差が大きい場合は価格差として評価してください。
+6. closedReferences の中に異なるモデルが多数混入している場合、contaminationDetected=true にしてください。
+7. programMarketPrice が無効サンプルによって高く見積もられている場合、programMarketPriceReasonable=false, priceJudgement=OVER_ESTIMATED にしてください。
+8. 有効な comparable が少ない場合は isComparableSetValid=false とし、aiPurchaseAdvice.recommendation は REVIEW または INSUFFICIENT_DATA にしてください。
+9. BUY_CANDIDATE は、有効サンプルに基づくAI推定価格でも十分な利益がある場合のみ許可します。
+10. closedReferences を無批判に信用しないでください。必ず title と price を確認し、Active 商品と同一比較対象か判断してください。
+
+必ず以下の追加フィールドも各 item に返してください:
+"closedReferenceAssessment": {"isComparableSetValid": true, "validComparableCount": 0, "invalidComparableCount": 0, "invalidReasons": [], "validReferenceTitles": [], "invalidReferenceTitles": [], "contaminationDetected": false, "contaminationReason": "", "confidence": "HIGH"},
+"priceAssessment": {"programMarketPriceReasonable": true, "programMarketPrice": 0, "aiEstimatedMarketPriceLow": 0, "aiEstimatedMarketPriceHigh": 0, "aiEstimatedMarketPriceMedian": 0, "priceJudgement": "REASONABLE", "priceReason": ""},
+"aiProfitAssessment": {"currentPrice": 0, "aiEstimatedNetProfitLow": 0, "aiEstimatedNetProfitHigh": 0, "aiEstimatedProfitMarginLow": "0", "aiEstimatedProfitMarginHigh": "0", "profitSpace": "MEDIUM", "profitReason": ""},
+"aiPurchaseAdvice": {"recommendation": "REVIEW", "confidence": "MEDIUM", "reason": "", "mustReview": false}
+
+confidence は HIGH/MEDIUM/LOW、priceJudgement は REASONABLE/OVER_ESTIMATED/UNDER_ESTIMATED/UNRELIABLE、profitSpace は HIGH/MEDIUM/LOW/NONE/UNKNOWN、recommendation は BUY_CANDIDATE/REVIEW/AVOID/INSUFFICIENT_DATA のいずれかにしてください。
+JSONのみを出力してください。"""
 
 
 def build_active_parse_prompt(items: List[Dict]) -> str:
@@ -881,10 +911,29 @@ def build_description_parse_prompt(items: List[Dict]) -> str:
             "estimatedProfit": si(pricing_result.get("netProfitAtCurrentBid", 0)),
             "profitMargin": str(pricing_result.get("profitMarginAtCurrentBid", "")),
             "pricingConfidence": str(pricing_result.get("pricingConfidence", "")),
+            "programPricingResult": {
+                "pricingStatus": pricing_result.get("pricingStatus", ""),
+                "estimatedMarketPrice": si(pricing_result.get("estimatedMarketPrice", 0)),
+                "estimatedLow": si(pricing_result.get("estimatedLow", 0)),
+                "estimatedHigh": si(pricing_result.get("estimatedHigh", 0)),
+                "currentBidPrice": si(pricing_result.get("currentBidPrice", item.get("price", 0))),
+                "netProfitAtCurrentBid": si(pricing_result.get("netProfitAtCurrentBid", 0)),
+                "profitMarginAtCurrentBid": str(pricing_result.get("profitMarginAtCurrentBid", "")),
+                "roiAtCurrentBid": str(pricing_result.get("roiAtCurrentBid", "")),
+                "pricingConfidence": str(pricing_result.get("pricingConfidence", "")),
+                "riskLevel": pricing_result.get("riskLevel", ""),
+                "riskScore": si(pricing_result.get("riskScore", 0)),
+                "comparableCount": si(pricing_result.get("comparableCount", 0)),
+                "matchInfo": pricing_result.get("matchInfo", {}),
+                "reasons": pricing_result.get("reasons", []),
+            },
             "closedReferences": [
                 {
+                    "itemID": str(sample.get("itemID", "")),
                     "title": str(sample.get("title", ""))[:160],
                     "price": si(sample.get("price", 0)),
+                    "listingType": sample.get("listingType", ""),
+                    "conditionClass": sample.get("conditionClass", ""),
                 }
                 for sample in reference_samples
                 if sample.get("title") and si(sample.get("price", 0)) > 0
@@ -1089,6 +1138,10 @@ def preserve_source_model_if_matched(parsed: Dict, item: Optional[Dict]) -> Dict
 def save_model(table, item_id: str, parsed: Dict, item: Optional[Dict] = None) -> str:
     parsed = preserve_source_model_if_matched(parsed, item)
     models, lt, cond, mc, missing_critical, excl = parse_ai_result(parsed)
+    closed_assessment = parsed.get("closedReferenceAssessment") or {}
+    price_assessment = parsed.get("priceAssessment") or {}
+    profit_assessment = parsed.get("aiProfitAssessment") or {}
+    ai_advice = parsed.get("aiPurchaseAdvice") or {}
     source_model = (item or {}).get("sourceModel", {}) or {}
     source_mismatch = bool(source_model.get("model")) and parsed.get("matched") is False
     if source_mismatch:
@@ -1127,6 +1180,24 @@ def save_model(table, item_id: str, parsed: Dict, item: Optional[Dict] = None) -
         "conditionRisk": norm(parsed.get("conditionRisk", "")).upper(),
         "aiMatched": parsed.get("matched"),
         "detailAnalyzedAt": datetime.now(timezone.utc).isoformat(),
+        "closedReferenceAssessment": closed_assessment,
+        "priceAssessment": price_assessment,
+        "aiProfitAssessment": profit_assessment,
+        "aiPurchaseAdvice": ai_advice,
+        "aiComparableSetValid": closed_assessment.get("isComparableSetValid"),
+        "aiComparableContaminationDetected": closed_assessment.get("contaminationDetected"),
+        "aiComparableValidCount": si(closed_assessment.get("validComparableCount", 0)),
+        "aiComparableInvalidCount": si(closed_assessment.get("invalidComparableCount", 0)),
+        "aiComparableConfidence": closed_assessment.get("confidence", ""),
+        "aiPriceJudgement": price_assessment.get("priceJudgement", ""),
+        "aiProgramMarketPriceReasonable": price_assessment.get("programMarketPriceReasonable"),
+        "aiEstimatedMarketPriceLow": si(price_assessment.get("aiEstimatedMarketPriceLow", 0)),
+        "aiEstimatedMarketPriceHigh": si(price_assessment.get("aiEstimatedMarketPriceHigh", 0)),
+        "aiEstimatedMarketPriceMedian": si(price_assessment.get("aiEstimatedMarketPriceMedian", 0)),
+        "aiRecommendation": ai_advice.get("recommendation", ""),
+        "aiRecommendationConfidence": ai_advice.get("confidence", ""),
+        "aiRecommendationReason": str(ai_advice.get("reason", ""))[:500],
+        "aiMustReview": ai_advice.get("mustReview"),
     })
     logger.info(
         "Detail summary saved: itemID=%s conditionRisk=%s matched=%s summary=%s",
@@ -1622,6 +1693,50 @@ def calc_decision(net: Decimal, margin: Decimal) -> str:
         return Recommendation.BUY_CANDIDATE
     return Recommendation.REVIEW
 
+
+
+def calc_final_recommendation(item: Dict, pricing: Dict) -> str:
+    """融合详情 AI 审计结果和程序利润率，生成最终购买建议。"""
+    pricing_status = pricing.get("pricingStatus")
+    ai_advice = item.get("aiPurchaseAdvice") or {}
+    ai_rec = norm(ai_advice.get("recommendation", "")).upper()
+    ai_must_review = str(ai_advice.get("mustReview", "")).lower() in ("true", "1", "yes")
+
+    closed_assessment = item.get("closedReferenceAssessment") or {}
+    contamination = str(closed_assessment.get("contaminationDetected", "")).lower() in ("true", "1", "yes")
+    comparable_valid = closed_assessment.get("isComparableSetValid")
+
+    price_assessment = item.get("priceAssessment") or {}
+    program_price_reasonable = price_assessment.get("programMarketPriceReasonable")
+    price_judgement = norm(price_assessment.get("priceJudgement", "")).upper()
+
+    if pricing_status != Status.COMPLETED:
+        return Recommendation.REVIEW
+    if contamination:
+        return Recommendation.REVIEW
+    if comparable_valid is False:
+        return Recommendation.REVIEW
+    if program_price_reasonable is False:
+        return Recommendation.REVIEW
+    if price_judgement in ("OVER_ESTIMATED", "UNRELIABLE"):
+        return Recommendation.REVIEW
+    if ai_must_review:
+        return Recommendation.REVIEW
+    if ai_rec == Recommendation.AVOID:
+        return Recommendation.AVOID
+    if ai_rec in ("INSUFFICIENT_DATA", Status.INSUFFICIENT_DATA):
+        return Recommendation.REVIEW
+    if ai_rec == Recommendation.REVIEW:
+        return Recommendation.REVIEW
+
+    program_rec = calc_decision(
+        sd(pricing.get("netProfitAtCurrentBid", 0)),
+        sd(pricing.get("profitMarginAtCurrentBid", 0)),
+    )
+    if ai_rec == Recommendation.BUY_CANDIDATE:
+        return program_rec if program_rec == Recommendation.BUY_CANDIDATE else Recommendation.REVIEW
+    return program_rec
+
 def build_result(item: Dict, stats: Dict, buy: Decimal, ship: Decimal, buynow=None, mi=None) -> Dict:
     ep = sd(stats.get("f_median",stats.get("median",0)))
     if ep<=0 and stats.get("prices"):
@@ -1867,6 +1982,20 @@ def upsert_buy_candidate(item_id: str, item: Dict, pricing: Dict,
         "buyReason": item.get("buyReason", ""),
         "conditionRisk": item.get("conditionRisk", ""),
         "aiMatched": item.get("aiMatched"),
+        "aiRecommendation": item.get("aiRecommendation", ""),
+        "aiRecommendationConfidence": item.get("aiRecommendationConfidence", ""),
+        "aiRecommendationReason": item.get("aiRecommendationReason", ""),
+        "aiComparableSetValid": item.get("aiComparableSetValid"),
+        "aiComparableContaminationDetected": item.get("aiComparableContaminationDetected"),
+        "aiPriceJudgement": item.get("aiPriceJudgement", ""),
+        "aiProgramMarketPriceReasonable": item.get("aiProgramMarketPriceReasonable"),
+        "aiEstimatedMarketPriceLow": item.get("aiEstimatedMarketPriceLow", 0),
+        "aiEstimatedMarketPriceHigh": item.get("aiEstimatedMarketPriceHigh", 0),
+        "aiEstimatedMarketPriceMedian": item.get("aiEstimatedMarketPriceMedian", 0),
+        "closedReferenceAssessment": item.get("closedReferenceAssessment", {}),
+        "priceAssessment": item.get("priceAssessment", {}),
+        "aiProfitAssessment": item.get("aiProfitAssessment", {}),
+        "aiPurchaseAdvice": item.get("aiPurchaseAdvice", {}),
         "referenceClosedSamples": reference_samples,
         "referenceClosedSampleCount": len(reference_samples),
     }
@@ -2016,10 +2145,7 @@ def price_active_item(item_id: str, idx: Dict[str,List[Dict]],
     buynow = sd(item.get("buynowPrice")) if item.get("buynowPrice") else None
 
     pricing = build_result(item, stats, current_price, shipping, buynow, mi)
-    recommendation = calc_decision(
-        sd(pricing.get("netProfitAtCurrentBid", 0)),
-        sd(pricing.get("profitMarginAtCurrentBid", 0)),
-    )
+    recommendation = calc_final_recommendation(item, pricing)
     save_pricing(item_id, pricing, recommendation)
     try:
         upsert_review_item(item_id, item, pricing, recommendation)
@@ -2042,7 +2168,10 @@ def price_active_item(item_id: str, idx: Dict[str,List[Dict]],
 
 def should_reanalyze_description(item: Dict, pricing: Dict) -> bool:
     """所有初判 BUY_CANDIDATE/REVIEW 都必须经过详情复核。"""
-    if pricing.get("pricingStatus") != Status.COMPLETED:
+    pricing_status = pricing.get("pricingStatus")
+    if pricing_status == Status.INSUFFICIENT_DATA:
+        return sd(pricing.get("netProfitAtCurrentBid", 0)) > 0
+    if pricing_status != Status.COMPLETED:
         return False
     recommendation = calc_decision(
         sd(pricing.get("netProfitAtCurrentBid", 0)),
