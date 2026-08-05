@@ -224,12 +224,6 @@ def process_candidate(candidate, now=None):
 
 
 def lambda_handler(event, context):
-    event = event or {}
-    if event.get("mode") not in (None, "schedule"):
-        return {
-            "statusCode": 400,
-            "body": json.dumps({"错误": "邮件测试功能已关闭，仅支持定时复核"}, ensure_ascii=False),
-        }
     now = int(time.time())
     response = candidate_db.query(
         IndexName="GSI_FinalCheck",
