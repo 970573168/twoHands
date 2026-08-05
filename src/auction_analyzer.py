@@ -271,6 +271,22 @@ def upsert_scraped_item(table, item_id: str, fields: Dict, force: bool = False):
     
     table.update_item(**kwargs)
 
+
+
+def category_fields_from_item(item: Dict) -> Dict[str, str]:
+    """统一提取分类 ID/名称，供 Active、Closed、Review、Candidate 表展示。"""
+    source = item.get("sourceModel") if isinstance(item, dict) else {}
+    source = source if isinstance(source, dict) else {}
+    category_id = norm(item.get("category_id") or source.get("category_id") or "")
+    category_name = norm(
+        item.get("category_name")
+        or item.get("category")
+        or source.get("category_name")
+        or source.get("category")
+        or ""
+    )
+    return {"category_id": category_id, "category_name": category_name, "category": category_name}
+
 def get_record(table, item_id: str) -> Optional[Dict]:
     r = table.get_item(Key={"itemID": str(item_id)})
     return r.get("Item")
@@ -1954,6 +1970,7 @@ def upsert_buy_candidate(item_id: str, item: Dict, pricing: Dict,
         "url": item.get("url", ""),
         "thumbnailUrl": item.get("thumbnailUrl", ""),
         "keyword": item.get("keyword", ""),
+        **category_fields_from_item(item),
         "brand": model.get("brand", "") if isinstance(model, dict) else "",
         "model": model.get("model", "") if isinstance(model, dict) else "",
         "lastAnalyzedAt": now,
@@ -2071,6 +2088,7 @@ def upsert_review_item(item_id: str, item: Dict, pricing: Dict,
         "审核状态": "待审核",
         "insufficient": pricing.get("pricingStatus") == Status.INSUFFICIENT_DATA,
         "recommendation": recommendation,
+        **category_fields_from_item(item),
         "pricingConfidence": str(pricing.get("pricingConfidence", 0)),
         "activeItem": active_snapshot,
         "closedReferences": closed_samples,
@@ -2255,6 +2273,9 @@ def scrape_closed(kw: str, cnt: int, force: bool = False, source_model: Optional
                         "itemCondition": item.get("itemCondition"),
                         "thumbnailUrl": item.get("thumbnailUrl", ""),
                         "keyword": kw,
+                        "category_id": norm((source_model or {}).get("category_id", "")),
+                        "category_name": norm((source_model or {}).get("category_name") or (source_model or {}).get("category", "")),
+                        "category": norm((source_model or {}).get("category_name") or (source_model or {}).get("category", "")),
                         "sourceModel": source_model or {},
                     },
                     force=force
@@ -2384,7 +2405,9 @@ def scrape_active(kw: str, cnt: int, max_p: int = 0, force: bool = False,
                         "keyword": kw,
                         # 分类名称放在顶层，便于直接在 ActiveItems 表中查看、筛选，
                         # 不必再展开 sourceModel。
-                        "category": norm((source_model or {}).get("category", "")),
+                        "category_id": norm((source_model or {}).get("category_id", "")),
+                        "category_name": norm((source_model or {}).get("category_name") or (source_model or {}).get("category", "")),
+                        "category": norm((source_model or {}).get("category_name") or (source_model or {}).get("category", "")),
                         "sourceModel": source_model or {},
                     },
                     # Active records are global by auction ID.  Re-run model
@@ -2434,6 +2457,8 @@ def inject_test_active_item(test_item: Dict, force: bool = True,
         "itemCondition": test_item.get("itemCondition", "中古"),
         "thumbnailUrl": test_item.get("thumbnailUrl", ""),
         "keyword": test_item.get("keyword", ""),
+        "category_id": source_category_id,
+        "category_name": normalized_category,
         "category": normalized_category,
         "sourceModel": {
             "category_id": source_category_id,

@@ -583,6 +583,7 @@ class LeanAiWorkflowTest(unittest.TestCase):
             "models": [{"brand": "Nikon", "model": "Z lens"}],
             "price": 62000, "buynowPrice": 0, "shippingFee": 1000,
             "endTime": "1970-01-01T00:33:20+00:00",
+            "sourceModel": {"category_id": "2084317598", "category": "カメラ"},
         }
         pricing = {
             "estimatedMarketPrice": 77000, "currentBidPrice": 62000,
@@ -600,6 +601,8 @@ class LeanAiWorkflowTest(unittest.TestCase):
         self.assertIn("WAITING_FINAL_CHECK", values.values())
         self.assertIn("NOT_SENT", values.values())
         self.assertIn(1100, values.values())
+        self.assertIn("2084317598", values.values())
+        self.assertIn("カメラ", values.values())
 
     @patch("auction_analyzer.update_record")
     @patch("auction_analyzer.send_countdown_candidate_email")
@@ -716,6 +719,8 @@ class LeanAiWorkflowTest(unittest.TestCase):
             "url": "https://example.test/active-1",
             "models": [{"brand": "Sony", "model": "A1"}],
             "seller": {"id": "seller-1", "rating": 99},
+            "category_id": "2084317598",
+            "category_name": "スマホ本体",
             "新字段": "必须保留",
         }
         pricing = {
@@ -739,6 +744,8 @@ class LeanAiWorkflowTest(unittest.TestCase):
         self.assertEqual(active["title"], "当前拍卖")
         self.assertEqual(active, item)
         self.assertEqual(closed[0]["title"], "成交参考")
+        self.assertIn("2084317598", values.values())
+        self.assertIn("スマホ本体", values.values())
 
     @patch("auction_analyzer.get_seller_blacklist", return_value=set())
     @patch("auction_analyzer.upsert_scraped_item")
